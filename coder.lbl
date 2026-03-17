@@ -70,6 +70,31 @@ function tool_definitions(): a list of a mapping from text to text
   [read_tool, write_tool, shell_tool, list_tool, grep_tool]
 end
 
+function is_known_tool(name: text): boolean
+  intent: compare name to read_file, write_file, shell_exec, list_dir, and grep
+  name == "read_file" or name == "write_file" or name == "shell_exec" or name == "list_dir" or name == "grep"
+end
+
+function describe_tool_call(name: text, arguments: text): text
+  intent: format name with its path, command, or pattern argument as a short label
+  let args: a mapping from text to text = json_parse(arguments)
+  if name == "read_file" or name == "list_dir" then
+    name ++ "  " ++ unwrap_or(get(args, "path"), "")
+  else if name == "write_file" then
+    name ++ "  " ++ unwrap_or(get(args, "path"), "")
+  else if name == "shell_exec" then
+    let cmd: text = unwrap_or(get(args, "command"), "")
+    let preview: text = if text_length(cmd) > 60 then substring(cmd, 0, 60) ++ "…" else cmd end
+    name ++ "  $ " ++ preview
+  else if name == "grep" then
+    let pat: text = unwrap_or(get(args, "pattern"), "")
+    let path: text = unwrap_or(get(args, "path"), ".")
+    name ++ "  /" ++ pat ++ "/  " ++ path
+  else
+    name
+  end
+end
+
 function execute_tool(name: text, arguments: text): text
   intent: parse arguments and dispatch to read_file, write_file, shell_exec, list_dir, or grep
   let args: a mapping from text to text = json_parse(arguments)
@@ -278,41 +303,58 @@ function main(): nothing
           let finish_reason: text = unwrap_or(get(choice, "finish_reason"), "stop")
 
           if finish_reason == "tool_calls" then
-            -- Model wants to call tools
-            let tool_calls: a list of a mapping from text to text = unwrap_or(get(message_obj, "tool_calls"), [])
+            -- Model wants to call tools; discard any calls to unregistered tool names
+            -- to prevent Groq from rejecting the next request during history validation
+            let all_calls: a list of a mapping from text to text = unwrap_or(get(message_obj, "tool_calls"), [])
+            let tool_calls: a list of a mapping from text to text = filter(all_calls, fn(tc: a mapping from text to text): boolean => is_known_tool(get(get(tc, "function"), "name")))
 
-            -- Add assistant message with tool_calls to history
-            let asst_msg: a mapping from text to text = {
-              "role": "assistant",
-              "content": none,
-              "tool_calls": tool_calls
-            }
-            set messages = append(messages, asst_msg)
-
-            -- Execute each tool call and add results
-            for tc in tool_calls do
+            -- Warn about any hallucinated tool names the model tried to call
+            for tc in all_calls do
               let fn_info: a mapping from text to text = get(tc, "function")
-              let tc_id: text = unwrap_or(get(tc, "id"), "")
               let fn_name: text = get(fn_info, "name")
-              let fn_args: text = get(fn_info, "arguments")
-
-              print("  [tool] " ++ fn_name)
-
-              let result: text = execute_tool(fn_name, fn_args)
-
-              -- Truncate very long results
-              let result_text: text = if text_length(result) > 8000 then
-                substring(result, 0, 8000) ++ "\n... (truncated)"
-              else
-                result
+              if not is_known_tool(fn_name) then
+                print("  [skip] unregistered tool: " ++ fn_name)
               end
+            end
 
-              let tool_msg: a mapping from text to text = {
-                "role": "tool",
-                "tool_call_id": tc_id,
-                "content": result_text
+            -- Only add assistant message if there are valid tool calls to execute
+            if length(tool_calls) > 0 then
+              let asst_msg: a mapping from text to text = {
+                "role": "assistant",
+                "content": none,
+                "tool_calls": tool_calls
               }
-              set messages = append(messages, tool_msg)
+              set messages = append(messages, asst_msg)
+
+              -- Execute each valid tool call and add result to history
+              for tc in tool_calls do
+                let fn_info: a mapping from text to text = get(tc, "function")
+                let tc_id: text = unwrap_or(get(tc, "id"), "")
+                let fn_name: text = get(fn_info, "name")
+                let fn_args: text = get(fn_info, "arguments")
+
+                print("  [tool] " ++ describe_tool_call(fn_name, fn_args))
+
+                let result: text = execute_tool(fn_name, fn_args)
+
+                -- Truncate very long results
+                let result_text: text = if text_length(result) > 8000 then
+                  substring(result, 0, 8000) ++ "\n... (truncated)"
+                else
+                  result
+                end
+
+                let tool_msg: a mapping from text to text = {
+                  "role": "tool",
+                  "tool_call_id": tc_id,
+                  "content": result_text
+                }
+                set messages = append(messages, tool_msg)
+              end
+            else
+              -- All tool calls were to unregistered tools; stop this turn
+              print("  [warn] model only called unregistered tools, ending turn")
+              set waiting = false
             end
             -- Loop back to get the model's next response
 

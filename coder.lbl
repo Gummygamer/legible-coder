@@ -1,15 +1,14 @@
 -- legible-coder: an interactive CLI coding assistant for the Legible language
--- Powered by gpt-oss-120b via the Groq API
+-- Powered by openai/gpt-oss-120b via the Groq API
+-- Model can be overridden with the LEGIBLE_CODER_MODEL environment variable
 
--- Build a parameter definition for a tool
 function make_param(pname: text, pdesc: text): a mapping from text to text
-  intent: create a parameter description mapping
+  intent: wrap pname and pdesc into a type and description mapping
   {"type": "string", "description": pdesc}
 end
 
--- Build a single tool definition as a mapping
 function make_tool(name: text, description: text, param_names: a list of text, param_descs: a list of text, required_params: a list of text): a mapping from text to text
-  intent: construct a tool definition mapping for the Groq API
+  intent: put name, description, properties, and required into a function schema mapping
   mutable properties: a mapping from text to text = {}
   mutable i: integer = 0
   for pname in param_names do
@@ -31,9 +30,8 @@ function make_tool(name: text, description: text, param_names: a list of text, p
   }
 end
 
--- Tool definitions for the API
 function tool_definitions(): a list of a mapping from text to text
-  intent: return list of tool definitions for the Groq API
+  intent: assemble read, write, shell, list, and grep tool schemas into a list
   let read_tool: a mapping from text to text = make_tool(
     "read_file",
     "Read the contents of a file at the given path.",
@@ -72,9 +70,8 @@ function tool_definitions(): a list of a mapping from text to text
   [read_tool, write_tool, shell_tool, list_tool, grep_tool]
 end
 
--- Execute a tool call and return the result as text
 function execute_tool(name: text, arguments: text): text
-  intent: execute a tool call by name with JSON arguments and return the result
+  intent: parse arguments and dispatch to read_file, write_file, shell_exec, list_dir, or grep
   let args: a mapping from text to text = json_parse(arguments)
 
   if name == "read_file" then
@@ -140,9 +137,8 @@ function execute_tool(name: text, arguments: text): text
   end
 end
 
--- Build the system prompt
 function system_prompt(): text
-  intent: return the system prompt that instructs the model how to behave
+  intent: compose the Legible syntax reference and cwd into a prompt string
   let cwd: text = get_cwd()
   "You are legible-coder, an interactive CLI coding assistant. " ++
   "You write code in the Legible programming language and perform tasks by running Legible scripts.\n\n" ++
@@ -177,11 +173,10 @@ function system_prompt(): text
   "Write code to files with write_file. Run things with shell_exec."
 end
 
--- Build the API request body mapping
-function build_request(messages: a list of a mapping from text to text): a mapping from text to text
-  intent: build the request body mapping for the Groq chat completions API
+function build_request(model: text, messages: a list of a mapping from text to text): a mapping from text to text
+  intent: put model, messages, tools, and max_tokens into the chat completions request mapping
   {
-    "model": "gpt-oss-120b",
+    "model": model,
     "messages": messages,
     "tools": tool_definitions(),
     "tool_choice": "auto",
@@ -189,9 +184,8 @@ function build_request(messages: a list of a mapping from text to text): a mappi
   }
 end
 
--- Call the Groq API
 function call_groq(api_key: text, request_body: a mapping from text to text): a mapping from text to text
-  intent: make a POST request to the Groq chat completions API
+  intent: encode request_body as json and post it to the chat completions endpoint with auth headers
   let headers: a mapping from text to text = {
     "Authorization": "Bearer " ++ api_key,
     "Content-Type": "application/json"
@@ -205,13 +199,12 @@ function call_groq(api_key: text, request_body: a mapping from text to text): a 
   response
 end
 
--- Print styled output
-function print_banner(): nothing
-  intent: display the welcome banner
+function print_banner(model: text): nothing
+  intent: print the legible-coder name, model, and cwd as the startup header
   print("")
   print("  legible-coder")
   print("  Interactive Legible coding assistant")
-  print("  Powered by gpt-oss-120b via Groq")
+  print("  Model: " ++ model ++ " via Groq")
   print("  ────────────────────────────────────────────")
   let cwd: text = get_cwd()
   print("  cwd: " ++ cwd)
@@ -220,14 +213,12 @@ function print_banner(): nothing
 end
 
 function print_separator(): nothing
-  intent: print a visual separator
+  intent: print the response separator
   print("  ────────────────────────────────────────────")
 end
 
--- Main conversation loop
 function main(): nothing
-  intent: run the interactive REPL loop for the coding assistant
-
+  intent: read api_key and model, then loop reading user messages and calling the assistant
   -- Check for API key
   let api_key: an optional text = env_get("GROQ_API_KEY")
   if is_none(api_key) then
@@ -236,8 +227,9 @@ function main(): nothing
     exit_process(1)
   end
   let key: text = unwrap(api_key)
+  let model: text = unwrap_or(env_get("LEGIBLE_CODER_MODEL"), "openai/gpt-oss-120b")
 
-  print_banner()
+  print_banner(model)
 
   -- Conversation history as a list of message mappings
   let sys_msg: a mapping from text to text = {"role": "system", "content": system_prompt()}
@@ -263,7 +255,7 @@ function main(): nothing
       -- Tool call loop: keep calling API until we get a text response
       mutable waiting: boolean = true
       while waiting do
-        let request_body: a mapping from text to text = build_request(messages)
+        let request_body: a mapping from text to text = build_request(model, messages)
         let response: a mapping from text to text = call_groq(key, request_body)
 
         let status: text = get(response, "status")

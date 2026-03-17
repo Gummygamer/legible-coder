@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# legible-coder — wrapper script
+# Resolves the real path to coder.lbl regardless of where the script is symlinked,
+# then delegates to the Legible interpreter.
+
+set -e
+
+# Follow symlinks to find the actual script directory
+SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
+DIR="$(dirname "$SCRIPT")"
+CODER="$DIR/coder.lbl"
+
+if [ ! -f "$CODER" ]; then
+  echo "Error: cannot find coder.lbl at $CODER" >&2
+  exit 1
+fi
+
+if ! command -v legible &>/dev/null; then
+  echo "Error: 'legible' interpreter not found in PATH." >&2
+  echo "Build it with: cargo install --path /path/to/legible-lang/legible" >&2
+  exit 1
+fi
+
+exec legible run "$CODER" "$@"

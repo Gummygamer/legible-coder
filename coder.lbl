@@ -1,0 +1,346 @@
+-- legible-coder: an interactive CLI coding assistant for the Legible language
+-- Powered by gpt-oss-120b via the Groq API
+
+-- Build a parameter definition for a tool
+function make_param(pname: text, pdesc: text): a mapping from text to text
+  intent: create a parameter description mapping
+  {"type": "string", "description": pdesc}
+end
+
+-- Build a single tool definition as a mapping
+function make_tool(name: text, description: text, param_names: a list of text, param_descs: a list of text, required_params: a list of text): a mapping from text to text
+  intent: construct a tool definition mapping for the Groq API
+  mutable properties: a mapping from text to text = {}
+  mutable i: integer = 0
+  for pname in param_names do
+    let pdesc: text = get(param_descs, i)
+    set properties = put(properties, pname, make_param(pname, pdesc))
+    set i = i + 1
+  end
+  {
+    "type": "function",
+    "function": {
+      "name": name,
+      "description": description,
+      "parameters": {
+        "type": "object",
+        "properties": properties,
+        "required": required_params
+      }
+    }
+  }
+end
+
+-- Tool definitions for the API
+function tool_definitions(): a list of a mapping from text to text
+  intent: return list of tool definitions for the Groq API
+  let read_tool: a mapping from text to text = make_tool(
+    "read_file",
+    "Read the contents of a file at the given path.",
+    ["path"],
+    ["The file path to read"],
+    ["path"]
+  )
+  let write_tool: a mapping from text to text = make_tool(
+    "write_file",
+    "Write content to a file at the given path. Creates or overwrites.",
+    ["path", "content"],
+    ["The file path to write", "The content to write"],
+    ["path", "content"]
+  )
+  let shell_tool: a mapping from text to text = make_tool(
+    "shell_exec",
+    "Run a shell command and return stdout, stderr, and exit code.",
+    ["command"],
+    ["The shell command to execute"],
+    ["command"]
+  )
+  let list_tool: a mapping from text to text = make_tool(
+    "list_dir",
+    "List files and directories at a given path.",
+    ["path"],
+    ["The directory path to list"],
+    ["path"]
+  )
+  let grep_tool: a mapping from text to text = make_tool(
+    "grep",
+    "Search for a pattern in files. Returns matching lines.",
+    ["pattern", "path", "glob"],
+    ["The regex pattern to search for", "Directory or file to search in", "Glob to filter files, e.g. *.lbl"],
+    ["pattern"]
+  )
+  [read_tool, write_tool, shell_tool, list_tool, grep_tool]
+end
+
+-- Execute a tool call and return the result as text
+function execute_tool(name: text, arguments: text): text
+  intent: execute a tool call by name with JSON arguments and return the result
+  let args: a mapping from text to text = json_parse(arguments)
+
+  if name == "read_file" then
+    let path: text = get(args, "path")
+    if file_exists(path) then
+      read_file(path)
+    else
+      "Error: file not found: " ++ path
+    end
+
+  else if name == "write_file" then
+    let path: text = get(args, "path")
+    let content: text = get(args, "content")
+    write_file(path, content)
+    "File written successfully: " ++ path
+
+  else if name == "shell_exec" then
+    let command: text = get(args, "command")
+    let result: a mapping from text to text = shell_exec(command)
+    let stdout: text = get(result, "stdout")
+    let stderr: text = get(result, "stderr")
+    let exit_code: text = to_text(get(result, "exit_code"))
+    let output: text = "exit_code: " ++ exit_code
+    let output2: text = if text_length(stdout) > 0 then
+      output ++ "\nstdout:\n" ++ stdout
+    else
+      output
+    end
+    if text_length(stderr) > 0 then
+      output2 ++ "\nstderr:\n" ++ stderr
+    else
+      output2
+    end
+
+  else if name == "list_dir" then
+    let path: text = get(args, "path")
+    if is_dir(path) then
+      let entries: a list of text = list_dir(path)
+      join(entries, "\n")
+    else
+      "Error: not a directory: " ++ path
+    end
+
+  else if name == "grep" then
+    let pattern: text = get(args, "pattern")
+    let path: text = unwrap_or(get(args, "path"), ".")
+    let glob_pattern: text = unwrap_or(get(args, "glob"), "")
+    let cmd: text = if text_length(glob_pattern) > 0 then
+      "grep -rn --include='" ++ glob_pattern ++ "' '" ++ pattern ++ "' " ++ path ++ " 2>&1 | head -50"
+    else
+      "grep -rn '" ++ pattern ++ "' " ++ path ++ " 2>&1 | head -50"
+    end
+    let result: a mapping from text to text = shell_exec(cmd)
+    let stdout: text = get(result, "stdout")
+    if text_length(stdout) > 0 then
+      stdout
+    else
+      "No matches found."
+    end
+
+  else
+    "Error: unknown tool: " ++ name
+  end
+end
+
+-- Build the system prompt
+function system_prompt(): text
+  intent: return the system prompt that instructs the model how to behave
+  let cwd: text = get_cwd()
+  "You are legible-coder, an interactive CLI coding assistant. " ++
+  "You write code in the Legible programming language and perform tasks by running Legible scripts.\n\n" ++
+  "Current working directory: " ++ cwd ++ "\n\n" ++
+  "You have access to tools: read_file, write_file, shell_exec, list_dir, grep.\n" ++
+  "Use them to explore code, read files, write code, and run commands.\n\n" ++
+  "The Legible language (.lbl files) key syntax:\n" ++
+  "- `let x: type = value` for immutable, `mutable x: type = value` for mutable\n" ++
+  "- `set x = value` to update mutable bindings\n" ++
+  "- `function name(params): return_type` ... `end` for functions\n" ++
+  "- Optional `intent:`, `requires:`, `ensures:` clauses after function signature\n" ++
+  "- `record Name` ... `end` for data structures\n" ++
+  "- `union Name` ... `end` for tagged unions with `match`/`when`\n" ++
+  "- `if`/`else if`/`else`/`end`, `for item in list do`/`end`, `while`/`end`\n" ++
+  "- `++` for string concatenation, `|>` for pipelines\n" ++
+  "- `fn(x: type): ret => expr` for lambdas\n" ++
+  "- `use module_name` to import modules (loads module_name.lbl)\n" ++
+  "- `public function` to export from modules\n" ++
+  "- Comments start with `--`\n" ++
+  "- Types: integer, decimal, text, boolean, nothing, a list of T, a mapping from K to V, an optional T\n" ++
+  "- Built-ins: print, read_line, length, append, concat, filter, map, reduce, sort_by, find,\n" ++
+  "  split, join, trim, replace, substring, contains_text, index_of, keys, values, get, put, has_key,\n" ++
+  "  json_parse, json_encode, read_file, write_file, file_exists, shell_exec,\n" ++
+  "  http_client_get, http_client_post, range, take, drop, to_text, to_integer, to_decimal\n" ++
+  "- Run Legible programs with: legible run file.lbl\n\n" ++
+  "When writing Legible code:\n" ++
+  "- Always include intent clauses for non-trivial functions\n" ++
+  "- Use descriptive variable names and prefer immutable bindings\n" ++
+  "- Use pipelines for data transformations\n" ++
+  "- Entry point should be `function main(): nothing` for standalone programs\n\n" ++
+  "Keep responses concise. Use tools to explore and modify code. " ++
+  "Write code to files with write_file. Run things with shell_exec."
+end
+
+-- Build the API request body mapping
+function build_request(messages: a list of a mapping from text to text): a mapping from text to text
+  intent: build the request body mapping for the Groq chat completions API
+  {
+    "model": "gpt-oss-120b",
+    "messages": messages,
+    "tools": tool_definitions(),
+    "tool_choice": "auto",
+    "max_tokens": 16384
+  }
+end
+
+-- Call the Groq API
+function call_groq(api_key: text, request_body: a mapping from text to text): a mapping from text to text
+  intent: make a POST request to the Groq chat completions API
+  let headers: a mapping from text to text = {
+    "Authorization": "Bearer " ++ api_key,
+    "Content-Type": "application/json"
+  }
+  let body_json: text = json_encode(request_body)
+  let response: a mapping from text to text = http_client_post(
+    "https://api.groq.com/openai/v1/chat/completions",
+    headers,
+    body_json
+  )
+  response
+end
+
+-- Print styled output
+function print_banner(): nothing
+  intent: display the welcome banner
+  print("")
+  print("  legible-coder")
+  print("  Interactive Legible coding assistant")
+  print("  Powered by gpt-oss-120b via Groq")
+  print("  ────────────────────────────────────────────")
+  let cwd: text = get_cwd()
+  print("  cwd: " ++ cwd)
+  print("  Type your request, or 'quit' to exit.")
+  print("")
+end
+
+function print_separator(): nothing
+  intent: print a visual separator
+  print("  ────────────────────────────────────────────")
+end
+
+-- Main conversation loop
+function main(): nothing
+  intent: run the interactive REPL loop for the coding assistant
+
+  -- Check for API key
+  let api_key: an optional text = env_get("GROQ_API_KEY")
+  if is_none(api_key) then
+    print("Error: GROQ_API_KEY environment variable is not set.")
+    print("Set it with: export GROQ_API_KEY=\"your-key-here\"")
+    exit_process(1)
+  end
+  let key: text = unwrap(api_key)
+
+  print_banner()
+
+  -- Conversation history as a list of message mappings
+  let sys_msg: a mapping from text to text = {"role": "system", "content": system_prompt()}
+  mutable messages: a list of a mapping from text to text = [sys_msg]
+
+  -- Main loop
+  mutable running: boolean = true
+  while running do
+    -- Prompt
+    print("  > ")
+    let user_input: text = trim(read_line())
+
+    if user_input == "quit" or user_input == "exit" then
+      print("  Goodbye!")
+      set running = false
+    else if text_length(user_input) == 0 then
+      print("")
+    else
+      -- Add user message to history
+      let user_msg: a mapping from text to text = {"role": "user", "content": user_input}
+      set messages = append(messages, user_msg)
+
+      -- Tool call loop: keep calling API until we get a text response
+      mutable waiting: boolean = true
+      while waiting do
+        let request_body: a mapping from text to text = build_request(messages)
+        let response: a mapping from text to text = call_groq(key, request_body)
+
+        let status: text = get(response, "status")
+        let body: text = get(response, "body")
+
+        if status != "200" then
+          print("")
+          print("  API error (status " ++ status ++ "):")
+          let error_data: a mapping from text to text = json_parse(body)
+          let error_info: a mapping from text to text = unwrap_or(get(error_data, "error"), {})
+          let error_msg: text = unwrap_or(get(error_info, "message"), body)
+          print("  " ++ error_msg)
+          print("")
+          set waiting = false
+        else
+          let data: a mapping from text to text = json_parse(body)
+          let choices: a list of a mapping from text to text = get(data, "choices")
+          let choice: a mapping from text to text = get(choices, 0)
+          let message_obj: a mapping from text to text = get(choice, "message")
+          let finish_reason: text = unwrap_or(get(choice, "finish_reason"), "stop")
+
+          if finish_reason == "tool_calls" then
+            -- Model wants to call tools
+            let tool_calls: a list of a mapping from text to text = unwrap_or(get(message_obj, "tool_calls"), [])
+
+            -- Add assistant message with tool_calls to history
+            let asst_msg: a mapping from text to text = {
+              "role": "assistant",
+              "content": none,
+              "tool_calls": tool_calls
+            }
+            set messages = append(messages, asst_msg)
+
+            -- Execute each tool call and add results
+            for tc in tool_calls do
+              let fn_info: a mapping from text to text = get(tc, "function")
+              let tc_id: text = unwrap_or(get(tc, "id"), "")
+              let fn_name: text = get(fn_info, "name")
+              let fn_args: text = get(fn_info, "arguments")
+
+              print("  [tool] " ++ fn_name)
+
+              let result: text = execute_tool(fn_name, fn_args)
+
+              -- Truncate very long results
+              let result_text: text = if text_length(result) > 8000 then
+                substring(result, 0, 8000) ++ "\n... (truncated)"
+              else
+                result
+              end
+
+              let tool_msg: a mapping from text to text = {
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": result_text
+              }
+              set messages = append(messages, tool_msg)
+            end
+            -- Loop back to get the model's next response
+
+          else
+            -- Text response
+            let content: text = unwrap_or(get(message_obj, "content"), "")
+            if text_length(content) > 0 then
+              let asst_msg: a mapping from text to text = {"role": "assistant", "content": content}
+              set messages = append(messages, asst_msg)
+
+              print("")
+              print_separator()
+              print(content)
+              print_separator()
+              print("")
+            end
+            set waiting = false
+          end
+        end
+      end
+    end
+  end
+end

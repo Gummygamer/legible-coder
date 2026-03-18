@@ -252,6 +252,7 @@ function system_prompt(): text
   "  keys(map)  values(map)  get(map, key)  put(map, key, val)  has_key(map, key)\n" ++
   "  unwrap(opt)  unwrap_or(opt, default)  is_some(opt)  is_none(opt)\n" ++
   "  abs(n)  max(a,b)  min(a,b)  floor(n)  ceil(n)  round(n)\n" ++
+  "  random_int(max)  random_decimal()\n" ++
   "  read_file(path)  write_file(path, content)  file_exists(path)\n" ++
   "  shell_exec(cmd)  env_get(name)  get_cwd()  list_dir(path)  is_dir(path)\n" ++
   "  json_parse(text)  json_encode(value)  json_valid(text)\n" ++
@@ -283,13 +284,14 @@ function system_prompt(): text
   "- Every let/mutable binding needs a colon: let x: text = ... not let x text = ...\n" ++
   "- No semicolons, no curly braces for blocks — use end\n" ++
   "- Strings must be on one line; use ++ to concatenate across lines\n" ++
-  "- No named arguments: call shell_exec(cmd) not shell_exec(command = cmd)\n" ++
+  "- In Legible source code, ALL arguments are positional — shell_exec(cmd) not shell_exec(command = cmd)\n" ++
   "- 'any' is NOT a valid type; use 'text' for unknown value types\n" ++
   "- shell_exec returns 'a mapping from text to text'; all values including exit_code are text\n" ++
+  "- Use random_int(max) for random integers; do NOT use python or shell for RNG\n" ++
   "- No 'return' keyword; the last expression in a function body is returned\n" ++
   "- intent: values are unquoted plain text: intent: do something — NOT intent: \"do something\"\n" ++
   "- Dot access only works on records (record.field); for mappings use get(map, \"key\")\n" ++
-  "- 'a mapping from text to text' is the only map type; you cannot write 'mapping from ...' (needs 'a')\n" ++
+  "- Types require the article: 'a list of T' and 'a mapping from K to V' — never 'list of T' or 'mapping from K to V'\n" ++
   "- Write code to files with write_file, then run with shell_exec\n" ++
   "- Keep responses concise; use tools to act rather than describing what you would do"
 end

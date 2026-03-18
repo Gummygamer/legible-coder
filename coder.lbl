@@ -318,7 +318,7 @@ function print_banner(model: text): nothing
 end
 
 function print_separator(): nothing
-  intent: print the response separator
+  intent: emit a divider
   print("  ────────────────────────────────────────────")
 end
 

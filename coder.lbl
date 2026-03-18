@@ -81,10 +81,22 @@ end
 
 -- ─── Tool validation ──────────────────────────────────────────────────────────
 
+-- Strip model special-token suffixes like "<|channel|>commentary" from a tool name
+function clean_tool_name(name: text): text
+  intent: strip everything from the first angle bracket onward in name
+  let bracket: integer = index_of(name, "<")
+  if bracket > 0 then
+    trim(substring(name, 0, bracket))
+  else
+    name
+  end
+end
+
 function is_known_tool(name: text): boolean
-  intent: compare name to read_file, write_file, shell_exec, list_dir, read_dir_recursive, and grep
-  name == "read_file" or name == "write_file" or name == "shell_exec" or
-  name == "list_dir" or name == "read_dir_recursive" or name == "grep"
+  intent: compare the cleaned name to read_file, write_file, shell_exec, list_dir, read_dir_recursive, and grep
+  let n: text = clean_tool_name(name)
+  n == "read_file" or n == "write_file" or n == "shell_exec" or
+  n == "list_dir" or n == "read_dir_recursive" or n == "grep"
 end
 
 function describe_tool_call(name: text, arguments: text): text
@@ -292,6 +304,10 @@ function system_prompt(): text
   "- intent: values are unquoted plain text: intent: do something — NOT intent: \"do something\"\n" ++
   "- Dot access only works on records (record.field); for mappings use get(map, \"key\")\n" ++
   "- Types require the article: 'a list of T' and 'a mapping from K to V' — never 'list of T' or 'mapping from K to V'\n" ++
+  "- No 'elseif' keyword — use 'else if' (two words)\n" ++
+  "- No 'break' keyword — use a mutable boolean flag to exit loops\n" ++
+  "- No array/list indexing with [] — use get(list, index) instead\n" ++
+  "- Semicolons are not allowed anywhere, including inside intent descriptions\n" ++
   "- Write code to files with write_file, then run with shell_exec\n" ++
   "- Keep responses concise; use tools to act rather than describing what you would do"
 end
@@ -433,7 +449,7 @@ function main(): nothing
               for tc in valid_calls do
                 let fn_info: a mapping from text to text = get(tc, "function")
                 let tc_id: text = unwrap_or(get(tc, "id"), "")
-                let fn_name: text = get(fn_info, "name")
+                let fn_name: text = clean_tool_name(get(fn_info, "name"))
                 let fn_args: text = get(fn_info, "arguments")
 
                 set tool_calls_this_turn = tool_calls_this_turn + 1

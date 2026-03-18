@@ -84,9 +84,9 @@ end
 -- Strip model special-token suffixes like "<|channel|>commentary" from a tool name
 function clean_tool_name(name: text): text
   intent: strip everything from the first angle bracket onward in name
-  let bracket: an optional integer = index_of(name, "<")
-  if is_some(bracket) and unwrap(bracket) > 0 then
-    trim(substring(name, 0, unwrap(bracket)))
+  let bracket: integer = unwrap_or(index_of(name, "<"), -1)
+  if bracket > 0 then
+    trim(substring(name, 0, bracket))
   else
     name
   end
@@ -359,10 +359,93 @@ function print_separator(): nothing
   print("  ────────────────────────────────────────────")
 end
 
+-- ─── Tool call batch execution ────────────────────────────────────────────────
+
+record BatchResult
+  messages: a list of a mapping from text to text
+  count: integer
+  stop: boolean
+end
+
+function run_tool_batch(messages: a list of a mapping from text to text, valid_calls: a list of a mapping from text to text, tool_count: integer): BatchResult
+  intent: append the assistant tool_calls message, execute each call, and return updated messages and count
+  let asst_msg: a mapping from text to text = {"role": "assistant", "content": none, "tool_calls": valid_calls}
+  mutable msgs: a list of a mapping from text to text = append(messages, asst_msg)
+  mutable n: integer = tool_count
+  for tc in valid_calls do
+    let fn_info: a mapping from text to text = get(tc, "function")
+    let tc_id: text = unwrap_or(get(tc, "id"), "")
+    let fn_name: text = clean_tool_name(get(fn_info, "name"))
+    let fn_args: text = get(fn_info, "arguments")
+    set n = n + 1
+    print("  [" ++ to_text(n) ++ "] " ++ describe_tool_call(fn_name, fn_args))
+    let raw: text = execute_tool(fn_name, fn_args)
+    let result: text = if text_length(raw) > 8000 then substring(raw, 0, 8000) ++ "\n... (truncated)" else raw end
+    set msgs = append(msgs, {"role": "tool", "tool_call_id": tc_id, "content": result})
+  end
+  let hit_cap: boolean = n >= 30
+  if hit_cap then print("  [warn] reached 30 tool calls this turn, stopping") end
+  BatchResult {messages: msgs, count: n, stop: hit_cap}
+end
+
+-- ─── Inner API loop ───────────────────────────────────────────────────────────
+
+function filter_valid_calls(all_calls: a list of a mapping from text to text): a list of a mapping from text to text
+  intent: keep only tool calls with known names and valid JSON object arguments
+  filter(all_calls, fn(tc: a mapping from text to text): boolean => is_known_tool(get(get(tc, "function"), "name")) and json_valid(get(get(tc, "function"), "arguments")) and starts_with(trim(get(get(tc, "function"), "arguments")), "\{"))
+end
+
+function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, model: text): a list of a mapping from text to text
+  intent: call the API in a loop executing tool calls until the model returns text or an error occurs
+  mutable msgs: a list of a mapping from text to text = init_messages
+  mutable waiting: boolean = true
+  mutable tool_count: integer = 0
+  while waiting do
+    let resp: a mapping from text to text = call_groq(key, build_request(model, msgs))
+    let status: text = get(resp, "status")
+    if status != "200" then
+      let err_data: a mapping from text to text = json_parse(get(resp, "body"))
+      let err_info: a mapping from text to text = unwrap_or(get(err_data, "error"), {})
+      print("  API error (status " ++ status ++ "):")
+      print("  " ++ unwrap_or(get(err_info, "message"), get(resp, "body")))
+      set msgs = take(msgs, messages_start)
+      set waiting = false
+    else
+      let choice: a mapping from text to text = get(get(json_parse(get(resp, "body")), "choices"), 0)
+      let msg: a mapping from text to text = get(choice, "message")
+      let finish: text = unwrap_or(get(choice, "finish_reason"), "stop")
+      if finish == "tool_calls" then
+        let valid_calls: a list of a mapping from text to text = filter_valid_calls(unwrap_or(get(msg, "tool_calls"), []))
+        if length(valid_calls) > 0 then
+          let batch: BatchResult = run_tool_batch(msgs, valid_calls, tool_count)
+          set msgs = batch.messages
+          set tool_count = batch.count
+          if batch.stop then set waiting = false end
+        else
+          print("  [warn] all tool calls invalid, ending turn")
+          set waiting = false
+        end
+      else
+        let content: text = unwrap_or(get(msg, "content"), "")
+        if text_length(content) > 0 then
+          set msgs = append(msgs, {"role": "assistant", "content": content})
+          print("")
+          print_separator()
+          print(content)
+          print_separator()
+          print("")
+        end
+        set waiting = false
+      end
+    end
+  end
+  msgs
+end
+
 -- ─── Main loop ────────────────────────────────────────────────────────────────
 
 function main(): nothing
-  intent: read api_key and model, then loop reading user messages and calling the assistant
+  intent: read api_key and model, print the banner, then loop reading user messages and calling the assistant
   let api_key: an optional text = env_get("GROQ_API_KEY")
   if is_none(api_key) then
     print("Error: GROQ_API_KEY environment variable is not set.")
@@ -371,132 +454,22 @@ function main(): nothing
   end
   let key: text = unwrap(api_key)
   let model: text = unwrap_or(env_get("LEGIBLE_CODER_MODEL"), "openai/gpt-oss-120b")
-
   print_banner(model)
-
   let sys_msg: a mapping from text to text = {"role": "system", "content": system_prompt()}
   mutable messages: a list of a mapping from text to text = [sys_msg]
-
   mutable running: boolean = true
   while running do
     print("  > ")
     let user_input: text = trim(read_line())
-
     if user_input == "quit" or user_input == "exit" then
       print("  Goodbye!")
       set running = false
     else if text_length(user_input) == 0 then
       print("")
     else
-      let user_msg: a mapping from text to text = {"role": "user", "content": user_input}
-      set messages = append(messages, user_msg)
-      let messages_start: integer = length(messages)
-
-      mutable waiting: boolean = true
-      mutable tool_calls_this_turn: integer = 0
-      let max_tool_calls: integer = 30
-
-      while waiting do
-        let request_body: a mapping from text to text = build_request(model, messages)
-        let response: a mapping from text to text = call_groq(key, request_body)
-
-        let status: text = get(response, "status")
-        let body: text = get(response, "body")
-
-        if status != "200" then
-          print("")
-          print("  API error (status " ++ status ++ "):")
-          let error_data: a mapping from text to text = json_parse(body)
-          let error_info: a mapping from text to text = unwrap_or(get(error_data, "error"), {})
-          let error_msg: text = unwrap_or(get(error_info, "message"), body)
-          print("  " ++ error_msg)
-          print("")
-          set messages = take(messages, messages_start)
-          set waiting = false
-        else
-          let data: a mapping from text to text = json_parse(body)
-          let choices: a list of a mapping from text to text = get(data, "choices")
-          let choice: a mapping from text to text = get(choices, 0)
-          let message_obj: a mapping from text to text = get(choice, "message")
-          let finish_reason: text = unwrap_or(get(choice, "finish_reason"), "stop")
-
-          if finish_reason == "tool_calls" then
-            let all_calls: a list of a mapping from text to text = unwrap_or(get(message_obj, "tool_calls"), [])
-
-            -- Filter: keep only known tools with valid JSON object arguments
-            let valid_calls: a list of a mapping from text to text = filter(all_calls, fn(tc: a mapping from text to text): boolean => is_known_tool(get(get(tc, "function"), "name")) and json_valid(get(get(tc, "function"), "arguments")) and starts_with(trim(get(get(tc, "function"), "arguments")), "\{"))
-
-            -- Log skipped calls
-            for tc in all_calls do
-              let fn_info: a mapping from text to text = get(tc, "function")
-              let fn_name: text = get(fn_info, "name")
-              let fn_args: text = get(fn_info, "arguments")
-              if not is_known_tool(fn_name) then
-                print("  [skip] unregistered tool: " ++ fn_name)
-              else if not json_valid(fn_args) or not starts_with(trim(fn_args), "\{") then
-                print("  [skip] invalid arguments for: " ++ fn_name)
-              end
-            end
-
-            if length(valid_calls) > 0 then
-              let asst_msg: a mapping from text to text = {
-                "role": "assistant",
-                "content": none,
-                "tool_calls": valid_calls
-              }
-              set messages = append(messages, asst_msg)
-
-              for tc in valid_calls do
-                let fn_info: a mapping from text to text = get(tc, "function")
-                let tc_id: text = unwrap_or(get(tc, "id"), "")
-                let fn_name: text = clean_tool_name(get(fn_info, "name"))
-                let fn_args: text = get(fn_info, "arguments")
-
-                set tool_calls_this_turn = tool_calls_this_turn + 1
-                print("  [" ++ to_text(tool_calls_this_turn) ++ "] " ++ describe_tool_call(fn_name, fn_args))
-
-                let result: text = execute_tool(fn_name, fn_args)
-                let result_text: text = if text_length(result) > 8000 then
-                  substring(result, 0, 8000) ++ "\n... (truncated)"
-                else
-                  result
-                end
-
-                let tool_msg: a mapping from text to text = {
-                  "role": "tool",
-                  "tool_call_id": tc_id,
-                  "content": result_text
-                }
-                set messages = append(messages, tool_msg)
-              end
-
-              -- Stop if the model is burning through too many tool calls
-              if tool_calls_this_turn >= max_tool_calls then
-                print("  [warn] reached " ++ to_text(max_tool_calls) ++ " tool calls this turn, stopping")
-                set waiting = false
-              end
-
-            else
-              print("  [warn] all tool calls were invalid or unregistered, ending turn")
-              set waiting = false
-            end
-
-          else
-            let content: text = unwrap_or(get(message_obj, "content"), "")
-            if text_length(content) > 0 then
-              let asst_msg: a mapping from text to text = {"role": "assistant", "content": content}
-              set messages = append(messages, asst_msg)
-
-              print("")
-              print_separator()
-              print(content)
-              print_separator()
-              print("")
-            end
-            set waiting = false
-          end
-        end
-      end
+      set messages = append(messages, {"role": "user", "content": user_input})
+      let start: integer = length(messages)
+      set messages = run_inner_loop(messages, start, key, model)
     end
   end
 end

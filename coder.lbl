@@ -2,6 +2,8 @@
 -- Powered by openai/gpt-oss-120b via the Groq API
 -- Model can be overridden with the LEGIBLE_CODER_MODEL environment variable
 
+-- ─── Tool schema helpers ──────────────────────────────────────────────────────
+
 function make_param(pname: text, pdesc: text): a mapping from text to text
   intent: wrap pname and pdesc into a type and description mapping
   {"type": "string", "description": pdesc}
@@ -31,7 +33,7 @@ function make_tool(name: text, description: text, param_names: a list of text, p
 end
 
 function tool_definitions(): a list of a mapping from text to text
-  intent: assemble read, write, shell, list, and grep tool schemas into a list
+  intent: assemble read, write, shell, list, grep, and read_dir_recursive tool schemas into a list
   let read_tool: a mapping from text to text = make_tool(
     "read_file",
     "Read the contents of a file at the given path.",
@@ -55,9 +57,16 @@ function tool_definitions(): a list of a mapping from text to text
   )
   let list_tool: a mapping from text to text = make_tool(
     "list_dir",
-    "List files and directories at a given path.",
+    "List files and directories at a given path (one level only).",
     ["path"],
     ["The directory path to list"],
+    ["path"]
+  )
+  let recursive_tool: a mapping from text to text = make_tool(
+    "read_dir_recursive",
+    "Recursively list all files under a directory. Use this instead of repeated list_dir calls to understand the project structure.",
+    ["path"],
+    ["The root directory to list recursively"],
     ["path"]
   )
   let grep_tool: a mapping from text to text = make_tool(
@@ -67,18 +76,21 @@ function tool_definitions(): a list of a mapping from text to text
     ["The regex pattern to search for", "Directory or file to search in", "Glob to filter files, e.g. *.lbl"],
     ["pattern"]
   )
-  [read_tool, write_tool, shell_tool, list_tool, grep_tool]
+  [read_tool, write_tool, shell_tool, list_tool, recursive_tool, grep_tool]
 end
 
+-- ─── Tool validation ──────────────────────────────────────────────────────────
+
 function is_known_tool(name: text): boolean
-  intent: compare name to read_file, write_file, shell_exec, list_dir, and grep
-  name == "read_file" or name == "write_file" or name == "shell_exec" or name == "list_dir" or name == "grep"
+  intent: compare name to read_file, write_file, shell_exec, list_dir, read_dir_recursive, and grep
+  name == "read_file" or name == "write_file" or name == "shell_exec" or
+  name == "list_dir" or name == "read_dir_recursive" or name == "grep"
 end
 
 function describe_tool_call(name: text, arguments: text): text
   intent: format name with its path, command, or pattern argument as a short label
   let args: a mapping from text to text = json_parse(arguments)
-  if name == "read_file" or name == "list_dir" then
+  if name == "read_file" or name == "list_dir" or name == "read_dir_recursive" then
     name ++ "  " ++ unwrap_or(get(args, "path"), "")
   else if name == "write_file" then
     name ++ "  " ++ unwrap_or(get(args, "path"), "")
@@ -95,8 +107,10 @@ function describe_tool_call(name: text, arguments: text): text
   end
 end
 
+-- ─── Tool execution ───────────────────────────────────────────────────────────
+
 function execute_tool(name: text, arguments: text): text
-  intent: parse arguments and dispatch to read_file, write_file, shell_exec, list_dir, or grep
+  intent: parse arguments and dispatch to read_file, write_file, shell_exec, list_dir, read_dir_recursive, or grep
   let args: a mapping from text to text = json_parse(arguments)
 
   if name == "read_file" then
@@ -140,6 +154,11 @@ function execute_tool(name: text, arguments: text): text
       "Error: not a directory: " ++ path
     end
 
+  else if name == "read_dir_recursive" then
+    let path: text = get(args, "path")
+    let result: a mapping from text to text = shell_exec("find " ++ path ++ " -type f | sort 2>&1 | head -200")
+    get(result, "stdout")
+
   else if name == "grep" then
     let pattern: text = get(args, "pattern")
     let path: text = unwrap_or(get(args, "path"), ".")
@@ -162,41 +181,101 @@ function execute_tool(name: text, arguments: text): text
   end
 end
 
+-- ─── System prompt ────────────────────────────────────────────────────────────
+
 function system_prompt(): text
   intent: compose the Legible syntax reference and cwd into a prompt string
   let cwd: text = get_cwd()
   "You are legible-coder, an interactive CLI coding assistant. " ++
   "You write code in the Legible programming language and perform tasks by running Legible scripts.\n\n" ++
   "Current working directory: " ++ cwd ++ "\n\n" ++
-  "You have access to tools: read_file, write_file, shell_exec, list_dir, grep.\n" ++
-  "Use them to explore code, read files, write code, and run commands.\n\n" ++
-  "The Legible language (.lbl files) key syntax:\n" ++
-  "- `let x: type = value` for immutable, `mutable x: type = value` for mutable\n" ++
-  "- `set x = value` to update mutable bindings\n" ++
-  "- `function name(params): return_type` ... `end` for functions\n" ++
-  "- Optional `intent:`, `requires:`, `ensures:` clauses after function signature\n" ++
-  "- `record Name` ... `end` for data structures\n" ++
-  "- `union Name` ... `end` for tagged unions with `match`/`when`\n" ++
-  "- `if`/`else if`/`else`/`end`, `for item in list do`/`end`, `while`/`end`\n" ++
-  "- `++` for string concatenation, `|>` for pipelines\n" ++
-  "- `fn(x: type): ret => expr` for lambdas\n" ++
-  "- `use module_name` to import modules (loads module_name.lbl)\n" ++
-  "- `public function` to export from modules\n" ++
-  "- Comments start with `--`\n" ++
-  "- Types: integer, decimal, text, boolean, nothing, a list of T, a mapping from K to V, an optional T\n" ++
-  "- Built-ins: print, read_line, length, append, concat, filter, map, reduce, sort_by, find,\n" ++
-  "  split, join, trim, replace, substring, contains_text, index_of, keys, values, get, put, has_key,\n" ++
-  "  json_parse, json_encode, read_file, write_file, file_exists, shell_exec,\n" ++
-  "  http_client_get, http_client_post, range, take, drop, to_text, to_integer, to_decimal\n" ++
-  "- Run Legible programs with: legible run file.lbl\n\n" ++
-  "When writing Legible code:\n" ++
-  "- Always include intent clauses for non-trivial functions\n" ++
-  "- Use descriptive variable names and prefer immutable bindings\n" ++
-  "- Use pipelines for data transformations\n" ++
-  "- Entry point should be `function main(): nothing` for standalone programs\n\n" ++
-  "Keep responses concise. Use tools to explore and modify code. " ++
-  "Write code to files with write_file. Run things with shell_exec."
+  "TOOLS: read_file, write_file, shell_exec, list_dir, read_dir_recursive, grep.\n" ++
+  "Use read_dir_recursive to understand project structure in ONE call instead of many list_dir calls.\n\n" ++
+  "════ LEGIBLE LANGUAGE REFERENCE ════\n\n" ++
+  "BINDINGS:\n" ++
+  "  let name: type = value          -- immutable\n" ++
+  "  mutable name: type = value      -- mutable\n" ++
+  "  set name = new_value            -- update a mutable binding\n\n" ++
+  "TYPES:\n" ++
+  "  integer  decimal  text  boolean  nothing\n" ++
+  "  a list of T\n" ++
+  "  a mapping from K to V\n" ++
+  "  an optional T\n\n" ++
+  "FUNCTIONS:\n" ++
+  "  function name(param: type, param2: type): return_type\n" ++
+  "    intent: what this function does\n" ++
+  "    body\n" ++
+  "  end\n\n" ++
+  "RECORDS:\n" ++
+  "  record Name\n" ++
+  "    field: type\n" ++
+  "  end\n" ++
+  "  let x: Name = Name \{ field: value \}\n" ++
+  "  let updated: Name = x with \{ field: new_value \}\n\n" ++
+  "UNIONS:\n" ++
+  "  union Shape\n" ++
+  "    Circle \{ radius: decimal \}\n" ++
+  "    Point\n" ++
+  "  end\n" ++
+  "  match s when Circle \{ radius \} then radius * 3.14 when Point then 0.0 end\n\n" ++
+  "CONTROL FLOW:\n" ++
+  "  if cond then ... else if cond then ... else ... end\n" ++
+  "  for item in list do ... end\n" ++
+  "  while cond do ... end\n\n" ++
+  "OPERATORS:\n" ++
+  "  ++ (text concat)   |> (pipeline)   and or not\n\n" ++
+  "LAMBDAS:\n" ++
+  "  fn(x: integer): boolean => x > 0\n\n" ++
+  "MODULES:\n" ++
+  "  use module_name           -- loads module_name.lbl\n" ++
+  "  public function foo ...   -- export from a module\n" ++
+  "  module_name.foo()         -- call an exported function\n\n" ++
+  "BUILT-INS:\n" ++
+  "  print(v)  read_line()  to_text(v)  to_integer(v)  to_decimal(v)\n" ++
+  "  length(list)  append(list, item)  filter(list, fn)  map(list, fn)  reduce(list, init, fn)\n" ++
+  "  sort_by(list, fn)  find(list, fn)  take(list, n)  drop(list, n)  range(a, b)\n" ++
+  "  split(text, delim)  join(list, sep)  trim(s)  replace(s, from, to)\n" ++
+  "  substring(s, start, len)  text_length(s)  contains_text(s, sub)  index_of(s, sub)\n" ++
+  "  uppercase(s)  lowercase(s)  starts_with(s, p)  ends_with(s, p)\n" ++
+  "  keys(map)  values(map)  get(map, key)  put(map, key, val)  has_key(map, key)\n" ++
+  "  unwrap(opt)  unwrap_or(opt, default)  is_some(opt)  is_none(opt)\n" ++
+  "  abs(n)  max(a,b)  min(a,b)  floor(n)  ceil(n)  round(n)\n" ++
+  "  read_file(path)  write_file(path, content)  file_exists(path)\n" ++
+  "  shell_exec(cmd)  env_get(name)  get_cwd()  list_dir(path)  is_dir(path)\n" ++
+  "  json_parse(text)  json_encode(value)  json_valid(text)\n" ++
+  "  http_client_get(url, headers)  http_client_post(url, headers, body)\n\n" ++
+  "COMPLETE EXAMPLE:\n" ++
+  "  record Creature\n" ++
+  "    name: text\n" ++
+  "    hp: integer\n" ++
+  "    level: integer\n" ++
+  "  end\n\n" ++
+  "  function describe(c: Creature): text\n" ++
+  "    intent: format creature name, level, and hp as a status line\n" ++
+  "    c.name ++ \" lv\" ++ to_text(c.level) ++ \" HP:\" ++ to_text(c.hp)\n" ++
+  "  end\n\n" ++
+  "  function level_up(c: Creature): Creature\n" ++
+  "    intent: return c with level incremented and hp raised by ten\n" ++
+  "    c with \{ level: c.level + 1, hp: c.hp + 10 \}\n" ++
+  "  end\n\n" ++
+  "  function main(): nothing\n" ++
+  "    intent: create a creature, level it up, and print both states\n" ++
+  "    let p: Creature = Creature \{ name: \"Flareon\", hp: 40, level: 1 \}\n" ++
+  "    print(describe(p))\n" ++
+  "    let p2: Creature = level_up(p)\n" ++
+  "    print(describe(p2))\n" ++
+  "  end\n\n" ++
+  "Run programs with: legible run file.lbl\n\n" ++
+  "RULES:\n" ++
+  "- Every function parameter needs a colon: fn(x: text) not fn(x text)\n" ++
+  "- Every let/mutable binding needs a colon: let x: text = ... not let x text = ...\n" ++
+  "- No semicolons, no curly braces for blocks — use end\n" ++
+  "- Strings must be on one line; use ++ to concatenate across lines\n" ++
+  "- Write code to files with write_file, then run with shell_exec\n" ++
+  "- Keep responses concise; use tools to act rather than describing what you would do"
 end
+
+-- ─── API ──────────────────────────────────────────────────────────────────────
 
 function build_request(model: text, messages: a list of a mapping from text to text): a mapping from text to text
   intent: put model, messages, tools, and max_tokens into the chat completions request mapping
@@ -216,13 +295,14 @@ function call_groq(api_key: text, request_body: a mapping from text to text): a 
     "Content-Type": "application/json"
   }
   let body_json: text = json_encode(request_body)
-  let response: a mapping from text to text = http_client_post(
+  http_client_post(
     "https://api.groq.com/openai/v1/chat/completions",
     headers,
     body_json
   )
-  response
 end
+
+-- ─── UI helpers ───────────────────────────────────────────────────────────────
 
 function print_banner(model: text): nothing
   intent: print the legible-coder name, model, and cwd as the startup header
@@ -242,9 +322,10 @@ function print_separator(): nothing
   print("  ────────────────────────────────────────────")
 end
 
+-- ─── Main loop ────────────────────────────────────────────────────────────────
+
 function main(): nothing
   intent: read api_key and model, then loop reading user messages and calling the assistant
-  -- Check for API key
   let api_key: an optional text = env_get("GROQ_API_KEY")
   if is_none(api_key) then
     print("Error: GROQ_API_KEY environment variable is not set.")
@@ -256,14 +337,11 @@ function main(): nothing
 
   print_banner(model)
 
-  -- Conversation history as a list of message mappings
   let sys_msg: a mapping from text to text = {"role": "system", "content": system_prompt()}
   mutable messages: a list of a mapping from text to text = [sys_msg]
 
-  -- Main loop
   mutable running: boolean = true
   while running do
-    -- Prompt
     print("  > ")
     let user_input: text = trim(read_line())
 
@@ -273,12 +351,13 @@ function main(): nothing
     else if text_length(user_input) == 0 then
       print("")
     else
-      -- Add user message to history
       let user_msg: a mapping from text to text = {"role": "user", "content": user_input}
       set messages = append(messages, user_msg)
 
-      -- Tool call loop: keep calling API until we get a text response
       mutable waiting: boolean = true
+      mutable tool_calls_this_turn: integer = 0
+      let max_tool_calls: integer = 30
+
       while waiting do
         let request_body: a mapping from text to text = build_request(model, messages)
         let response: a mapping from text to text = call_groq(key, request_body)
@@ -303,41 +382,41 @@ function main(): nothing
           let finish_reason: text = unwrap_or(get(choice, "finish_reason"), "stop")
 
           if finish_reason == "tool_calls" then
-            -- Model wants to call tools; discard any calls to unregistered tool names
-            -- to prevent Groq from rejecting the next request during history validation
             let all_calls: a list of a mapping from text to text = unwrap_or(get(message_obj, "tool_calls"), [])
-            let tool_calls: a list of a mapping from text to text = filter(all_calls, fn(tc: a mapping from text to text): boolean => is_known_tool(get(get(tc, "function"), "name")))
 
-            -- Warn about any hallucinated tool names the model tried to call
+            -- Filter: keep only known tools with valid JSON arguments
+            let valid_calls: a list of a mapping from text to text = filter(all_calls, fn(tc: a mapping from text to text): boolean => is_known_tool(get(get(tc, "function"), "name")) and json_valid(get(get(tc, "function"), "arguments")))
+
+            -- Log skipped calls
             for tc in all_calls do
               let fn_info: a mapping from text to text = get(tc, "function")
               let fn_name: text = get(fn_info, "name")
+              let fn_args: text = get(fn_info, "arguments")
               if not is_known_tool(fn_name) then
                 print("  [skip] unregistered tool: " ++ fn_name)
+              else if not json_valid(fn_args) then
+                print("  [skip] invalid arguments for: " ++ fn_name)
               end
             end
 
-            -- Only add assistant message if there are valid tool calls to execute
-            if length(tool_calls) > 0 then
+            if length(valid_calls) > 0 then
               let asst_msg: a mapping from text to text = {
                 "role": "assistant",
                 "content": none,
-                "tool_calls": tool_calls
+                "tool_calls": valid_calls
               }
               set messages = append(messages, asst_msg)
 
-              -- Execute each valid tool call and add result to history
-              for tc in tool_calls do
+              for tc in valid_calls do
                 let fn_info: a mapping from text to text = get(tc, "function")
                 let tc_id: text = unwrap_or(get(tc, "id"), "")
                 let fn_name: text = get(fn_info, "name")
                 let fn_args: text = get(fn_info, "arguments")
 
-                print("  [tool] " ++ describe_tool_call(fn_name, fn_args))
+                set tool_calls_this_turn = tool_calls_this_turn + 1
+                print("  [" ++ to_text(tool_calls_this_turn) ++ "] " ++ describe_tool_call(fn_name, fn_args))
 
                 let result: text = execute_tool(fn_name, fn_args)
-
-                -- Truncate very long results
                 let result_text: text = if text_length(result) > 8000 then
                   substring(result, 0, 8000) ++ "\n... (truncated)"
                 else
@@ -351,15 +430,19 @@ function main(): nothing
                 }
                 set messages = append(messages, tool_msg)
               end
+
+              -- Stop if the model is burning through too many tool calls
+              if tool_calls_this_turn >= max_tool_calls then
+                print("  [warn] reached " ++ to_text(max_tool_calls) ++ " tool calls this turn, stopping")
+                set waiting = false
+              end
+
             else
-              -- All tool calls were to unregistered tools; stop this turn
-              print("  [warn] model only called unregistered tools, ending turn")
+              print("  [warn] all tool calls were invalid or unregistered, ending turn")
               set waiting = false
             end
-            -- Loop back to get the model's next response
 
           else
-            -- Text response
             let content: text = unwrap_or(get(message_obj, "content"), "")
             if text_length(content) > 0 then
               let asst_msg: a mapping from text to text = {"role": "assistant", "content": content}

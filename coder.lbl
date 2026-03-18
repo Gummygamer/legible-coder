@@ -84,9 +84,9 @@ end
 -- Strip model special-token suffixes like "<|channel|>commentary" from a tool name
 function clean_tool_name(name: text): text
   intent: strip everything from the first angle bracket onward in name
-  let bracket: integer = index_of(name, "<")
-  if bracket > 0 then
-    trim(substring(name, 0, bracket))
+  let bracket: an optional integer = index_of(name, "<")
+  if is_some(bracket) and unwrap(bracket) > 0 then
+    trim(substring(name, 0, unwrap(bracket)))
   else
     name
   end

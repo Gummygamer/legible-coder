@@ -32,51 +32,27 @@ function make_tool(name: text, description: text, param_names: a list of text, p
   }
 end
 
+function file_tools(): a list of a mapping from text to text
+  intent: build read_file, write_file, list_dir, and read_dir_recursive tool schemas
+  let read_tool: a mapping from text to text = make_tool("read_file", "Read the contents of a file at the given path.", ["path"], ["The file path to read"], ["path"])
+  let write_tool: a mapping from text to text = make_tool("write_file", "Write content to a file at the given path. Creates or overwrites.", ["path", "content"], ["The file path to write", "The content to write"], ["path", "content"])
+  let list_tool: a mapping from text to text = make_tool("list_dir", "List files and directories at a given path (one level only).", ["path"], ["The directory path to list"], ["path"])
+  let recursive_tool: a mapping from text to text = make_tool("read_dir_recursive", "Recursively list all files under a directory. Use this instead of repeated list_dir calls to understand the project structure.", ["path"], ["The root directory to list recursively"], ["path"])
+  [read_tool, write_tool, list_tool, recursive_tool]
+end
+
+function search_tools(): a list of a mapping from text to text
+  intent: build shell_exec and grep tool schemas
+  let shell_tool: a mapping from text to text = make_tool("shell_exec", "Run a shell command and return stdout, stderr, and exit code.", ["command"], ["The shell command to execute"], ["command"])
+  let grep_tool: a mapping from text to text = make_tool("grep", "Search for a pattern in files. Returns matching lines.", ["pattern", "path", "glob"], ["The regex pattern to search for", "Directory or file to search in", "Glob to filter files, e.g. *.lbl"], ["pattern"])
+  [shell_tool, grep_tool]
+end
+
 function tool_definitions(): a list of a mapping from text to text
-  intent: assemble read, write, shell, list, grep, and read_dir_recursive tool schemas into a list
-  let read_tool: a mapping from text to text = make_tool(
-    "read_file",
-    "Read the contents of a file at the given path.",
-    ["path"],
-    ["The file path to read"],
-    ["path"]
-  )
-  let write_tool: a mapping from text to text = make_tool(
-    "write_file",
-    "Write content to a file at the given path. Creates or overwrites.",
-    ["path", "content"],
-    ["The file path to write", "The content to write"],
-    ["path", "content"]
-  )
-  let shell_tool: a mapping from text to text = make_tool(
-    "shell_exec",
-    "Run a shell command and return stdout, stderr, and exit code.",
-    ["command"],
-    ["The shell command to execute"],
-    ["command"]
-  )
-  let list_tool: a mapping from text to text = make_tool(
-    "list_dir",
-    "List files and directories at a given path (one level only).",
-    ["path"],
-    ["The directory path to list"],
-    ["path"]
-  )
-  let recursive_tool: a mapping from text to text = make_tool(
-    "read_dir_recursive",
-    "Recursively list all files under a directory. Use this instead of repeated list_dir calls to understand the project structure.",
-    ["path"],
-    ["The root directory to list recursively"],
-    ["path"]
-  )
-  let grep_tool: a mapping from text to text = make_tool(
-    "grep",
-    "Search for a pattern in files. Returns matching lines.",
-    ["pattern", "path", "glob"],
-    ["The regex pattern to search for", "Directory or file to search in", "Glob to filter files, e.g. *.lbl"],
-    ["pattern"]
-  )
-  [read_tool, write_tool, shell_tool, list_tool, recursive_tool, grep_tool]
+  intent: combine file_tools and search_tools into one list
+  let ft: a list of a mapping from text to text = file_tools()
+  let st: a list of a mapping from text to text = search_tools()
+  reduce(st, ft, fn(acc: a list of a mapping from text to text, t: a mapping from text to text): a list of a mapping from text to text => append(acc, t))
 end
 
 -- ─── Tool validation ──────────────────────────────────────────────────────────
@@ -121,85 +97,64 @@ end
 
 -- ─── Tool execution ───────────────────────────────────────────────────────────
 
+function exec_write_file(args: a mapping from text to text): text
+  intent: write content to path and print a diff if the file already existed
+  let path: text = get(args, "path")
+  let content: text = get(args, "content")
+  if file_exists(path) then
+    let old_content: text = read_file(path)
+    write_file("/tmp/legible_coder_old", old_content)
+    write_file(path, content)
+    let diff_output: text = get(shell_exec("diff -u /tmp/legible_coder_old " ++ path ++ " 2>&1 | head -120"), "stdout")
+    if text_length(diff_output) > 0 then
+      print("")
+      print(diff_output)
+    end
+  else
+    write_file(path, content)
+  end
+  "File written successfully: " ++ path
+end
+
+function exec_shell(args: a mapping from text to text): text
+  intent: run the command and return exit_code, stdout, and stderr as text
+  let result: a mapping from text to text = shell_exec(get(args, "command"))
+  let base: text = "exit_code: " ++ to_text(get(result, "exit_code"))
+  let with_out: text = if text_length(get(result, "stdout")) > 0 then base ++ "\nstdout:\n" ++ get(result, "stdout") else base end
+  if text_length(get(result, "stderr")) > 0 then with_out ++ "\nstderr:\n" ++ get(result, "stderr") else with_out end
+end
+
+function exec_grep(args: a mapping from text to text): text
+  intent: run grep with pattern, path, and optional glob and return matching lines
+  let pattern: text = get(args, "pattern")
+  let path: text = unwrap_or(get(args, "path"), ".")
+  let glob_pattern: text = unwrap_or(get(args, "glob"), "")
+  let cmd: text = if text_length(glob_pattern) > 0 then
+    "grep -rn --include='" ++ glob_pattern ++ "' '" ++ pattern ++ "' " ++ path ++ " 2>&1 | head -50"
+  else
+    "grep -rn '" ++ pattern ++ "' " ++ path ++ " 2>&1 | head -50"
+  end
+  let stdout: text = get(shell_exec(cmd), "stdout")
+  if text_length(stdout) > 0 then stdout else "No matches found." end
+end
+
 function execute_tool(name: text, arguments: text): text
   intent: parse arguments and dispatch to read_file, write_file, shell_exec, list_dir, read_dir_recursive, or grep
   let args: a mapping from text to text = json_parse(arguments)
-
   if name == "read_file" then
     let path: text = get(args, "path")
-    if file_exists(path) then
-      read_file(path)
-    else
-      "Error: file not found: " ++ path
-    end
-
+    if file_exists(path) then read_file(path) else "Error: file not found: " ++ path end
   else if name == "write_file" then
-    let path: text = get(args, "path")
-    let content: text = get(args, "content")
-    if file_exists(path) then
-      let old_content: text = read_file(path)
-      write_file("/tmp/legible_coder_old", old_content)
-      write_file(path, content)
-      let diff_result: a mapping from text to text = shell_exec("diff -u /tmp/legible_coder_old " ++ path ++ " 2>&1 | head -120")
-      let diff_output: text = get(diff_result, "stdout")
-      if text_length(diff_output) > 0 then
-        print("")
-        print(diff_output)
-      end
-    else
-      write_file(path, content)
-    end
-    "File written successfully: " ++ path
-
+    exec_write_file(args)
   else if name == "shell_exec" then
-    let command: text = get(args, "command")
-    let result: a mapping from text to text = shell_exec(command)
-    let stdout: text = get(result, "stdout")
-    let stderr: text = get(result, "stderr")
-    let exit_code: text = to_text(get(result, "exit_code"))
-    let output: text = "exit_code: " ++ exit_code
-    let output2: text = if text_length(stdout) > 0 then
-      output ++ "\nstdout:\n" ++ stdout
-    else
-      output
-    end
-    if text_length(stderr) > 0 then
-      output2 ++ "\nstderr:\n" ++ stderr
-    else
-      output2
-    end
-
+    exec_shell(args)
   else if name == "list_dir" then
     let path: text = get(args, "path")
-    if is_dir(path) then
-      let entries: a list of text = list_dir(path)
-      join(entries, "\n")
-    else
-      "Error: not a directory: " ++ path
-    end
-
+    if is_dir(path) then join(list_dir(path), "\n") else "Error: not a directory: " ++ path end
   else if name == "read_dir_recursive" then
-    let path: text = get(args, "path")
-    let result: a mapping from text to text = shell_exec("find " ++ path ++ " -type f | sort 2>&1 | head -200")
-    get(result, "stdout")
-
+    get(shell_exec("find " ++ get(args, "path") ++ " -type f | sort 2>&1 | head -200"), "stdout")
   else if name == "grep" then
-    let pattern: text = get(args, "pattern")
-    let path: text = unwrap_or(get(args, "path"), ".")
-    let glob_pattern: text = unwrap_or(get(args, "glob"), "")
-    let cmd: text = if text_length(glob_pattern) > 0 then
-      "grep -rn --include='" ++ glob_pattern ++ "' '" ++ pattern ++ "' " ++ path ++ " 2>&1 | head -50"
-    else
-      "grep -rn '" ++ pattern ++ "' " ++ path ++ " 2>&1 | head -50"
-    end
-    let result: a mapping from text to text = shell_exec(cmd)
-    let stdout: text = get(result, "stdout")
-    if text_length(stdout) > 0 then
-      stdout
-    else
-      "No matches found."
-    end
-
+    exec_grep(args)
   else
     "Error: unknown tool: " ++ name
   end
@@ -207,14 +162,8 @@ end
 
 -- ─── System prompt ────────────────────────────────────────────────────────────
 
-function system_prompt(): text
-  intent: compose the Legible syntax reference and cwd into a prompt string
-  let cwd: text = get_cwd()
-  "You are legible-coder, an interactive CLI coding assistant. " ++
-  "You write code in the Legible programming language and perform tasks by running Legible scripts.\n\n" ++
-  "Current working directory: " ++ cwd ++ "\n\n" ++
-  "TOOLS: read_file, write_file, shell_exec, list_dir, read_dir_recursive, grep.\n" ++
-  "Use read_dir_recursive to understand project structure in ONE call instead of many list_dir calls.\n\n" ++
+function prompt_syntax_ref(): text
+  intent: return the Legible syntax reference section covering bindings, types, functions, records, unions, control flow, and operators
   "════ LEGIBLE LANGUAGE REFERENCE ════\n\n" ++
   "BINDINGS:\n" ++
   "  let name: type = value          -- immutable\n" ++
@@ -253,7 +202,11 @@ function system_prompt(): text
   "MODULES:\n" ++
   "  use module_name           -- loads module_name.lbl\n" ++
   "  public function foo ...   -- export from a module\n" ++
-  "  module_name.foo()         -- call an exported function\n\n" ++
+  "  module_name.foo()         -- call an exported function\n\n"
+end
+
+function prompt_builtins_and_example(): text
+  intent: return the built-ins list and a complete working Legible example
   "BUILT-INS:\n" ++
   "  print(v)  read_line()  to_text(v)  to_integer(v)  to_decimal(v)\n" ++
   "  length(list)  append(list, item)  filter(list, fn)  map(list, fn)  reduce(list, init, fn)\n" ++
@@ -290,7 +243,11 @@ function system_prompt(): text
   "    let p2: Creature = level_up(p)\n" ++
   "    print(describe(p2))\n" ++
   "  end\n\n" ++
-  "Run programs with: legible run file.lbl\n\n" ++
+  "Run programs with: legible run file.lbl\n\n"
+end
+
+function prompt_rules(): text
+  intent: return the rules section listing common Legible mistakes to avoid
   "RULES:\n" ++
   "- Every function parameter needs a colon: fn(x: text) not fn(x text)\n" ++
   "- Every let/mutable binding needs a colon: let x: text = ... not let x text = ...\n" ++
@@ -310,6 +267,19 @@ function system_prompt(): text
   "- Semicolons are not allowed anywhere, including inside intent descriptions\n" ++
   "- Write code to files with write_file, then run with shell_exec\n" ++
   "- Keep responses concise; use tools to act rather than describing what you would do"
+end
+
+function system_prompt(): text
+  intent: compose the header, syntax reference, builtins, example, and rules into the full system prompt
+  let cwd: text = get_cwd()
+  "You are legible-coder, an interactive CLI coding assistant. " ++
+  "You write code in the Legible programming language and perform tasks by running Legible scripts.\n\n" ++
+  "Current working directory: " ++ cwd ++ "\n\n" ++
+  "TOOLS: read_file, write_file, shell_exec, list_dir, read_dir_recursive, grep.\n" ++
+  "Use read_dir_recursive to understand project structure in ONE call instead of many list_dir calls.\n\n" ++
+  prompt_syntax_ref() ++
+  prompt_builtins_and_example() ++
+  prompt_rules()
 end
 
 -- ─── API ──────────────────────────────────────────────────────────────────────
@@ -395,6 +365,21 @@ function filter_valid_calls(all_calls: a list of a mapping from text to text): a
   filter(all_calls, fn(tc: a mapping from text to text): boolean => is_known_tool(get(get(tc, "function"), "name")) and json_valid(get(get(tc, "function"), "arguments")) and starts_with(trim(get(get(tc, "function"), "arguments")), "\{"))
 end
 
+function handle_text_response(msg: a mapping from text to text, msgs: a list of a mapping from text to text): a list of a mapping from text to text
+  intent: print content between separators and append it to msgs as an assistant message
+  let content: text = unwrap_or(get(msg, "content"), "")
+  if text_length(content) > 0 then
+    print("")
+    print_separator()
+    print(content)
+    print_separator()
+    print("")
+    append(msgs, {"role": "assistant", "content": content})
+  else
+    msgs
+  end
+end
+
 function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, model: text): a list of a mapping from text to text
   intent: call the API in a loop executing tool calls until the model returns text or an error occurs
   mutable msgs: a list of a mapping from text to text = init_messages
@@ -404,8 +389,7 @@ function run_inner_loop(init_messages: a list of a mapping from text to text, me
     let resp: a mapping from text to text = call_groq(key, build_request(model, msgs))
     let status: text = get(resp, "status")
     if status != "200" then
-      let err_data: a mapping from text to text = json_parse(get(resp, "body"))
-      let err_info: a mapping from text to text = unwrap_or(get(err_data, "error"), {})
+      let err_info: a mapping from text to text = unwrap_or(get(json_parse(get(resp, "body")), "error"), {})
       print("  API error (status " ++ status ++ "):")
       print("  " ++ unwrap_or(get(err_info, "message"), get(resp, "body")))
       set msgs = take(msgs, messages_start)
@@ -426,15 +410,7 @@ function run_inner_loop(init_messages: a list of a mapping from text to text, me
           set waiting = false
         end
       else
-        let content: text = unwrap_or(get(msg, "content"), "")
-        if text_length(content) > 0 then
-          set msgs = append(msgs, {"role": "assistant", "content": content})
-          print("")
-          print_separator()
-          print(content)
-          print_separator()
-          print("")
-        end
+        set msgs = handle_text_response(msg, msgs)
         set waiting = false
       end
     end

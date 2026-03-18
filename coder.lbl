@@ -124,7 +124,19 @@ function execute_tool(name: text, arguments: text): text
   else if name == "write_file" then
     let path: text = get(args, "path")
     let content: text = get(args, "content")
-    write_file(path, content)
+    if file_exists(path) then
+      let old_content: text = read_file(path)
+      write_file("/tmp/legible_coder_old", old_content)
+      write_file(path, content)
+      let diff_result: a mapping from text to text = shell_exec("diff -u /tmp/legible_coder_old " ++ path ++ " 2>&1 | head -120")
+      let diff_output: text = get(diff_result, "stdout")
+      if text_length(diff_output) > 0 then
+        print("")
+        print(diff_output)
+      end
+    else
+      write_file(path, content)
+    end
     "File written successfully: " ++ path
 
   else if name == "shell_exec" then
@@ -384,8 +396,8 @@ function main(): nothing
           if finish_reason == "tool_calls" then
             let all_calls: a list of a mapping from text to text = unwrap_or(get(message_obj, "tool_calls"), [])
 
-            -- Filter: keep only known tools with valid JSON arguments
-            let valid_calls: a list of a mapping from text to text = filter(all_calls, fn(tc: a mapping from text to text): boolean => is_known_tool(get(get(tc, "function"), "name")) and json_valid(get(get(tc, "function"), "arguments")))
+            -- Filter: keep only known tools with valid JSON object arguments
+            let valid_calls: a list of a mapping from text to text = filter(all_calls, fn(tc: a mapping from text to text): boolean => is_known_tool(get(get(tc, "function"), "name")) and json_valid(get(get(tc, "function"), "arguments")) and starts_with(trim(get(get(tc, "function"), "arguments")), "\{"))
 
             -- Log skipped calls
             for tc in all_calls do
@@ -394,7 +406,7 @@ function main(): nothing
               let fn_args: text = get(fn_info, "arguments")
               if not is_known_tool(fn_name) then
                 print("  [skip] unregistered tool: " ++ fn_name)
-              else if not json_valid(fn_args) then
+              else if not json_valid(fn_args) or not starts_with(trim(fn_args), "\{") then
                 print("  [skip] invalid arguments for: " ++ fn_name)
               end
             end

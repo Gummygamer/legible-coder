@@ -283,6 +283,13 @@ function system_prompt(): text
   "- Every let/mutable binding needs a colon: let x: text = ... not let x text = ...\n" ++
   "- No semicolons, no curly braces for blocks — use end\n" ++
   "- Strings must be on one line; use ++ to concatenate across lines\n" ++
+  "- No named arguments: call shell_exec(cmd) not shell_exec(command = cmd)\n" ++
+  "- 'any' is NOT a valid type; use 'text' for unknown value types\n" ++
+  "- shell_exec returns 'a mapping from text to text'; all values including exit_code are text\n" ++
+  "- No 'return' keyword; the last expression in a function body is returned\n" ++
+  "- intent: values are unquoted plain text: intent: do something — NOT intent: \"do something\"\n" ++
+  "- Dot access only works on records (record.field); for mappings use get(map, \"key\")\n" ++
+  "- 'a mapping from text to text' is the only map type; you cannot write 'mapping from ...' (needs 'a')\n" ++
   "- Write code to files with write_file, then run with shell_exec\n" ++
   "- Keep responses concise; use tools to act rather than describing what you would do"
 end
@@ -365,6 +372,7 @@ function main(): nothing
     else
       let user_msg: a mapping from text to text = {"role": "user", "content": user_input}
       set messages = append(messages, user_msg)
+      let messages_start: integer = length(messages)
 
       mutable waiting: boolean = true
       mutable tool_calls_this_turn: integer = 0
@@ -385,6 +393,7 @@ function main(): nothing
           let error_msg: text = unwrap_or(get(error_info, "message"), body)
           print("  " ++ error_msg)
           print("")
+          set messages = take(messages, messages_start)
           set waiting = false
         else
           let data: a mapping from text to text = json_parse(body)

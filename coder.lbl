@@ -217,7 +217,7 @@ function prompt_builtins_and_example(): text
   "  keys(map)  values(map)  get(map, key)  put(map, key, val)  has_key(map, key)\n" ++
   "  unwrap(opt)  unwrap_or(opt, default)  is_some(opt)  is_none(opt)\n" ++
   "  abs(n)  max(a,b)  min(a,b)  floor(n)  ceil(n)  round(n)\n" ++
-  "  random_int(max)  random_decimal()\n" ++
+  "  random_int(max)  random_decimal()  skip()\n" ++
   "  read_file(path)  write_file(path, content)  file_exists(path)\n" ++
   "  shell_exec(cmd)  env_get(name)  get_cwd()  list_dir(path)  is_dir(path)\n" ++
   "  json_parse(text)  json_encode(value)  json_valid(text)\n" ++
@@ -265,6 +265,9 @@ function prompt_rules(): text
   "- No 'break' keyword — use a mutable boolean flag to exit loops\n" ++
   "- No array/list indexing with [] — use get(list, index) instead\n" ++
   "- Semicolons are not allowed anywhere, including inside intent descriptions\n" ++
+  "- Comments use -- not #: write -- this is a comment, never # this is a comment\n" ++
+  "- if-branches cannot be empty; use skip() as a no-op: if cond then skip() end\n" ++
+  "- Avoid Unicode characters in code: use ASCII dash - not em-dash, straight quotes not curly quotes\n" ++
   "- Write code to files with write_file, then run with shell_exec\n" ++
   "- Keep responses concise; use tools to act rather than describing what you would do"
 end

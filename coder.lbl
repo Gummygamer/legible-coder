@@ -421,10 +421,28 @@ function run_inner_loop(init_messages: a list of a mapping from text to text, me
   msgs
 end
 
+-- ─── Model selection ─────────────────────────────────────────────────────────
+
+function needs_full_model(input: text): boolean
+  intent: return true when input is long or contains error codes suggesting a complex task
+  let long_input: boolean = text_length(input) > 200
+  let has_error: boolean = contains_text(input, "E_") or contains_text(lowercase(input), "error")
+  long_input or has_error
+end
+
+function pick_model(input: text, full_model: text, fast_model: text): text
+  intent: dispatch to fast_model or full_model based on needs_full_model and text_length
+  if text_length(fast_model) == 0 or needs_full_model(input) then
+    full_model
+  else
+    fast_model
+  end
+end
+
 -- ─── Main loop ────────────────────────────────────────────────────────────────
 
 function main(): nothing
-  intent: read api_key and model, print the banner, then loop reading user messages and calling the assistant
+  intent: read api_key and models, print the banner, then loop reading user messages and calling the assistant
   let api_key: an optional text = env_get("GROQ_API_KEY")
   if is_none(api_key) then
     print("Error: GROQ_API_KEY environment variable is not set.")
@@ -432,8 +450,9 @@ function main(): nothing
     exit_process(1)
   end
   let key: text = unwrap(api_key)
-  let model: text = unwrap_or(env_get("LEGIBLE_CODER_MODEL"), "openai/gpt-oss-120b")
-  print_banner(model)
+  let full_model: text = unwrap_or(env_get("LEGIBLE_CODER_MODEL"), "openai/gpt-oss-120b")
+  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "")
+  print_banner(full_model)
   let sys_msg: a mapping from text to text = {"role": "system", "content": system_prompt()}
   mutable messages: a list of a mapping from text to text = [sys_msg]
   mutable running: boolean = true
@@ -446,9 +465,11 @@ function main(): nothing
     else if text_length(user_input) == 0 then
       print("")
     else
+      let turn_model: text = pick_model(user_input, full_model, fast_model)
+      if turn_model != full_model then print("  [fast model]") end
       set messages = append(messages, {"role": "user", "content": user_input})
       let start: integer = length(messages)
-      set messages = run_inner_loop(messages, start, key, model)
+      set messages = run_inner_loop(messages, start, key, turn_model)
     end
   end
 end

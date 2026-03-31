@@ -460,7 +460,7 @@ function main(): nothing
   end
   let key: text = unwrap(api_key)
   let full_model: text = unwrap_or(env_get("LEGIBLE_CODER_MODEL"), "openai/gpt-oss-120b")
-  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "")
+  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "openai/gpt-oss-20b")
   let expert_model: text = unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "")
   print_banner(full_model)
   let sys_msg: a mapping from text to text = {"role": "system", "content": system_prompt()}

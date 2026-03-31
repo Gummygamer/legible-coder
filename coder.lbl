@@ -423,16 +423,25 @@ end
 
 -- ─── Model selection ─────────────────────────────────────────────────────────
 
-function needs_full_model(input: text): boolean
-  intent: return true when input is long or contains error codes suggesting a complex task
+function is_expert_task(input: text): boolean
+  intent: return true when input is very long or contains architecture and design keywords
+  let very_long: boolean = text_length(input) > 800
+  let arch_keywords: boolean = contains_text(lowercase(input), "architect") or contains_text(lowercase(input), "refactor") or contains_text(lowercase(input), "redesign") or contains_text(lowercase(input), "design")
+  very_long or arch_keywords
+end
+
+function is_complex_task(input: text): boolean
+  intent: return true when input is long or contains error codes suggesting a non-trivial task
   let long_input: boolean = text_length(input) > 200
   let has_error: boolean = contains_text(input, "E_") or contains_text(lowercase(input), "error")
   long_input or has_error
 end
 
-function pick_model(input: text, full_model: text, fast_model: text): text
-  intent: dispatch to fast_model or full_model based on needs_full_model and text_length
-  if text_length(fast_model) == 0 or needs_full_model(input) then
+function pick_model(input: text, full_model: text, fast_model: text, expert_model: text): text
+  intent: dispatch to expert_model, full_model, or fast_model based on is_expert_task and is_complex_task
+  if text_length(expert_model) > 0 and is_expert_task(input) then
+    expert_model
+  else if text_length(fast_model) == 0 or is_complex_task(input) then
     full_model
   else
     fast_model
@@ -452,6 +461,7 @@ function main(): nothing
   let key: text = unwrap(api_key)
   let full_model: text = unwrap_or(env_get("LEGIBLE_CODER_MODEL"), "openai/gpt-oss-120b")
   let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "")
+  let expert_model: text = unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "")
   print_banner(full_model)
   let sys_msg: a mapping from text to text = {"role": "system", "content": system_prompt()}
   mutable messages: a list of a mapping from text to text = [sys_msg]
@@ -465,8 +475,9 @@ function main(): nothing
     else if text_length(user_input) == 0 then
       print("")
     else
-      let turn_model: text = pick_model(user_input, full_model, fast_model)
-      if turn_model != full_model then print("  [fast model]") end
+      let turn_model: text = pick_model(user_input, full_model, fast_model, expert_model)
+      if turn_model == expert_model then print("  [expert model: " ++ expert_model ++ "]") end
+      if turn_model == fast_model then print("  [fast model: " ++ fast_model ++ "]") end
       set messages = append(messages, {"role": "user", "content": user_input})
       let start: integer = length(messages)
       set messages = run_inner_loop(messages, start, key, turn_model)

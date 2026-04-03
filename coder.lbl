@@ -298,28 +298,24 @@ function build_request(model: text, messages: a list of a mapping from text to t
   }
 end
 
-function call_groq(api_key: text, request_body: a mapping from text to text): a mapping from text to text
-  intent: encode request_body as json and post it to the chat completions endpoint with auth headers
+function call_api(api_key: text, base_url: text, request_body: a mapping from text to text): a mapping from text to text
+  intent: encode request_body as json and post it to base_url chat completions with auth headers
   let headers: a mapping from text to text = {
     "Authorization": "Bearer " ++ api_key,
     "Content-Type": "application/json"
   }
-  let body_json: text = json_encode(request_body)
-  http_client_post(
-    "https://api.groq.com/openai/v1/chat/completions",
-    headers,
-    body_json
-  )
+  http_client_post(base_url ++ "/chat/completions", headers, json_encode(request_body))
 end
 
 -- ─── UI helpers ───────────────────────────────────────────────────────────────
 
-function print_banner(model: text): nothing
-  intent: print the legible-coder name, model, and cwd as the startup header
+function print_banner(model: text, base_url: text): nothing
+  intent: print the legible-coder name, model, base_url, and cwd as the startup header
+  let backend: text = if contains_text(base_url, "localhost") or contains_text(base_url, "127.0.0.1") then "LM Studio (" ++ base_url ++ ")" else "Groq" end
   print("")
   print("  legible-coder")
   print("  Interactive Legible coding assistant")
-  print("  Model: " ++ model ++ " via Groq")
+  print("  Model: " ++ model ++ " via " ++ backend)
   print("  ────────────────────────────────────────────")
   let cwd: text = get_cwd()
   print("  cwd: " ++ cwd)
@@ -383,13 +379,13 @@ function handle_text_response(msg: a mapping from text to text, msgs: a list of 
   end
 end
 
-function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, model: text): a list of a mapping from text to text
+function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text): a list of a mapping from text to text
   intent: call the API in a loop executing tool calls until the model returns text or an error occurs
   mutable msgs: a list of a mapping from text to text = init_messages
   mutable waiting: boolean = true
   mutable tool_count: integer = 0
   while waiting do
-    let resp: a mapping from text to text = call_groq(key, build_request(model, msgs))
+    let resp: a mapping from text to text = call_api(key, base_url, build_request(model, msgs))
     let status: text = get(resp, "status")
     if status != "200" then
       let err_info: a mapping from text to text = unwrap_or(get(json_parse(get(resp, "body")), "error"), {})
@@ -450,19 +446,32 @@ end
 
 -- ─── Main loop ────────────────────────────────────────────────────────────────
 
-function main(): nothing
-  intent: read api_key and models, print the banner, then loop reading user messages and calling the assistant
-  let api_key: an optional text = env_get("GROQ_API_KEY")
-  if is_none(api_key) then
-    print("Error: GROQ_API_KEY environment variable is not set.")
-    print("Set it with: export GROQ_API_KEY=\"your-key-here\"")
-    exit_process(1)
+function resolve_api_key(base_url: text): text
+  intent: return LEGIBLE_CODER_API_KEY if set, else GROQ_API_KEY for Groq, else lm-studio for local endpoints
+  let explicit_key: an optional text = env_get("LEGIBLE_CODER_API_KEY")
+  if is_some(explicit_key) then
+    unwrap(explicit_key)
+  else if contains_text(base_url, "groq.com") then
+    let groq_key: an optional text = env_get("GROQ_API_KEY")
+    if is_none(groq_key) then
+      print("Error: GROQ_API_KEY is not set. Set it or use LEGIBLE_CODER_API_KEY.")
+      exit_process(1)
+    end
+    unwrap(groq_key)
+  else
+    "lm-studio"
   end
-  let key: text = unwrap(api_key)
+end
+
+function main(): nothing
+  intent: read base_url, api_key, and models, print the banner, then loop reading user messages
+  let base_url: text = unwrap_or(env_get("LEGIBLE_CODER_BASE_URL"), "https://api.groq.com/openai/v1")
+  let key: text = resolve_api_key(base_url)
+  let is_local: boolean = contains_text(base_url, "localhost") or contains_text(base_url, "127.0.0.1")
   let full_model: text = unwrap_or(env_get("LEGIBLE_CODER_MODEL"), "openai/gpt-oss-120b")
-  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "openai/gpt-oss-20b")
-  let expert_model: text = unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "")
-  print_banner(full_model)
+  let fast_model: text = if is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "openai/gpt-oss-20b") end
+  let expert_model: text = if is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "") end
+  print_banner(full_model, base_url)
   let sys_msg: a mapping from text to text = {"role": "system", "content": system_prompt()}
   mutable messages: a list of a mapping from text to text = [sys_msg]
   mutable running: boolean = true
@@ -476,11 +485,11 @@ function main(): nothing
       print("")
     else
       let turn_model: text = pick_model(user_input, full_model, fast_model, expert_model)
-      if turn_model == expert_model then print("  [expert model: " ++ expert_model ++ "]") end
-      if turn_model == fast_model then print("  [fast model: " ++ fast_model ++ "]") end
+      if turn_model == expert_model and text_length(expert_model) > 0 then print("  [expert model: " ++ expert_model ++ "]") end
+      if turn_model == fast_model and text_length(fast_model) > 0 then print("  [fast model: " ++ fast_model ++ "]") end
       set messages = append(messages, {"role": "user", "content": user_input})
       let start: integer = length(messages)
-      set messages = run_inner_loop(messages, start, key, turn_model)
+      set messages = run_inner_loop(messages, start, key, base_url, turn_model)
     end
   end
 end

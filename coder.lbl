@@ -80,6 +80,13 @@ function is_known_tool(name: text): boolean
   n == "list_dir" or n == "read_dir_recursive" or n == "grep"
 end
 
+function is_local_known_tool(name: text): boolean
+  intent: compare the cleaned name to the local manual-tool names that exclude full-file reads
+  let n: text = clean_tool_name(name)
+  n == "read_file_lines" or n == "write_file" or n == "shell_exec" or
+  n == "list_dir" or n == "read_dir_recursive" or n == "grep"
+end
+
 function describe_tool_call(name: text, arguments: text): text
   intent: format name with its path, command, or pattern argument as a short label
   let args: a mapping from text to text = json_parse(arguments)
@@ -152,7 +159,7 @@ function exec_read_file_lines(args: a mapping from text to text): text
     "Error: file not found: " ++ path
   else
     let start_line: integer = max(to_integer(unwrap_or(get(args, "start_line"), "1")), 1)
-    let line_count: integer = max(to_integer(unwrap_or(get(args, "line_count"), "80")), 1)
+    let line_count: integer = 40
     let lines: a list of text = split(read_file(path), "\n")
     let finish: integer = min(length(lines), start_line + line_count - 1)
     mutable out: a list of text = []
@@ -314,24 +321,44 @@ function tool_names_text(include_tools: boolean, include_dir_tools: boolean): te
   end
 end
 
+function local_startup_instructions(): text
+  intent: return the local startup workflow that uses the bootstrap as the starting project view
+  "Startup workflow for every task:\n" ++
+  "1. First read the LOCAL MODEL BOOTSTRAP already in context.\n" ++
+  "2. Treat the bootstrap project tree as your starting view of the current working folder.\n" ++
+  "3. Do not call list_dir on '.' unless the bootstrap is clearly insufficient.\n" ++
+  "4. Then inspect only the files relevant to the current task.\n" ++
+  "5. Always read files in 40-line intervals with read_file_lines to protect context.\n\n"
+end
+
+function local_examples(): text
+  intent: return generic local tool examples without findings-file workflow
+  "Examples:\n" ++
+  "TOOL read_file_lines \{\"path\":\"main.lbl\",\"start_line\":\"1\",\"line_count\":\"40\"\}\n" ++
+  "TOOL list_dir \{\"path\":\"../legible\"\}\n" ++
+  "TOOL write_file \{\"path\":\"main.lbl\",\"content\":\"...updated content...\"\}\n" ++
+  "TOOL shell_exec \{\"command\":\"legible check main.lbl\"\}\n" ++
+  "TOOL grep \{\"pattern\":\"TODO\",\"path\":\".\",\"glob\":\"*.lbl\"\}\n\n"
+end
+
 function local_system_prompt(): text
-  intent: return a compact local-model prompt with a manual TOOL and FINAL protocol
+  intent: return a compact local-model prompt with a manual TOOL protocol
   "You are legible-coder, a concise coding assistant for the Legible language.\n\n" ++
   "For this local-model session, native OpenAI tool calling is unavailable.\n" ++
   "If you need to use a tool, reply with exactly one line in this format:\n" ++
   "TOOL tool_name JSON_arguments\n" ++
-  "Valid tools: read_file, read_file_lines, write_file, list_dir, read_dir_recursive, grep, shell_exec.\n" ++
+  "Valid tools: read_file_lines, write_file, list_dir, read_dir_recursive, grep, shell_exec.\n" ++
   "After tool results are returned, either request one more tool the same way or reply with:\n" ++
   "FINAL: your answer\n\n" ++
   "Do not emit multiple TOOL lines in one response. Do not explain the tool choice before or after the TOOL line.\n" ++
   "Do not emit <tool_call>, <tool_response>, arguments:, or any XML-style wrappers.\n" ++
+  local_startup_instructions() ++
+  "The bootstrap already gives you the current project tree, so prefer using it instead of restarting with list_dir on '.'.\n" ++
   "Prefer list_dir or read_dir_recursive for directory exploration before using shell_exec.\n" ++
-  "Prefer read_file_lines for large files after you know the area you need.\n" ++
-  "Examples:\n" ++
-  "TOOL list_dir \{\"path\":\".\"\}\n" ++
-  "TOOL read_file \{\"path\":\"game.lbl\"\}\n" ++
-  "TOOL read_file_lines \{\"path\":\"game.lbl\",\"start_line\":\"1\",\"line_count\":\"80\"\}\n" ++
-  "TOOL grep \{\"pattern\":\"sdl_\",\"path\":\"../legible/src/interpreter/sdl_builtins.rs\"\}\n\n" ++
+  "Do not use read_file in local mode. Always use read_file_lines with path, start_line, and line_count set to 40 unless you have a strong reason not to.\n" ++
+  "If the user asks you to change code or files, do not stop at a description. Keep using tools until you write the file with write_file or you can clearly explain a blocker.\n" ++
+  "If the user says 'continue', 'do that', or asks for a follow-up change, continue from the prior conversation state instead of restarting exploration unless you truly need new information.\n" ++
+  local_examples() ++
   "Understand the task by reading the relevant files first. Do not guess file contents.\n" ++
   "Keep answers direct and avoid long chain-of-thought.\n\n" ++
   "Legible rules:\n" ++
@@ -376,11 +403,13 @@ function extract_error_message(body: text): text
 end
 
 function local_model_context(): text
-  intent: provide minimal local workspace orientation without task-specific code content
+  intent: provide minimal local workspace orientation and the bootstrap project tree
   let project_tree: text = get(shell_exec("find . -maxdepth 2 -not -path './.git' -not -path './.git/*' | sort | head -80"), "stdout")
   "LOCAL MODEL BOOTSTRAP:\n" ++
   "Project tree:\n" ++ trim(project_tree) ++ "\n\n" ++
   "A neighboring repository named ../legible contains the interpreter implementation.\n" ++
+  "Use this bootstrap as your initial view of the current working directory.\n" ++
+  "Do not start with list_dir on '.' unless this bootstrap is missing something important.\n" ++
   "Read specific files with tools before proposing changes."
 end
 
@@ -442,6 +471,8 @@ record LoopStep
   last_batch: text
   waiting: boolean
   must_force_text: boolean
+  explore_count: integer
+  acted: boolean
 end
 
 record ManualToolRequest
@@ -521,7 +552,7 @@ function truncate_tool_output(raw: text, max_chars: integer): text
 end
 
 function prune_local_messages(msgs: a list of a mapping from text to text): a list of a mapping from text to text
-  intent: keep only the local system messages and the most recent turn messages
+  intent: if length msgs is over 6 take msgs 3 then drop to the last 3 and reduce with append
   if length(msgs) <= 6 then
     msgs
   else
@@ -536,8 +567,14 @@ function seen_tool_for_path(msgs: a list of a mapping from text to text, tool_na
   is_some(find(msgs, fn(msg: a mapping from text to text): boolean => contains_text(unwrap_or(get(msg, "content"), ""), "Tool result for " ++ tool_name) and contains_text(unwrap_or(get(msg, "content"), ""), "\"path\":\"" ++ path ++ "\"")))
 end
 
+function seen_manual_tool_request(msgs: a list of a mapping from text to text, name: text, arguments: text): boolean
+  intent: return true when prior local messages already contain the same tool name and exact arguments
+  let marker: text = "Tool result for " ++ to_text(name) ++ " " ++ to_text(arguments) ++ ":"
+  is_some(find(msgs, fn(msg: a mapping from text to text): boolean => contains_text(unwrap_or(get(msg, "content"), ""), marker)))
+end
+
 function json_escape_text(content: text): text
-  intent: replace content backslashes and double quotes with escaped JSON text
+  intent: let slashed be replace content backslash then replace slashed double quote for JSON text
   let slashed: text = replace(content, "\\", "\\\\")
   replace(slashed, "\"", "\\\"")
 end
@@ -595,6 +632,18 @@ function normalize_manual_arguments(name: text, raw_args: text): text
   end
 end
 
+function normalize_read_file_lines_arguments(arguments: text): text
+  intent: normalize read_file_lines to a 1-based start line and a fixed 40-line window
+  let args: a mapping from text to text = json_parse(arguments)
+  let path: text = unwrap_or(get(args, "path"), "")
+  let start_line: integer = max(to_integer(unwrap_or(get(args, "start_line"), "1")), 1)
+  json_encode({
+    "path": path,
+    "start_line": to_text(start_line),
+    "line_count": "40"
+  })
+end
+
 function parse_manual_tool_request(content: text): ManualToolRequest
   intent: parse local-model TOOL and FINAL responses from plain text content
   let trimmed: text = trim(content)
@@ -608,13 +657,15 @@ function parse_manual_tool_request(content: text): ManualToolRequest
     let space: integer = unwrap_or(index_of(rest, " "), -1)
     if brace > 0 then
       let name: text = trim(substring(rest, 0, brace))
-      let arguments: text = normalize_manual_arguments(clean_tool_name(name), substring(rest, brace, text_length(rest) - brace))
-      let valid: boolean = is_known_tool(name) and json_valid(arguments) and starts_with(arguments, "\{")
+      let normalized: text = normalize_manual_arguments(clean_tool_name(name), substring(rest, brace, text_length(rest) - brace))
+      let arguments: text = if clean_tool_name(name) == "read_file_lines" and json_valid(normalized) then normalize_read_file_lines_arguments(normalized) else normalized end
+      let valid: boolean = is_local_known_tool(name) and json_valid(arguments) and starts_with(arguments, "\{")
       ManualToolRequest {valid: valid, final: false, name: clean_tool_name(name), arguments: arguments, final_text: ""}
     else if space > 0 then
       let name: text = trim(substring(rest, 0, space))
-      let arguments: text = normalize_manual_arguments(clean_tool_name(name), substring(rest, space + 1, text_length(rest) - space - 1))
-      let valid: boolean = is_known_tool(name) and json_valid(arguments) and starts_with(arguments, "\{")
+      let normalized: text = normalize_manual_arguments(clean_tool_name(name), substring(rest, space + 1, text_length(rest) - space - 1))
+      let arguments: text = if clean_tool_name(name) == "read_file_lines" and json_valid(normalized) then normalize_read_file_lines_arguments(normalized) else normalized end
+      let valid: boolean = is_local_known_tool(name) and json_valid(arguments) and starts_with(arguments, "\{")
       ManualToolRequest {valid: valid, final: false, name: clean_tool_name(name), arguments: arguments, final_text: ""}
     else
       ManualToolRequest {valid: false, final: false, name: "", arguments: "", final_text: trimmed}
@@ -627,101 +678,259 @@ function parse_manual_tool_request(content: text): ManualToolRequest
   end
 end
 
-function local_manual_retry(msgs: a list of a mapping from text to text, content: text, total_tools: integer, last_batch: text): LoopStep
+function local_manual_retry(msgs: a list of a mapping from text to text, content: text, total_tools: integer, last_batch: text, explore_count: integer, acted: boolean): LoopStep
   intent: append assistant content and a strict-format reminder when the local model ignores the protocol
   print("  [warn] local model returned a malformed TOOL/FINAL response; retrying with format reminder]")
   if length(msgs) > 5 then print("  [context] pruning local retry history]") end
+  let disallow_full_read: text = if contains_text(content, "TOOL read_file ") then "\nDo not use read_file in local mode. Use read_file_lines with path, start_line, and line_count." else "" end
+  if local_needs_action(explore_count, acted) then
+    local_action_retry_step(msgs, total_tools, last_batch, explore_count, acted)
+  else
+    LoopStep {
+      messages: prune_local_messages(append(msgs, {"role": "user", "content": "Your last reply did not follow the required format. Reply in exactly one of these formats only:\nTOOL tool_name JSON_arguments\nFINAL: your answer\nValid local tools: read_file_lines, write_file, list_dir, read_dir_recursive, grep, shell_exec." ++ disallow_full_read})),
+      count: total_tools,
+      last_batch: last_batch,
+      waiting: true,
+      must_force_text: false,
+      explore_count: explore_count,
+      acted: acted
+    }
+  end
+end
+
+function local_manual_final(msgs: a list of a mapping from text to text, final_text: text, total_tools: integer, last_batch: text, explore_count: integer, acted: boolean): LoopStep
+  intent: finish the local manual-tool loop by printing the final text answer
+  if local_needs_action(explore_count, acted) then
+    print("  [warn] local model stopped before acting; requiring write_file, shell_exec, or blocker]")
+    local_action_retry_step(msgs, total_tools, last_batch, explore_count, acted)
+  else
+    let final_msg: a mapping from text to text = {"content": final_text}
+    LoopStep {
+      messages: handle_text_response(final_msg, msgs),
+      count: total_tools,
+      last_batch: last_batch,
+      waiting: false,
+      must_force_text: false,
+      explore_count: explore_count,
+      acted: acted
+    }
+  end
+end
+
+function local_repeat_hint(req: ManualToolRequest, has_partial_read: boolean): text
+  intent: build the retry hint text for repeated read_file_lines grep or other tool requests
+  if req.name == "read_file" then
+    if has_partial_read then
+      "You already read that file and also fetched line ranges from it. Do not repeat read_file. Continue with FINAL: your answer, or request a new non-overlapping read_file_lines range."
+    else
+      "You already read that whole file. Do not repeat read_file. If you need more detail, use read_file_lines with path, start_line, and line_count instead, for example TOOL read_file_lines " ++ to_text(req.arguments) ++ " plus a start_line and line_count."
+    end
+  else if req.name == "read_file_lines" then
+    "You already requested that exact file range and received it. Do not repeat the same range. Either request a different non-overlapping read_file_lines range or reply with FINAL: your answer."
+  else if req.name == "grep" then
+    "You already ran that exact grep and received its result. Do not repeat it. Read a relevant file slice or reply with FINAL: your answer."
+  else
+    "You already requested that tool and received its result. Do not repeat it. Reply with FINAL: and your answer."
+  end
+end
+
+function bootstrap_listing_hint(): text
+  intent: tell the local model to use the bootstrap project tree instead of list_dir on dot
+  "The LOCAL MODEL BOOTSTRAP already includes the current project tree. Do not call list_dir on '.'. Use the bootstrap, inspect a relevant file directly, or use list_dir/read_dir_recursive on a more specific path."
+end
+
+function is_bootstrap_listing(req: ManualToolRequest): boolean
+  intent: return true when req is list_dir on the current working directory
+  req.name == "list_dir" and unwrap_or(get(json_parse(req.arguments), "path"), "") == "."
+end
+
+function skip_bootstrap_listing_step(msgs: a list of a mapping from text to text, total_tools: integer, fingerprint: text, explore_count: integer, acted: boolean): LoopStep
+  intent: skip redundant list_dir on dot because the bootstrap already includes the project tree
+  print("  [warn] bootstrap already covers '.', skipping list_dir]")
   LoopStep {
-    messages: prune_local_messages(append(msgs, {"role": "user", "content": "Your last reply did not follow the required format. Reply in exactly one of these formats only:\nTOOL tool_name JSON_arguments\nFINAL: your answer"})),
+    messages: append(msgs, {"role": "user", "content": bootstrap_listing_hint()}),
+    count: total_tools,
+    last_batch: fingerprint,
+    waiting: true,
+    must_force_text: false,
+    explore_count: explore_count,
+    acted: acted
+  }
+end
+
+function advance_read_file_lines_request(req: ManualToolRequest): ManualToolRequest
+  intent: increment read_file_lines start_line by 40 and keep the same path
+  let args: a mapping from text to text = json_parse(req.arguments)
+  let next_start: integer = max(to_integer(unwrap_or(get(args, "start_line"), "1")), 1) + 40
+  let next_args: text = json_encode({
+    "path": unwrap_or(get(args, "path"), ""),
+    "start_line": to_text(next_start),
+    "line_count": "40"
+  })
+  ManualToolRequest {
+    valid: true,
+    final: false,
+    name: req.name,
+    arguments: next_args,
+    final_text: req.final_text
+  }
+end
+
+function is_exploration_tool(name: text): boolean
+  intent: return true for read_file_lines list_dir read_dir_recursive or grep
+  name == "read_file_lines" or name == "list_dir" or name == "read_dir_recursive" or name == "grep"
+end
+
+function is_action_tool(name: text): boolean
+  intent: return true for write_file or shell_exec
+  name == "write_file" or name == "shell_exec"
+end
+
+function shell_command_text(req: ManualToolRequest): text
+  intent: return the lowercase trimmed shell_exec command text or empty text for other tools
+  if req.name == "shell_exec" then
+    lowercase(trim(unwrap_or(get(json_parse(req.arguments), "command"), "")))
+  else
+    ""
+  end
+end
+
+function is_exploration_shell_command(command: text): boolean
+  intent: return true for shell commands starting with cat ls find grep rg sed head tail tree wc awk or fd
+  starts_with(command, "cat ") or starts_with(command, "ls") or starts_with(command, "find ") or starts_with(command, "grep ") or starts_with(command, "rg ") or starts_with(command, "sed ") or starts_with(command, "head ") or starts_with(command, "tail ") or starts_with(command, "tree") or starts_with(command, "wc ") or starts_with(command, "awk ") or starts_with(command, "fd ")
+end
+
+function is_exploration_request(req: ManualToolRequest): boolean
+  intent: return true for exploration tools and shell_exec commands that inspect files or text
+  is_exploration_tool(req.name) or (req.name == "shell_exec" and is_exploration_shell_command(shell_command_text(req)))
+end
+
+function is_action_request(req: ManualToolRequest): boolean
+  intent: return true for write_file and for shell_exec commands that run check build run or test work
+  req.name == "write_file" or (req.name == "shell_exec" and not is_exploration_shell_command(shell_command_text(req)))
+end
+
+function resolve_local_explore_budget(): integer
+  intent: read LEGIBLE_CODER_MAX_EXPLORE or use default 8 for the local exploration budget
+  let raw: text = unwrap_or(env_get("LEGIBLE_CODER_MAX_EXPLORE"), "8")
+  max(to_integer(raw), 1)
+end
+
+function local_needs_action(explore_count: integer, acted: boolean): boolean
+  intent: return true when explore_count reached resolve_local_explore_budget and acted is false
+  not acted and explore_count >= resolve_local_explore_budget()
+end
+
+function local_action_prompt(): text
+  intent: return the exact write_file shell_exec or FINAL blocked prompt for local action mode
+  "Exploration budget reached. Do not continue with read_file_lines, list_dir, read_dir_recursive, or grep.\n" ++
+  "Assume the current context is enough for a first implementation attempt.\n" ++
+  "Your next reply is invalid unless it is exactly one of these formats:\n" ++
+  "TOOL write_file JSON_arguments\n" ++
+  "TOOL shell_exec JSON_arguments  -- only for checking, building, running, or testing code\n" ++
+  "FINAL: blocked because you need one specific missing file path or 40-line range\n" ++
+  "Do not use shell_exec to read files or list directories.\n" ++
+  "Commands like cat, ls, find, grep, rg, sed, head, or tail are invalid here.\n" ++
+  "Do not answer with prose, plans, or more exploratory tools."
+end
+
+function local_action_retry_step(msgs: a list of a mapping from text to text, total_tools: integer, last_batch: text, explore_count: integer, acted: boolean): LoopStep
+  intent: continue the local loop while requiring an action or blocker after too much exploration
+  print("  [warn] local exploration budget reached; requiring write_file, shell_exec, or blocker]")
+  LoopStep {
+    messages: prune_local_messages(append(msgs, {"role": "user", "content": local_action_prompt()})),
     count: total_tools,
     last_batch: last_batch,
     waiting: true,
-    must_force_text: false
+    must_force_text: false,
+    explore_count: explore_count,
+    acted: acted
   }
 end
 
-function local_manual_final(msgs: a list of a mapping from text to text, final_text: text, total_tools: integer, last_batch: text): LoopStep
-  intent: finish the local manual-tool loop by printing the final text answer
-  let final_msg: a mapping from text to text = {"content": final_text}
+function execute_local_manual_tool(msgs: a list of a mapping from text to text, req: ManualToolRequest, advanced_range: boolean, total_tools: integer, max_tools: integer, fingerprint: text, explore_count: integer, acted: boolean): LoopStep
+  intent: execute one local tool request and update exploration and action state
+  let next_count: integer = total_tools + 1
+  let next_explore_count: integer = if is_exploration_request(req) then explore_count + 1 else explore_count end
+  let next_acted: boolean = acted or is_action_request(req)
+  if advanced_range then print("  [warn] advancing repeated read_file_lines request to the next 40-line window]") end
+  print("  [" ++ to_text(next_count) ++ "] " ++ describe_tool_call(req.name, req.arguments))
+  let raw: text = execute_tool(req.name, req.arguments)
+  let result: text = truncate_tool_output(to_text(raw), 2000)
+  if length(msgs) > 5 then print("  [context] pruning local tool history]") end
+  let next_msgs: a list of a mapping from text to text = prune_local_messages(append(msgs, {"role": "user", "content": "Tool result for " ++ to_text(req.name) ++ " " ++ to_text(req.arguments) ++ ":\n" ++ to_text(result) ++ "\n\nReply with one TOOL line if you need one more tool, or FINAL: followed by your answer."}))
+  if next_count >= max_tools then print("  [warn] reached " ++ to_text(max_tools) ++ " local tool calls this turn, stopping]") end
   LoopStep {
-    messages: handle_text_response(final_msg, msgs),
-    count: total_tools,
-    last_batch: last_batch,
-    waiting: false,
-    must_force_text: false
+    messages: next_msgs,
+    count: next_count,
+    last_batch: fingerprint,
+    waiting: next_count < max_tools,
+    must_force_text: false,
+    explore_count: next_explore_count,
+    acted: next_acted
   }
 end
 
-function local_manual_tool_step(msgs: a list of a mapping from text to text, content: text, req: ManualToolRequest, total_tools: integer, max_tools: integer, last_batch: text): LoopStep
+function local_manual_tool_step(msgs: a list of a mapping from text to text, content: text, req: ManualToolRequest, total_tools: integer, max_tools: integer, last_batch: text, explore_count: integer, acted: boolean): LoopStep
   intent: execute one manual tool request or reject an immediate repeat
-  let fingerprint: text = manual_tool_fingerprint(req.name, req.arguments)
-  let req_path: text = if req.name == "read_file" or req.name == "read_file_lines" then unwrap_or(get(json_parse(req.arguments), "path"), "") else "" end
-  let repeated_full_read: boolean = req.name == "read_file" and text_length(req_path) > 0 and seen_tool_for_path(msgs, "read_file", req_path)
-  let has_partial_read: boolean = req.name == "read_file" and text_length(req_path) > 0 and seen_tool_for_path(msgs, "read_file_lines", req_path)
-  if fingerprint == last_batch or repeated_full_read then
+  let adjusted_req: ManualToolRequest = if req.name == "read_file_lines" and seen_manual_tool_request(msgs, req.name, req.arguments) then advance_read_file_lines_request(req) else req end
+  let fingerprint: text = manual_tool_fingerprint(adjusted_req.name, adjusted_req.arguments)
+  let req_path: text = if adjusted_req.name == "read_file" or adjusted_req.name == "read_file_lines" then unwrap_or(get(json_parse(adjusted_req.arguments), "path"), "") else "" end
+  let repeated_full_read: boolean = adjusted_req.name == "read_file" and text_length(req_path) > 0 and seen_tool_for_path(msgs, "read_file", req_path)
+  let has_partial_read: boolean = adjusted_req.name == "read_file" and text_length(req_path) > 0 and seen_tool_for_path(msgs, "read_file_lines", req_path)
+  let repeated_request: boolean = adjusted_req.name != "read_file_lines" and seen_manual_tool_request(msgs, adjusted_req.name, adjusted_req.arguments)
+  if is_bootstrap_listing(adjusted_req) then
+    skip_bootstrap_listing_step(msgs, total_tools, fingerprint, explore_count, acted)
+  else if is_exploration_request(adjusted_req) and local_needs_action(explore_count, acted) then
+    local_action_retry_step(msgs, total_tools, last_batch, explore_count, acted)
+  else if fingerprint == last_batch or repeated_full_read or repeated_request then
     print("  [warn] model repeated the same manual tool request; forcing final answer]")
-    let repeat_hint: text = if req.name == "read_file" then
-      if has_partial_read then
-        "You already read that file and also fetched line ranges from it. Do not repeat read_file. Continue with FINAL: your answer, or request a new non-overlapping read_file_lines range."
-      else
-        "You already read that whole file. Do not repeat read_file. If you need more detail, use read_file_lines with path, start_line, and line_count instead, for example TOOL read_file_lines " ++ req.arguments ++ " plus a start_line and line_count."
-      end
-    else
-      "You already requested that tool and received its result. Do not repeat it. Reply with FINAL: and your answer."
-    end
+    let repeat_hint: text = local_repeat_hint(adjusted_req, has_partial_read)
     LoopStep {
       messages: append(msgs, {"role": "user", "content": repeat_hint}),
       count: total_tools,
       last_batch: last_batch,
       waiting: true,
-      must_force_text: false
+      must_force_text: false,
+      explore_count: explore_count,
+      acted: acted
     }
   else
-    let next_count: integer = total_tools + 1
-    print("  [" ++ to_text(next_count) ++ "] " ++ describe_tool_call(req.name, req.arguments))
-    let raw: text = execute_tool(req.name, req.arguments)
-    let result: text = truncate_tool_output(raw, 2000)
-    if length(msgs) > 5 then print("  [context] pruning local tool history]") end
-    let next_msgs: a list of a mapping from text to text = prune_local_messages(append(msgs, {"role": "user", "content": "Tool result for " ++ req.name ++ " " ++ req.arguments ++ ":\n" ++ result ++ "\n\nReply with one TOOL line if you need one more tool, or FINAL: followed by your answer."}))
-    LoopStep {
-      messages: next_msgs,
-      count: next_count,
-      last_batch: fingerprint,
-      waiting: next_count < max_tools,
-      must_force_text: false
-    }
+    execute_local_manual_tool(msgs, adjusted_req, adjusted_req.arguments != req.arguments, total_tools, max_tools, fingerprint, explore_count, acted)
   end
 end
 
-function handle_local_text_round(msg: a mapping from text to text, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text): LoopStep
+function handle_local_text_round(msg: a mapping from text to text, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, explore_count: integer, acted: boolean): LoopStep
   intent: process one local-model text response and optionally execute one manual tool request
   let content: text = unwrap_or(get(msg, "content"), "")
   let req: ManualToolRequest = parse_manual_tool_request(content)
   if req.valid then
-    local_manual_tool_step(msgs, content, req, total_tools, max_tools, last_batch)
+    local_manual_tool_step(msgs, content, req, total_tools, max_tools, last_batch, explore_count, acted)
   else if req.final then
-    local_manual_final(msgs, req.final_text, total_tools, last_batch)
+    local_manual_final(msgs, req.final_text, total_tools, last_batch, explore_count, acted)
   else
-    local_manual_retry(msgs, content, total_tools, last_batch)
+    local_manual_retry(msgs, content, total_tools, last_batch, explore_count, acted)
   end
 end
 
-function prompt_loop_step(msgs: a list of a mapping from text to text, total_tools: integer, last_batch: text, prompt: text, must_force_text: boolean): LoopStep
+function prompt_loop_step(msgs: a list of a mapping from text to text, total_tools: integer, last_batch: text, prompt: text, must_force_text: boolean, explore_count: integer, acted: boolean): LoopStep
   intent: append a user follow-up prompt and continue the loop with updated forcing state
   LoopStep {
     messages: append(msgs, {"role": "user", "content": prompt}),
     count: total_tools,
     last_batch: last_batch,
     waiting: true,
-    must_force_text: must_force_text
+    must_force_text: must_force_text,
+    explore_count: explore_count,
+    acted: acted
   }
 end
 
-function handle_tool_round(msg: a mapping from text to text, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, round: integer, force_text: boolean): LoopStep
+function handle_tool_round(msg: a mapping from text to text, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, round: integer, force_text: boolean, explore_count: integer, acted: boolean): LoopStep
   intent: process one tool-calling response and decide whether the loop should continue
   if force_text then
     print("  [round " ++ to_text(round) ++ " - forcing text response]")
-    prompt_loop_step(msgs, total_tools, last_batch, "STOP calling tools. Provide your answer as plain text NOW.", false)
+    prompt_loop_step(msgs, total_tools, last_batch, "STOP calling tools. Provide your answer as plain text NOW.", false, explore_count, acted)
   else
     let valid_calls: a list of a mapping from text to text = dedupe_tool_calls(filter_valid_calls(unwrap_or(get(msg, "tool_calls"), [])))
     let current_batch: text = batch_fingerprint(valid_calls)
@@ -732,14 +941,16 @@ function handle_tool_round(msg: a mapping from text to text, msgs: a list of a m
         count: batch.count,
         last_batch: current_batch,
         waiting: not batch.stop,
-        must_force_text: false
+        must_force_text: false,
+        explore_count: explore_count,
+        acted: acted
       }
     else if length(valid_calls) > 0 then
       print("  [warn] model repeated the same tool batch; forcing text response]")
-      prompt_loop_step(msgs, total_tools, last_batch, "You already called those tools and have their results. Do not call them again. Answer using the existing tool outputs.", true)
+      prompt_loop_step(msgs, total_tools, last_batch, "You already called those tools and have their results. Do not call them again. Answer using the existing tool outputs.", true, explore_count, acted)
     else
       print("  [warn] model returned invalid tool calls; forcing text response]")
-      prompt_loop_step(msgs, total_tools, last_batch, "Your previous tool call was invalid. Do not call tools again. Answer in plain text or fix the tool call format.", true)
+      prompt_loop_step(msgs, total_tools, last_batch, "Your previous tool call was invalid. Do not call tools again. Answer in plain text or fix the tool call format.", true, explore_count, acted)
     end
   end
 end
@@ -759,22 +970,24 @@ function handle_text_response(msg: a mapping from text to text, msgs: a list of 
   end
 end
 
-function handle_success_response(resp_body: text, include_tools: boolean, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, round: integer, force_text: boolean): LoopStep
+function handle_success_response(resp_body: text, include_tools: boolean, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, round: integer, force_text: boolean, explore_count: integer, acted: boolean): LoopStep
   intent: process a successful API response and return the next loop state
   let choice: a mapping from text to text = get(get(json_parse(resp_body), "choices"), 0)
   let msg: a mapping from text to text = get(choice, "message")
   let finish: text = unwrap_or(get(choice, "finish_reason"), "stop")
   if not include_tools then
-    handle_local_text_round(msg, msgs, total_tools, max_tools, last_batch)
+    handle_local_text_round(msg, msgs, total_tools, max_tools, last_batch, explore_count, acted)
   else if finish == "tool_calls" then
-    handle_tool_round(msg, msgs, total_tools, max_tools, last_batch, round, force_text)
+    handle_tool_round(msg, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted)
   else
     LoopStep {
       messages: handle_text_response(msg, msgs),
       count: total_tools,
       last_batch: last_batch,
       waiting: false,
-      must_force_text: false
+      must_force_text: false,
+      explore_count: explore_count,
+      acted: acted
     }
   end
 end
@@ -787,6 +1000,8 @@ function run_inner_loop(init_messages: a list of a mapping from text to text, me
   mutable total_tools: integer = 0
   mutable last_batch: text = ""
   mutable must_force_text: boolean = false
+  mutable explore_count: integer = 0
+  mutable acted: boolean = false
   let round_cap: integer = if include_tools then max_tools else 999999 end
   while waiting do
     set round = round + 1
@@ -800,12 +1015,14 @@ function run_inner_loop(init_messages: a list of a mapping from text to text, me
       set msgs = take(msgs, messages_start)
       set waiting = false
     else
-      let step: LoopStep = handle_success_response(get(resp, "body"), include_tools, msgs, total_tools, max_tools, last_batch, round, force_text)
+      let step: LoopStep = handle_success_response(get(resp, "body"), include_tools, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted)
       set msgs = step.messages
       set total_tools = step.count
       set last_batch = step.last_batch
       set waiting = step.waiting
       set must_force_text = step.must_force_text
+      set explore_count = step.explore_count
+      set acted = step.acted
     end
     if round >= round_cap then
       print("  [warn] reached " ++ to_text(round_cap) ++ " response rounds this turn, stopping]")
@@ -861,6 +1078,13 @@ function resolve_api_key(base_url: text): text
   end
 end
 
+function resolve_max_tools(is_local: boolean): integer
+  intent: read LEGIBLE_CODER_MAX_TOOLS or use default 60 local and 30 remote
+  let default_text: text = if is_local then "60" else "30" end
+  let raw: text = unwrap_or(env_get("LEGIBLE_CODER_MAX_TOOLS"), default_text)
+  max(to_integer(raw), 1)
+end
+
 function main(): nothing
   intent: read base_url, api_key, and models, print the banner, then loop reading user messages
   let base_url: text = unwrap_or(env_get("LEGIBLE_CODER_BASE_URL"), "https://api.groq.com/openai/v1")
@@ -871,8 +1095,8 @@ function main(): nothing
   let full_model: text = unwrap_or(env_get("LEGIBLE_CODER_MODEL"), "openai/gpt-oss-120b")
   let fast_model: text = if is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "openai/gpt-oss-20b") end
   let expert_model: text = if is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "") end
-  let max_tools: integer = if is_local then 14 else 30 end
-  let max_output_tokens: integer = if is_local then 1536 else 16384 end
+  let max_tools: integer = resolve_max_tools(is_local)
+  let max_output_tokens: integer = if is_local then 750 else 16384 end
   print_banner(full_model, base_url)
   let sys_prompt: text = if is_local then local_system_prompt() else system_prompt(include_tools, include_dir_tools) end
   let sys_msg: a mapping from text to text = {"role": "system", "content": sys_prompt}
@@ -894,9 +1118,6 @@ function main(): nothing
       let turn_model: text = pick_model(user_input, full_model, fast_model, expert_model)
       if turn_model == expert_model and text_length(expert_model) > 0 then print("  [expert model: " ++ expert_model ++ "]") end
       if turn_model == fast_model and text_length(fast_model) > 0 then print("  [fast model: " ++ fast_model ++ "]") end
-      if is_local then
-        set messages = [sys_msg, local_bootstrap_msg]
-      end
       set messages = append(messages, {"role": "user", "content": user_input})
       let start: integer = length(messages)
       set messages = run_inner_loop(messages, start, key, base_url, turn_model, max_tools, include_tools, include_dir_tools, max_output_tokens)

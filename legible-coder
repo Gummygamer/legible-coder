@@ -9,10 +9,15 @@ set -e
 SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
 DIR="$(dirname "$SCRIPT")"
 CODER="$DIR/coder.lbl"
+LOCAL_LEGIBLE="$DIR/../legible/target/release/legible"
 
 if [ ! -f "$CODER" ]; then
   echo "Error: cannot find coder.lbl at $CODER" >&2
   exit 1
+fi
+
+if [ -x "$LOCAL_LEGIBLE" ]; then
+  exec "$LOCAL_LEGIBLE" run "$CODER" "$@"
 fi
 
 if ! command -v legible &>/dev/null; then

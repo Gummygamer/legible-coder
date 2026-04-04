@@ -32,13 +32,18 @@ function make_tool(name: text, description: text, param_names: a list of text, p
   }
 end
 
-function file_tools(): a list of a mapping from text to text
-  intent: build read_file, write_file, list_dir, and read_dir_recursive tool schemas
+function file_tools(include_dir_tools: boolean): a list of a mapping from text to text
+  intent: build file read write schemas and optionally add directory listing tools
   let read_tool: a mapping from text to text = make_tool("read_file", "Read the contents of a file at the given path.", ["path"], ["The file path to read"], ["path"])
+  let lines_tool: a mapping from text to text = make_tool("read_file_lines", "Read only part of a file using 1-based start_line and line_count.", ["path", "start_line", "line_count"], ["The file path to read", "The first 1-based line number to include", "The number of lines to include"], ["path", "start_line", "line_count"])
   let write_tool: a mapping from text to text = make_tool("write_file", "Write content to a file at the given path. Creates or overwrites.", ["path", "content"], ["The file path to write", "The content to write"], ["path", "content"])
-  let list_tool: a mapping from text to text = make_tool("list_dir", "List files and directories at a given path (one level only).", ["path"], ["The directory path to list"], ["path"])
-  let recursive_tool: a mapping from text to text = make_tool("read_dir_recursive", "Recursively list all files under a directory. Use this instead of repeated list_dir calls to understand the project structure.", ["path"], ["The root directory to list recursively"], ["path"])
-  [read_tool, write_tool, list_tool, recursive_tool]
+  if include_dir_tools then
+    let list_tool: a mapping from text to text = make_tool("list_dir", "List files and directories at a given path (one level only).", ["path"], ["The directory path to list"], ["path"])
+    let recursive_tool: a mapping from text to text = make_tool("read_dir_recursive", "Recursively list all files under a directory. Use this instead of repeated list_dir calls to understand the project structure.", ["path"], ["The root directory to list recursively"], ["path"])
+    [read_tool, lines_tool, write_tool, list_tool, recursive_tool]
+  else
+    [read_tool, lines_tool, write_tool]
+  end
 end
 
 function search_tools(): a list of a mapping from text to text
@@ -48,9 +53,9 @@ function search_tools(): a list of a mapping from text to text
   [shell_tool, grep_tool]
 end
 
-function tool_definitions(): a list of a mapping from text to text
-  intent: combine file_tools and search_tools into one list
-  let ft: a list of a mapping from text to text = file_tools()
+function tool_definitions(include_dir_tools: boolean): a list of a mapping from text to text
+  intent: combine file tools and search tools into one list
+  let ft: a list of a mapping from text to text = file_tools(include_dir_tools)
   let st: a list of a mapping from text to text = search_tools()
   reduce(st, ft, fn(acc: a list of a mapping from text to text, t: a mapping from text to text): a list of a mapping from text to text => append(acc, t))
 end
@@ -69,9 +74,9 @@ function clean_tool_name(name: text): text
 end
 
 function is_known_tool(name: text): boolean
-  intent: compare the cleaned name to read_file, write_file, shell_exec, list_dir, read_dir_recursive, and grep
+  intent: compare the cleaned name to the supported tool names
   let n: text = clean_tool_name(name)
-  n == "read_file" or n == "write_file" or n == "shell_exec" or
+  n == "read_file" or n == "read_file_lines" or n == "write_file" or n == "shell_exec" or
   n == "list_dir" or n == "read_dir_recursive" or n == "grep"
 end
 
@@ -80,6 +85,8 @@ function describe_tool_call(name: text, arguments: text): text
   let args: a mapping from text to text = json_parse(arguments)
   if name == "read_file" or name == "list_dir" or name == "read_dir_recursive" then
     name ++ "  " ++ unwrap_or(get(args, "path"), "")
+  else if name == "read_file_lines" then
+    name ++ "  " ++ unwrap_or(get(args, "path"), "") ++ ":" ++ unwrap_or(get(args, "start_line"), "") ++ "+" ++ unwrap_or(get(args, "line_count"), "")
   else if name == "write_file" then
     name ++ "  " ++ unwrap_or(get(args, "path"), "")
   else if name == "shell_exec" then
@@ -138,12 +145,34 @@ function exec_grep(args: a mapping from text to text): text
   if text_length(stdout) > 0 then stdout else "No matches found." end
 end
 
+function exec_read_file_lines(args: a mapping from text to text): text
+  intent: read one file slice using a 1-based start line and line count
+  let path: text = get(args, "path")
+  if not file_exists(path) then
+    "Error: file not found: " ++ path
+  else
+    let start_line: integer = max(to_integer(unwrap_or(get(args, "start_line"), "1")), 1)
+    let line_count: integer = max(to_integer(unwrap_or(get(args, "line_count"), "80")), 1)
+    let lines: a list of text = split(read_file(path), "\n")
+    let finish: integer = min(length(lines), start_line + line_count - 1)
+    mutable out: a list of text = []
+    mutable i: integer = start_line
+    while i <= finish do
+      set out = append(out, to_text(i) ++ ": " ++ unwrap_or(get(lines, i - 1), ""))
+      set i = i + 1
+    end
+    if length(out) == 0 then "(no lines in requested range)" else join(out, "\n") end
+  end
+end
+
 function execute_tool(name: text, arguments: text): text
-  intent: parse arguments and dispatch to read_file, write_file, shell_exec, list_dir, read_dir_recursive, or grep
+  intent: parse arguments and dispatch to the supported tool implementations
   let args: a mapping from text to text = json_parse(arguments)
   if name == "read_file" then
     let path: text = get(args, "path")
     if file_exists(path) then read_file(path) else "Error: file not found: " ++ path end
+  else if name == "read_file_lines" then
+    exec_read_file_lines(args)
   else if name == "write_file" then
     exec_write_file(args)
   else if name == "shell_exec" then
@@ -269,17 +298,62 @@ function prompt_rules(): text
   "- if-branches cannot be empty; use skip() as a no-op: if cond then skip() end\n" ++
   "- Avoid Unicode characters in code: use ASCII dash - not em-dash, straight quotes not curly quotes\n" ++
   "- Write code to files with write_file, then run with shell_exec\n" ++
-  "- Keep responses concise; use tools to act rather than describing what you would do"
+  "- Keep responses concise; use tools to act rather than describing what you would do\n" ++
+  "- Do NOT repeat the same tool call in one turn; if you already read a file or listed a directory, use what you have and answer\n" ++
+  "- You have a limited tool budget per turn; gather what you need efficiently and then provide your answer"
 end
 
-function system_prompt(): text
+function tool_names_text(include_tools: boolean, include_dir_tools: boolean): text
+  intent: return none or the read_file write_file shell_exec list_dir read_dir_recursive grep tool names
+  if not include_tools then
+    "none"
+  else if include_dir_tools then
+    "read_file, write_file, shell_exec, list_dir, read_dir_recursive, grep"
+  else
+    "read_file, write_file, shell_exec, grep"
+  end
+end
+
+function local_system_prompt(): text
+  intent: return a compact local-model prompt with a manual TOOL and FINAL protocol
+  "You are legible-coder, a concise coding assistant for the Legible language.\n\n" ++
+  "For this local-model session, native OpenAI tool calling is unavailable.\n" ++
+  "If you need to use a tool, reply with exactly one line in this format:\n" ++
+  "TOOL tool_name JSON_arguments\n" ++
+  "Valid tools: read_file, read_file_lines, write_file, list_dir, read_dir_recursive, grep, shell_exec.\n" ++
+  "After tool results are returned, either request one more tool the same way or reply with:\n" ++
+  "FINAL: your answer\n\n" ++
+  "Do not emit multiple TOOL lines in one response. Do not explain the tool choice before or after the TOOL line.\n" ++
+  "Do not emit <tool_call>, <tool_response>, arguments:, or any XML-style wrappers.\n" ++
+  "Prefer list_dir or read_dir_recursive for directory exploration before using shell_exec.\n" ++
+  "Prefer read_file_lines for large files after you know the area you need.\n" ++
+  "Examples:\n" ++
+  "TOOL list_dir \{\"path\":\".\"\}\n" ++
+  "TOOL read_file \{\"path\":\"game.lbl\"\}\n" ++
+  "TOOL read_file_lines \{\"path\":\"game.lbl\",\"start_line\":\"1\",\"line_count\":\"80\"\}\n" ++
+  "TOOL grep \{\"pattern\":\"sdl_\",\"path\":\"../legible/src/interpreter/sdl_builtins.rs\"\}\n\n" ++
+  "Understand the task by reading the relevant files first. Do not guess file contents.\n" ++
+  "Keep answers direct and avoid long chain-of-thought.\n\n" ++
+  "Legible rules:\n" ++
+  "- function params need colons: fn(x: text)\n" ++
+  "- let/mutable bindings need colons\n" ++
+  "- blocks end with end\n" ++
+  "- no return keyword; last expression returns\n" ++
+  "- mapping access uses get(map, \"key\")\n" ++
+  "- list access uses get(list, index)\n" ++
+  "- use else if, not elseif\n" ++
+  "- comments use --\n" ++
+  "- use ASCII in code\n"
+end
+
+function system_prompt(include_tools: boolean, include_dir_tools: boolean): text
   intent: compose the header, syntax reference, builtins, example, and rules into the full system prompt
   let cwd: text = get_cwd()
   "You are legible-coder, an interactive CLI coding assistant. " ++
   "You write code in the Legible programming language and perform tasks by running Legible scripts.\n\n" ++
   "Current working directory: " ++ cwd ++ "\n\n" ++
-  "TOOLS: read_file, write_file, shell_exec, list_dir, read_dir_recursive, grep.\n" ++
-  "Use read_dir_recursive to understand project structure in ONE call instead of many list_dir calls.\n\n" ++
+  "TOOLS: " ++ tool_names_text(include_tools, include_dir_tools) ++ ".\n" ++
+  if not include_tools then "No runtime tools are available in this session. Rely on the preloaded workspace snapshot and answer in plain text.\n\n" else if include_dir_tools then "Use read_dir_recursive to understand project structure in ONE call instead of many list_dir calls.\n\n" else "For local models, rely on the preloaded workspace snapshot before making tool calls.\n\n" end ++
   prompt_syntax_ref() ++
   prompt_builtins_and_example() ++
   prompt_rules()
@@ -287,14 +361,40 @@ end
 
 -- ─── API ──────────────────────────────────────────────────────────────────────
 
-function build_request(model: text, messages: a list of a mapping from text to text): a mapping from text to text
-  intent: put model, messages, tools, and max_tokens into the chat completions request mapping
+function extract_error_message(body: text): text
+  intent: extract an API error message from a JSON body or fall back to the raw body text
+  if json_valid(body) then
+    let parsed: a mapping from text to text = json_parse(body)
+    if has_key(parsed, "error") then
+      to_text(get(parsed, "error"))
+    else
+      body
+    end
+  else
+    body
+  end
+end
+
+function local_model_context(): text
+  intent: provide minimal local workspace orientation without task-specific code content
+  let project_tree: text = get(shell_exec("find . -maxdepth 2 -not -path './.git' -not -path './.git/*' | sort | head -80"), "stdout")
+  "LOCAL MODEL BOOTSTRAP:\n" ++
+  "Project tree:\n" ++ trim(project_tree) ++ "\n\n" ++
+  "A neighboring repository named ../legible contains the interpreter implementation.\n" ++
+  "Read specific files with tools before proposing changes."
+end
+
+function build_request(model: text, messages: a list of a mapping from text to text, force_text: boolean, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer): a mapping from text to text
+  intent: put model, messages, tools, tool_choice, and token limits into the chat completions request mapping
+  let tc: text = if force_text or not include_tools then "none" else "auto" end
+  let tools: a list of a mapping from text to text = if include_tools then tool_definitions(include_dir_tools) else [] end
   {
     "model": model,
     "messages": messages,
-    "tools": tool_definitions(),
-    "tool_choice": "auto",
-    "max_tokens": 16384
+    "tools": tools,
+    "tool_choice": tc,
+    "max_tokens": max_output_tokens,
+    "stream": false
   }
 end
 
@@ -336,8 +436,25 @@ record BatchResult
   stop: boolean
 end
 
-function run_tool_batch(messages: a list of a mapping from text to text, valid_calls: a list of a mapping from text to text, tool_count: integer): BatchResult
+record LoopStep
+  messages: a list of a mapping from text to text
+  count: integer
+  last_batch: text
+  waiting: boolean
+  must_force_text: boolean
+end
+
+record ManualToolRequest
+  valid: boolean
+  final: boolean
+  name: text
+  arguments: text
+  final_text: text
+end
+
+function run_tool_batch(messages: a list of a mapping from text to text, valid_calls: a list of a mapping from text to text, tool_count: integer, max_tools: integer): BatchResult
   intent: append the assistant tool_calls message, execute each call, and return updated messages and count
+  print("  batch: " ++ to_text(length(valid_calls)) ++ " calls")
   let asst_msg: a mapping from text to text = {"role": "assistant", "content": none, "tool_calls": valid_calls}
   mutable msgs: a list of a mapping from text to text = append(messages, asst_msg)
   mutable n: integer = tool_count
@@ -352,8 +469,8 @@ function run_tool_batch(messages: a list of a mapping from text to text, valid_c
     let result: text = if text_length(raw) > 8000 then substring(raw, 0, 8000) ++ "\n... (truncated)" else raw end
     set msgs = append(msgs, {"role": "tool", "tool_call_id": tc_id, "content": result})
   end
-  let hit_cap: boolean = n >= 30
-  if hit_cap then print("  [warn] reached 30 tool calls this turn, stopping") end
+  let hit_cap: boolean = n >= max_tools
+  if hit_cap then print("  [warn] reached " ++ to_text(max_tools) ++ " tool calls this turn, stopping") end
   BatchResult {messages: msgs, count: n, stop: hit_cap}
 end
 
@@ -362,6 +479,269 @@ end
 function filter_valid_calls(all_calls: a list of a mapping from text to text): a list of a mapping from text to text
   intent: keep only tool calls with known names and valid JSON object arguments
   filter(all_calls, fn(tc: a mapping from text to text): boolean => is_known_tool(get(get(tc, "function"), "name")) and json_valid(get(get(tc, "function"), "arguments")) and starts_with(trim(get(get(tc, "function"), "arguments")), "\{"))
+end
+
+function call_fingerprint(tc: a mapping from text to text): text
+  intent: normalize a tool call into a stable text key using cleaned function name and raw arguments
+  let fn_info: a mapping from text to text = get(tc, "function")
+  clean_tool_name(get(fn_info, "name")) ++ "::" ++ trim(get(fn_info, "arguments"))
+end
+
+function dedupe_tool_calls(valid_calls: a list of a mapping from text to text): a list of a mapping from text to text
+  intent: preserve only the first occurrence of each tool call fingerprint in a response
+  mutable seen: a list of text = []
+  mutable deduped: a list of a mapping from text to text = []
+  for tc in valid_calls do
+    let fingerprint: text = call_fingerprint(tc)
+    if is_none(find(seen, fn(item: text): boolean => item == fingerprint)) then
+      set seen = append(seen, fingerprint)
+      set deduped = append(deduped, tc)
+    end
+  end
+  deduped
+end
+
+function batch_fingerprint(valid_calls: a list of a mapping from text to text): text
+  intent: join all call fingerprints into one batch fingerprint for repeat detection
+  join(map(valid_calls, fn(tc: a mapping from text to text): text => call_fingerprint(tc)), "\n")
+end
+
+function manual_tool_fingerprint(name: text, arguments: text): text
+  intent: join tool name and arguments into one fingerprint text
+  name ++ "::" ++ trim(arguments)
+end
+
+function truncate_tool_output(raw: text, max_chars: integer): text
+  intent: return raw tool output clipped to max_chars with a truncated marker
+  if text_length(raw) > max_chars then
+    substring(raw, 0, max_chars) ++ "\n... (truncated)"
+  else
+    raw
+  end
+end
+
+function prune_local_messages(msgs: a list of a mapping from text to text): a list of a mapping from text to text
+  intent: keep only the local system messages and the most recent turn messages
+  if length(msgs) <= 6 then
+    msgs
+  else
+    let head: a list of a mapping from text to text = take(msgs, 3)
+    let tail: a list of a mapping from text to text = drop(msgs, max(length(msgs) - 3, 3))
+    reduce(tail, head, fn(acc: a list of a mapping from text to text, item: a mapping from text to text): a list of a mapping from text to text => append(acc, item))
+  end
+end
+
+function seen_tool_for_path(msgs: a list of a mapping from text to text, tool_name: text, path: text): boolean
+  intent: return true when prior local messages already contain a tool result line for tool_name and path
+  is_some(find(msgs, fn(msg: a mapping from text to text): boolean => contains_text(unwrap_or(get(msg, "content"), ""), "Tool result for " ++ tool_name) and contains_text(unwrap_or(get(msg, "content"), ""), "\"path\":\"" ++ path ++ "\"")))
+end
+
+function json_escape_text(content: text): text
+  intent: replace content backslashes and double quotes with escaped JSON text
+  let slashed: text = replace(content, "\\", "\\\\")
+  replace(slashed, "\"", "\\\"")
+end
+
+function trim_manual_tool_blob(blob: text): text
+  intent: trim tool blob text before any angle bracket marker or pipe marker
+  let lt: integer = unwrap_or(index_of(blob, "<"), -1)
+  let pipe: integer = unwrap_or(index_of(blob, "|"), -1)
+  if lt >= 0 and pipe >= 0 then
+    trim(substring(blob, 0, min(lt, pipe)))
+  else if lt >= 0 then
+    trim(substring(blob, 0, lt))
+  else if pipe >= 0 then
+    trim(substring(blob, 0, pipe))
+  else
+    trim(blob)
+  end
+end
+
+function recover_single_quoted_argument(raw_args: text, key: text): text
+  intent: find key colon single-quoted text and return one JSON object for that key
+  let marker: text = key ++ ":"
+  let start: integer = unwrap_or(index_of(raw_args, marker), -1)
+  if start >= 0 then
+    let after: text = trim(substring(raw_args, start + text_length(marker), text_length(raw_args) - start - text_length(marker)))
+    let first_quote: integer = unwrap_or(index_of(after, "'"), -1)
+    if first_quote >= 0 then
+      let tail: text = substring(after, first_quote + 1, text_length(after) - first_quote - 1)
+      let second_quote: integer = unwrap_or(index_of(tail, "'"), -1)
+      if second_quote >= 0 then
+        "\{\"" ++ key ++ "\":\"" ++ json_escape_text(substring(tail, 0, second_quote)) ++ "\"\}"
+      else
+        raw_args
+      end
+    else
+      raw_args
+    end
+  else
+    raw_args
+  end
+end
+
+function normalize_manual_arguments(name: text, raw_args: text): text
+  intent: normalize malformed local tool arguments into JSON when possible
+  let cleaned: text = trim_manual_tool_blob(trim(raw_args))
+  if json_valid(cleaned) and starts_with(cleaned, "\{") then
+    cleaned
+  else if name == "shell_exec" then
+    recover_single_quoted_argument(cleaned, "arguments")
+    |> fn(result: text): text => if json_valid(result) then result else recover_single_quoted_argument(cleaned, "command") end
+  else if name == "read_file" or name == "list_dir" or name == "read_dir_recursive" then
+    recover_single_quoted_argument(cleaned, "path")
+  else
+    cleaned
+  end
+end
+
+function parse_manual_tool_request(content: text): ManualToolRequest
+  intent: parse local-model TOOL and FINAL responses from plain text content
+  let trimmed: text = trim(content)
+  let lines: a list of text = split(trimmed, "\n")
+  let tool_line: an optional text = find(lines, fn(line: text): boolean => starts_with(trim(line), "TOOL "))
+  let final_line: an optional text = find(lines, fn(line: text): boolean => starts_with(trim(line), "FINAL:"))
+  if is_some(tool_line) then
+    let line: text = trim(unwrap(tool_line))
+    let rest: text = trim_manual_tool_blob(trim(substring(line, 5, text_length(line) - 5)))
+    let brace: integer = unwrap_or(index_of(rest, "\{"), -1)
+    let space: integer = unwrap_or(index_of(rest, " "), -1)
+    if brace > 0 then
+      let name: text = trim(substring(rest, 0, brace))
+      let arguments: text = normalize_manual_arguments(clean_tool_name(name), substring(rest, brace, text_length(rest) - brace))
+      let valid: boolean = is_known_tool(name) and json_valid(arguments) and starts_with(arguments, "\{")
+      ManualToolRequest {valid: valid, final: false, name: clean_tool_name(name), arguments: arguments, final_text: ""}
+    else if space > 0 then
+      let name: text = trim(substring(rest, 0, space))
+      let arguments: text = normalize_manual_arguments(clean_tool_name(name), substring(rest, space + 1, text_length(rest) - space - 1))
+      let valid: boolean = is_known_tool(name) and json_valid(arguments) and starts_with(arguments, "\{")
+      ManualToolRequest {valid: valid, final: false, name: clean_tool_name(name), arguments: arguments, final_text: ""}
+    else
+      ManualToolRequest {valid: false, final: false, name: "", arguments: "", final_text: trimmed}
+    end
+  else if is_some(final_line) then
+    let line: text = trim(unwrap(final_line))
+    ManualToolRequest {valid: false, final: true, name: "", arguments: "", final_text: trim(substring(line, 6, text_length(line) - 6))}
+  else
+    ManualToolRequest {valid: false, final: false, name: "", arguments: "", final_text: trimmed}
+  end
+end
+
+function local_manual_retry(msgs: a list of a mapping from text to text, content: text, total_tools: integer, last_batch: text): LoopStep
+  intent: append assistant content and a strict-format reminder when the local model ignores the protocol
+  print("  [warn] local model returned a malformed TOOL/FINAL response; retrying with format reminder]")
+  if length(msgs) > 5 then print("  [context] pruning local retry history]") end
+  LoopStep {
+    messages: prune_local_messages(append(msgs, {"role": "user", "content": "Your last reply did not follow the required format. Reply in exactly one of these formats only:\nTOOL tool_name JSON_arguments\nFINAL: your answer"})),
+    count: total_tools,
+    last_batch: last_batch,
+    waiting: true,
+    must_force_text: false
+  }
+end
+
+function local_manual_final(msgs: a list of a mapping from text to text, final_text: text, total_tools: integer, last_batch: text): LoopStep
+  intent: finish the local manual-tool loop by printing the final text answer
+  let final_msg: a mapping from text to text = {"content": final_text}
+  LoopStep {
+    messages: handle_text_response(final_msg, msgs),
+    count: total_tools,
+    last_batch: last_batch,
+    waiting: false,
+    must_force_text: false
+  }
+end
+
+function local_manual_tool_step(msgs: a list of a mapping from text to text, content: text, req: ManualToolRequest, total_tools: integer, max_tools: integer, last_batch: text): LoopStep
+  intent: execute one manual tool request or reject an immediate repeat
+  let fingerprint: text = manual_tool_fingerprint(req.name, req.arguments)
+  let req_path: text = if req.name == "read_file" or req.name == "read_file_lines" then unwrap_or(get(json_parse(req.arguments), "path"), "") else "" end
+  let repeated_full_read: boolean = req.name == "read_file" and text_length(req_path) > 0 and seen_tool_for_path(msgs, "read_file", req_path)
+  let has_partial_read: boolean = req.name == "read_file" and text_length(req_path) > 0 and seen_tool_for_path(msgs, "read_file_lines", req_path)
+  if fingerprint == last_batch or repeated_full_read then
+    print("  [warn] model repeated the same manual tool request; forcing final answer]")
+    let repeat_hint: text = if req.name == "read_file" then
+      if has_partial_read then
+        "You already read that file and also fetched line ranges from it. Do not repeat read_file. Continue with FINAL: your answer, or request a new non-overlapping read_file_lines range."
+      else
+        "You already read that whole file. Do not repeat read_file. If you need more detail, use read_file_lines with path, start_line, and line_count instead, for example TOOL read_file_lines " ++ req.arguments ++ " plus a start_line and line_count."
+      end
+    else
+      "You already requested that tool and received its result. Do not repeat it. Reply with FINAL: and your answer."
+    end
+    LoopStep {
+      messages: append(msgs, {"role": "user", "content": repeat_hint}),
+      count: total_tools,
+      last_batch: last_batch,
+      waiting: true,
+      must_force_text: false
+    }
+  else
+    let next_count: integer = total_tools + 1
+    print("  [" ++ to_text(next_count) ++ "] " ++ describe_tool_call(req.name, req.arguments))
+    let raw: text = execute_tool(req.name, req.arguments)
+    let result: text = truncate_tool_output(raw, 2000)
+    if length(msgs) > 5 then print("  [context] pruning local tool history]") end
+    let next_msgs: a list of a mapping from text to text = prune_local_messages(append(msgs, {"role": "user", "content": "Tool result for " ++ req.name ++ " " ++ req.arguments ++ ":\n" ++ result ++ "\n\nReply with one TOOL line if you need one more tool, or FINAL: followed by your answer."}))
+    LoopStep {
+      messages: next_msgs,
+      count: next_count,
+      last_batch: fingerprint,
+      waiting: next_count < max_tools,
+      must_force_text: false
+    }
+  end
+end
+
+function handle_local_text_round(msg: a mapping from text to text, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text): LoopStep
+  intent: process one local-model text response and optionally execute one manual tool request
+  let content: text = unwrap_or(get(msg, "content"), "")
+  let req: ManualToolRequest = parse_manual_tool_request(content)
+  if req.valid then
+    local_manual_tool_step(msgs, content, req, total_tools, max_tools, last_batch)
+  else if req.final then
+    local_manual_final(msgs, req.final_text, total_tools, last_batch)
+  else
+    local_manual_retry(msgs, content, total_tools, last_batch)
+  end
+end
+
+function prompt_loop_step(msgs: a list of a mapping from text to text, total_tools: integer, last_batch: text, prompt: text, must_force_text: boolean): LoopStep
+  intent: append a user follow-up prompt and continue the loop with updated forcing state
+  LoopStep {
+    messages: append(msgs, {"role": "user", "content": prompt}),
+    count: total_tools,
+    last_batch: last_batch,
+    waiting: true,
+    must_force_text: must_force_text
+  }
+end
+
+function handle_tool_round(msg: a mapping from text to text, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, round: integer, force_text: boolean): LoopStep
+  intent: process one tool-calling response and decide whether the loop should continue
+  if force_text then
+    print("  [round " ++ to_text(round) ++ " - forcing text response]")
+    prompt_loop_step(msgs, total_tools, last_batch, "STOP calling tools. Provide your answer as plain text NOW.", false)
+  else
+    let valid_calls: a list of a mapping from text to text = dedupe_tool_calls(filter_valid_calls(unwrap_or(get(msg, "tool_calls"), [])))
+    let current_batch: text = batch_fingerprint(valid_calls)
+    if length(valid_calls) > 0 and current_batch != last_batch then
+      let batch: BatchResult = run_tool_batch(msgs, valid_calls, total_tools, max_tools)
+      LoopStep {
+        messages: batch.messages,
+        count: batch.count,
+        last_batch: current_batch,
+        waiting: not batch.stop,
+        must_force_text: false
+      }
+    else if length(valid_calls) > 0 then
+      print("  [warn] model repeated the same tool batch; forcing text response]")
+      prompt_loop_step(msgs, total_tools, last_batch, "You already called those tools and have their results. Do not call them again. Answer using the existing tool outputs.", true)
+    else
+      print("  [warn] model returned invalid tool calls; forcing text response]")
+      prompt_loop_step(msgs, total_tools, last_batch, "Your previous tool call was invalid. Do not call tools again. Answer in plain text or fix the tool call format.", true)
+    end
+  end
 end
 
 function handle_text_response(msg: a mapping from text to text, msgs: a list of a mapping from text to text): a list of a mapping from text to text
@@ -379,39 +759,57 @@ function handle_text_response(msg: a mapping from text to text, msgs: a list of 
   end
 end
 
-function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text): a list of a mapping from text to text
-  intent: call the API in a loop executing tool calls until the model returns text or an error occurs
+function handle_success_response(resp_body: text, include_tools: boolean, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, round: integer, force_text: boolean): LoopStep
+  intent: process a successful API response and return the next loop state
+  let choice: a mapping from text to text = get(get(json_parse(resp_body), "choices"), 0)
+  let msg: a mapping from text to text = get(choice, "message")
+  let finish: text = unwrap_or(get(choice, "finish_reason"), "stop")
+  if not include_tools then
+    handle_local_text_round(msg, msgs, total_tools, max_tools, last_batch)
+  else if finish == "tool_calls" then
+    handle_tool_round(msg, msgs, total_tools, max_tools, last_batch, round, force_text)
+  else
+    LoopStep {
+      messages: handle_text_response(msg, msgs),
+      count: total_tools,
+      last_batch: last_batch,
+      waiting: false,
+      must_force_text: false
+    }
+  end
+end
+
+function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer): a list of a mapping from text to text
+  intent: call the API in a loop executing tool calls until text response or round limit
   mutable msgs: a list of a mapping from text to text = init_messages
   mutable waiting: boolean = true
-  mutable tool_count: integer = 0
+  mutable round: integer = 0
+  mutable total_tools: integer = 0
+  mutable last_batch: text = ""
+  mutable must_force_text: boolean = false
+  let round_cap: integer = if include_tools then max_tools else 999999 end
   while waiting do
-    let resp: a mapping from text to text = call_api(key, base_url, build_request(model, msgs))
+    set round = round + 1
+    let force_text: boolean = if include_tools then must_force_text or round > max_tools / 2 else false end
+    set must_force_text = false
+    let resp: a mapping from text to text = call_api(key, base_url, build_request(model, msgs, force_text, include_tools, include_dir_tools, max_output_tokens))
     let status: text = get(resp, "status")
+    print("  [" ++ to_text(round) ++ "] status=" ++ status)
     if status != "200" then
-      let err_info: a mapping from text to text = unwrap_or(get(json_parse(get(resp, "body")), "error"), {})
-      print("  API error (status " ++ status ++ "):")
-      print("  " ++ unwrap_or(get(err_info, "message"), get(resp, "body")))
+      print("  API error: " ++ extract_error_message(get(resp, "body")))
       set msgs = take(msgs, messages_start)
       set waiting = false
     else
-      let choice: a mapping from text to text = get(get(json_parse(get(resp, "body")), "choices"), 0)
-      let msg: a mapping from text to text = get(choice, "message")
-      let finish: text = unwrap_or(get(choice, "finish_reason"), "stop")
-      if finish == "tool_calls" then
-        let valid_calls: a list of a mapping from text to text = filter_valid_calls(unwrap_or(get(msg, "tool_calls"), []))
-        if length(valid_calls) > 0 then
-          let batch: BatchResult = run_tool_batch(msgs, valid_calls, tool_count)
-          set msgs = batch.messages
-          set tool_count = batch.count
-          if batch.stop then set waiting = false end
-        else
-          print("  [warn] all tool calls invalid, ending turn")
-          set waiting = false
-        end
-      else
-        set msgs = handle_text_response(msg, msgs)
-        set waiting = false
-      end
+      let step: LoopStep = handle_success_response(get(resp, "body"), include_tools, msgs, total_tools, max_tools, last_batch, round, force_text)
+      set msgs = step.messages
+      set total_tools = step.count
+      set last_batch = step.last_batch
+      set waiting = step.waiting
+      set must_force_text = step.must_force_text
+    end
+    if round >= round_cap then
+      print("  [warn] reached " ++ to_text(round_cap) ++ " response rounds this turn, stopping]")
+      set waiting = false
     end
   end
   msgs
@@ -468,12 +866,21 @@ function main(): nothing
   let base_url: text = unwrap_or(env_get("LEGIBLE_CODER_BASE_URL"), "https://api.groq.com/openai/v1")
   let key: text = resolve_api_key(base_url)
   let is_local: boolean = contains_text(base_url, "localhost") or contains_text(base_url, "127.0.0.1")
+  let include_tools: boolean = not is_local
+  let include_dir_tools: boolean = not is_local
   let full_model: text = unwrap_or(env_get("LEGIBLE_CODER_MODEL"), "openai/gpt-oss-120b")
   let fast_model: text = if is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "openai/gpt-oss-20b") end
   let expert_model: text = if is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "") end
+  let max_tools: integer = if is_local then 14 else 30 end
+  let max_output_tokens: integer = if is_local then 1536 else 16384 end
   print_banner(full_model, base_url)
-  let sys_msg: a mapping from text to text = {"role": "system", "content": system_prompt()}
+  let sys_prompt: text = if is_local then local_system_prompt() else system_prompt(include_tools, include_dir_tools) end
+  let sys_msg: a mapping from text to text = {"role": "system", "content": sys_prompt}
+  let local_bootstrap_msg: a mapping from text to text = {"role": "system", "content": local_model_context()}
   mutable messages: a list of a mapping from text to text = [sys_msg]
+  if is_local then
+    set messages = append(messages, local_bootstrap_msg)
+  end
   mutable running: boolean = true
   while running do
     print("  > ")
@@ -487,9 +894,12 @@ function main(): nothing
       let turn_model: text = pick_model(user_input, full_model, fast_model, expert_model)
       if turn_model == expert_model and text_length(expert_model) > 0 then print("  [expert model: " ++ expert_model ++ "]") end
       if turn_model == fast_model and text_length(fast_model) > 0 then print("  [fast model: " ++ fast_model ++ "]") end
+      if is_local then
+        set messages = [sys_msg, local_bootstrap_msg]
+      end
       set messages = append(messages, {"role": "user", "content": user_input})
       let start: integer = length(messages)
-      set messages = run_inner_loop(messages, start, key, base_url, turn_model)
+      set messages = run_inner_loop(messages, start, key, base_url, turn_model, max_tools, include_tools, include_dir_tools, max_output_tokens)
     end
   end
 end

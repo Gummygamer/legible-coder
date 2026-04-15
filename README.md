@@ -1,6 +1,6 @@
 # legible-coder
 
-An interactive CLI coding assistant for the [Legible programming language](../legible/), styled after Claude Code. It writes Legible code and performs tasks by running Legible scripts, powered by the `gpt-oss-120b` model via the [Groq API](https://groq.com/).
+An interactive CLI coding assistant for the [Legible programming language](../legible/), styled after Claude Code. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is `gpt-oss-120b` via the [Groq API](https://groq.com/).
 
 ```
   legible-coder
@@ -58,6 +58,19 @@ cd your-project-directory
 legible-coder
 ```
 
+For a local OpenAI-compatible server such as LM Studio:
+
+```bash
+export LEGIBLE_CODER_BASE_URL="http://127.0.0.1:1234/v1"
+export LEGIBLE_CODER_MODEL="google/gemma-4-26b-a4b"
+legible-coder
+```
+
+Gemma 4 model names enable native tool calling automatically. Set
+`LEGIBLE_CODER_LOCAL_TOOLS=0` to force the older manual `TOOL ...` protocol,
+or `LEGIBLE_CODER_LOCAL_TOOLS=1` to force native tool schemas for another local
+model.
+
 Then type your request at the `>` prompt. Examples:
 
 ```
@@ -75,21 +88,27 @@ Type `quit` or `exit` to leave.
 legible-coder is a single Legible file (`coder.lbl`) that implements a Claude Code-style REPL:
 
 1. Reads your request
-2. Sends it to `gpt-oss-120b` on Groq with a full Legible language reference in the system prompt
+2. Sends it to the configured model with a full Legible language reference in the system prompt
 3. If the model calls a tool, executes it and feeds the result back
 4. Loops until the model produces a text response
 5. Prints the response and waits for the next request
 
-Conversation history is kept in-memory for the duration of the session.
+Conversation history is kept in-memory for the duration of the session. When
+the rough transcript token estimate crosses the configured context budget,
+older messages are compacted into a synthetic summary while recent messages are
+kept verbatim. Native tool-call transcripts are compacted at safe boundaries so
+tool results keep their preceding assistant tool-call message.
 
 ### Tools available to the model
 
 | Tool | Description |
 |------|-------------|
 | `read_file` | Read a file's contents |
+| `read_file_lines` | Read a 40-line slice of a file with line numbers |
 | `write_file` | Create or overwrite a file |
 | `shell_exec` | Run a shell command (including `legible run`) |
 | `list_dir` | List directory entries |
+| `read_dir_recursive` | Recursively list files under a directory |
 | `grep` | Search for patterns in files |
 
 ## Interpreter additions
@@ -126,4 +145,15 @@ legible-coder/
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GROQ_API_KEY` | Yes | Your Groq API key |
+| `GROQ_API_KEY` | For Groq | Groq API key when using the default Groq endpoint |
+| `LEGIBLE_CODER_API_KEY` | No | Explicit API key override. Local endpoints default to `lm-studio` |
+| `LEGIBLE_CODER_BASE_URL` | No | OpenAI-compatible base URL. Default: `https://api.groq.com/openai/v1` |
+| `LEGIBLE_CODER_MODEL` | No | Primary model. Default: `openai/gpt-oss-120b` |
+| `LEGIBLE_CODER_FAST_MODEL` | No | Remote fast model for simple turns. Default: `openai/gpt-oss-20b` |
+| `LEGIBLE_CODER_EXPERT_MODEL` | No | Optional remote expert model for architecture/refactor/design turns |
+| `LEGIBLE_CODER_LOCAL_TOOLS` | No | `1` forces native tools for local models, `0` forces manual local protocol. Gemma 4 names auto-enable native tools |
+| `LEGIBLE_CODER_MAX_TOOLS` | No | Maximum tool calls per user turn. Defaults: `60` local, `30` remote |
+| `LEGIBLE_CODER_MAX_EXPLORE` | No | Local manual-mode exploration budget before requiring an action. Default: `8` |
+| `LEGIBLE_CODER_MAX_OUTPUT_TOKENS` | No | Response cap. Defaults: `750` local manual, `4096` local native tools, `16384` remote |
+| `LEGIBLE_CODER_CONTEXT_TOKENS` | No | Rough transcript compaction budget. Defaults: `16000` local, `90000` remote |
+| `LEGIBLE_CODER_CONTEXT_KEEP_MESSAGES` | No | Recent messages preserved verbatim during compaction. Defaults: `8` local, `12` remote |

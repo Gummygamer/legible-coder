@@ -1,6 +1,6 @@
 # legible-coder
 
-An interactive CLI coding assistant written in the Legible programming language. It writes Legible code and performs tasks by running Legible scripts, powered by the `gpt-oss-120b` model via the Groq API.
+An interactive CLI coding assistant written in the Legible programming language. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is `gpt-oss-120b` via the Groq API.
 
 ## Architecture
 
@@ -12,20 +12,34 @@ legible-coder is a single-file Legible program (`coder.lbl`) that implements a C
 2. The tool displays a welcome banner and prompt
 3. User types a request (write code, run a task, ask a question)
 4. The tool builds a message with system prompt + conversation history
-5. It calls the Groq API (`gpt-oss-120b`) via `http_client_post`
+5. It calls an OpenAI-compatible chat completions API via `http_client_post`
 6. The model responds with either text or tool calls
 7. Tool calls are executed (read/write files, run shell commands, list directories)
 8. Results are fed back to the model for follow-up
 9. The final text response is displayed to the user
 
+Conversation context is bounded by rough token estimates. When the transcript
+crosses `LEGIBLE_CODER_CONTEXT_TOKENS`, older non-system messages are compacted
+into a synthetic system summary and the most recent messages are preserved
+verbatim. The compaction boundary walks backward over `tool` messages so native
+OpenAI-compatible tool results are not orphaned from their assistant tool-call
+message.
+
 ### Tool system
 
 The model has access to these tools:
 - `read_file` — read a file's contents
+- `read_file_lines` — read a fixed 40-line slice with line numbers
 - `write_file` — write content to a file
 - `shell_exec` — run a shell command
 - `list_dir` — list directory contents
 - `read_dir_recursive` — recursively list files (via `find`)
+- `grep` — search for patterns in files
+
+Local endpoints default to the manual `TOOL name JSON_arguments` protocol unless
+the model name looks like Gemma 4 or `LEGIBLE_CODER_LOCAL_TOOLS=1` is set. Set
+`LEGIBLE_CODER_LOCAL_TOOLS=0` to force the manual fallback for a local server
+whose OpenAI-compatible tool support is incomplete.
 
 ### Files
 
@@ -43,7 +57,8 @@ legible run /path/to/legible-coder/coder.lbl
 
 - The Legible interpreter built with HTTP client and process builtins
 - A valid Groq API key in the `GROQ_API_KEY` environment variable
-- Network access to `api.groq.com`
+- Network access to `api.groq.com`, or an OpenAI-compatible local server via
+  `LEGIBLE_CODER_BASE_URL`
 
 ## Legible language quick reference
 

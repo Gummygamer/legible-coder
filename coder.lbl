@@ -315,9 +315,9 @@ function tool_names_text(include_tools: boolean, include_dir_tools: boolean): te
   if not include_tools then
     "none"
   else if include_dir_tools then
-    "read_file, write_file, shell_exec, list_dir, read_dir_recursive, grep"
+    "read_file, read_file_lines, write_file, shell_exec, list_dir, read_dir_recursive, grep"
   else
-    "read_file, write_file, shell_exec, grep"
+    "read_file, read_file_lines, write_file, shell_exec, grep"
   end
 end
 
@@ -551,15 +551,179 @@ function truncate_tool_output(raw: text, max_chars: integer): text
   end
 end
 
-function prune_local_messages(msgs: a list of a mapping from text to text): a list of a mapping from text to text
-  intent: if length msgs is over 6 take msgs 3 then drop to the last 3 and reduce with append
-  if length(msgs) <= 6 then
+function compact_summary_marker(): text
+  intent: return compacted session summary marker
+  "COMPACTED SESSION SUMMARY:"
+end
+
+function message_text(msg: a mapping from text to text): text
+  intent: return content tool_calls text
+  let content: text = unwrap_or(get(msg, "content"), "")
+  let calls: text = if has_key(msg, "tool_calls") then to_text(get(msg, "tool_calls")) else "" end
+  trim(content ++ "\n" ++ calls)
+end
+
+function estimate_message_tokens(msg: a mapping from text to text): integer
+  intent: return max text_length message_text divided four
+  max(text_length(message_text(msg)) / 4, 1)
+end
+
+function estimate_messages_tokens(msgs: a list of a mapping from text to text): integer
+  intent: sum rough token estimates for every message in msgs
+  mutable total: integer = 0
+  for msg in msgs do
+    set total = total + estimate_message_tokens(msg)
+  end
+  total
+end
+
+function is_compact_summary_message(msg: a mapping from text to text): boolean
+  intent: return true when msg is a synthetic compacted context summary
+  get(msg, "role") == "system" and starts_with(unwrap_or(get(msg, "content"), ""), compact_summary_marker())
+end
+
+function leading_system_count(msgs: a list of a mapping from text to text): integer
+  intent: count leading system role messages
+  mutable i: integer = 0
+  mutable scanning: boolean = true
+  while i < length(msgs) and scanning do
+    let msg: a mapping from text to text = get(msgs, i)
+    if get(msg, "role") == "system" then
+      set i = i + 1
+    else
+      set scanning = false
+    end
+  end
+  i
+end
+
+function base_system_messages(msgs: a list of a mapping from text to text): a list of a mapping from text to text
+  intent: append leading system role messages not compact summary
+  mutable result: a list of a mapping from text to text = []
+  mutable i: integer = 0
+  mutable scanning: boolean = true
+  while i < length(msgs) and scanning do
+    let msg: a mapping from text to text = get(msgs, i)
+    if get(msg, "role") == "system" then
+      if not is_compact_summary_message(msg) then
+        set result = append(result, msg)
+      end
+      set i = i + 1
+    else
+      set scanning = false
+    end
+  end
+  result
+end
+
+function existing_compact_summary(msgs: a list of a mapping from text to text): text
+  intent: return the existing compact summary text if present
+  let found: an optional a mapping from text to text = find(msgs, fn(msg: a mapping from text to text): boolean => is_compact_summary_message(msg))
+  if is_some(found) then
+    unwrap_or(get(unwrap(found), "content"), "")
+  else
+    ""
+  end
+end
+
+function one_line_snippet(text_value: text, max_chars: integer): text
+  intent: replace newline tab trim substring text_value
+  let cleaned: text = replace(replace(trim(text_value), "\n", " "), "\t", " ")
+  if text_length(cleaned) > max_chars then
+    substring(cleaned, 0, max_chars) ++ "..."
+  else
+    cleaned
+  end
+end
+
+function summarize_message_for_context(msg: a mapping from text to text): text
+  intent: format one chat message as a short role-prefixed summary line
+  let role: text = unwrap_or(get(msg, "role"), "message")
+  "- " ++ role ++ ": " ++ one_line_snippet(message_text(msg), 180)
+end
+
+function recent_user_request_summary(msgs: a list of a mapping from text to text): text
+  intent: append user role snippets and drop older requests
+  mutable requests: a list of text = []
+  for msg in msgs do
+    if get(msg, "role") == "user" then
+      set requests = append(requests, "  - " ++ one_line_snippet(message_text(msg), 180))
+      if length(requests) > 3 then
+        set requests = drop(requests, 1)
+      end
+    end
+  end
+  if length(requests) > 0 then
+    "- Recent user requests:\n" ++ join(requests, "\n") ++ "\n"
+  else
+    ""
+  end
+end
+
+function recent_timeline_summary(msgs: a list of a mapping from text to text): text
+  intent: summarize the last few compacted messages as a lightweight timeline
+  let start: integer = max(length(msgs) - 8, 0)
+  let recent: a list of a mapping from text to text = drop(msgs, start)
+  let lines: a list of text = map(recent, fn(msg: a mapping from text to text): text => "  " ++ summarize_message_for_context(msg))
+  if length(lines) > 0 then
+    "- Recent compacted timeline:\n" ++ join(lines, "\n") ++ "\n"
+  else
+    ""
+  end
+end
+
+function compact_transcript_summary(removed: a list of a mapping from text to text, prior_summary: text): text
+  intent: build a synthetic summary for removed conversation messages while preserving actionable context
+  let prior: text = if text_length(prior_summary) > 0 then "- Previously compacted context:\n  - " ++ one_line_snippet(prior_summary, 700) ++ "\n" else "" end
+  compact_summary_marker() ++ "\n" ++
+  "This synthetic message preserves older conversation context that was compacted to keep the model inside its context budget.\n" ++
+  prior ++
+  "- Scope: " ++ to_text(length(removed)) ++ " older messages compacted from the live transcript.\n" ++
+  recent_user_request_summary(removed) ++
+  recent_timeline_summary(removed) ++
+  "Recent messages after this summary are preserved verbatim. Continue directly from the preserved context without asking the user to repeat it."
+end
+
+function safe_context_keep_from(msgs: a list of a mapping from text to text, raw_keep_from: integer, min_keep_from: integer): integer
+  intent: decrement keep_from while first_preserved role is tool
+  mutable keep_from: integer = max(raw_keep_from, min_keep_from)
+  mutable scanning: boolean = true
+  while keep_from > min_keep_from and scanning do
+    let first_preserved: a mapping from text to text = get(msgs, keep_from)
+    if get(first_preserved, "role") == "tool" then
+      set keep_from = keep_from - 1
+    else
+      set scanning = false
+    end
+  end
+  keep_from
+end
+
+function compact_context_if_needed(msgs: a list of a mapping from text to text, max_estimated_tokens: integer, preserve_recent_messages: integer): a list of a mapping from text to text
+  intent: compact older transcript messages into one summary when estimated tokens exceed the configured budget
+  let estimated: integer = estimate_messages_tokens(msgs)
+  let prefix_count: integer = leading_system_count(msgs)
+  if max_estimated_tokens <= 0 or estimated < max_estimated_tokens or length(msgs) <= prefix_count + preserve_recent_messages then
     msgs
   else
-    let head: a list of a mapping from text to text = take(msgs, 3)
-    let tail: a list of a mapping from text to text = drop(msgs, max(length(msgs) - 3, 3))
-    reduce(tail, head, fn(acc: a list of a mapping from text to text, item: a mapping from text to text): a list of a mapping from text to text => append(acc, item))
+    let raw_keep_from: integer = max(length(msgs) - preserve_recent_messages, prefix_count)
+    let keep_from: integer = safe_context_keep_from(msgs, raw_keep_from, prefix_count)
+    if keep_from <= prefix_count then
+      msgs
+    else
+      let removed: a list of a mapping from text to text = take(drop(msgs, prefix_count), keep_from - prefix_count)
+      let preserved: a list of a mapping from text to text = drop(msgs, keep_from)
+      let summary: text = compact_transcript_summary(removed, existing_compact_summary(msgs))
+      let compact_msg: a mapping from text to text = {"role": "system", "content": summary}
+      let with_summary: a list of a mapping from text to text = append(base_system_messages(msgs), compact_msg)
+      reduce(preserved, with_summary, fn(acc: a list of a mapping from text to text, msg: a mapping from text to text): a list of a mapping from text to text => append(acc, msg))
+    end
   end
+end
+
+function prune_local_messages(msgs: a list of a mapping from text to text): a list of a mapping from text to text
+  intent: compact context with resolve_context_budget and resolve_context_keep_messages
+  compact_context_if_needed(msgs, resolve_context_budget(true), resolve_context_keep_messages(true))
 end
 
 function seen_tool_for_path(msgs: a list of a mapping from text to text, tool_name: text, path: text): boolean
@@ -977,7 +1141,7 @@ function handle_success_response(resp_body: text, include_tools: boolean, msgs: 
   let finish: text = unwrap_or(get(choice, "finish_reason"), "stop")
   if not include_tools then
     handle_local_text_round(msg, msgs, total_tools, max_tools, last_batch, explore_count, acted)
-  else if finish == "tool_calls" then
+  else if finish == "tool_calls" or length(unwrap_or(get(msg, "tool_calls"), [])) > 0 then
     handle_tool_round(msg, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted)
   else
     LoopStep {
@@ -992,7 +1156,18 @@ function handle_success_response(resp_body: text, include_tools: boolean, msgs: 
   end
 end
 
-function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer): a list of a mapping from text to text
+function compact_loop_messages(msgs: a list of a mapping from text to text, context_budget: integer, preserve_recent_messages: integer): a list of a mapping from text to text
+  intent: compact loop messages when estimated tokens exceed the configured context budget
+  let tokens_before: integer = estimate_messages_tokens(msgs)
+  let compacted: a list of a mapping from text to text = compact_context_if_needed(msgs, context_budget, preserve_recent_messages)
+  let tokens_after: integer = estimate_messages_tokens(compacted)
+  if tokens_after < tokens_before then
+    print("  [context] compacted transcript " ++ to_text(tokens_before) ++ " -> " ++ to_text(tokens_after) ++ " estimated tokens")
+  end
+  compacted
+end
+
+function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer): a list of a mapping from text to text
   intent: call the API in a loop executing tool calls until text response or round limit
   mutable msgs: a list of a mapping from text to text = init_messages
   mutable waiting: boolean = true
@@ -1007,6 +1182,7 @@ function run_inner_loop(init_messages: a list of a mapping from text to text, me
     set round = round + 1
     let force_text: boolean = if include_tools then must_force_text or round > max_tools / 2 else false end
     set must_force_text = false
+    set msgs = compact_loop_messages(msgs, context_budget, preserve_recent_messages)
     let resp: a mapping from text to text = call_api(key, base_url, build_request(model, msgs, force_text, include_tools, include_dir_tools, max_output_tokens))
     let status: text = get(resp, "status")
     print("  [" ++ to_text(round) ++ "] status=" ++ status)
@@ -1085,20 +1261,82 @@ function resolve_max_tools(is_local: boolean): integer
   max(to_integer(raw), 1)
 end
 
+function resolve_context_budget(is_local: boolean): integer
+  intent: read LEGIBLE_CODER_CONTEXT_TOKENS or use a local or remote default budget
+  let default_text: text = if is_local then "16000" else "90000" end
+  let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_TOKENS"), default_text)
+  max(to_integer(raw), 1000)
+end
+
+function resolve_context_keep_messages(is_local: boolean): integer
+  intent: read LEGIBLE_CODER_CONTEXT_KEEP_MESSAGES or use a local or remote recent-message default
+  let default_text: text = if is_local then "8" else "12" end
+  let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_KEEP_MESSAGES"), default_text)
+  max(to_integer(raw), 2)
+end
+
+function resolve_max_output_tokens(is_local: boolean, include_tools: boolean): integer
+  intent: read LEGIBLE_CODER_MAX_OUTPUT_TOKENS or pick a default suited to the backend mode
+  let default_text: text = if is_local and include_tools then "4096" else if is_local then "750" else "16384" end
+  let raw: text = unwrap_or(env_get("LEGIBLE_CODER_MAX_OUTPUT_TOKENS"), default_text)
+  max(to_integer(raw), 128)
+end
+
+function env_truthy(name: text): boolean
+  intent: env_get lowercase trim raw compare
+  let raw: text = lowercase(trim(unwrap_or(env_get(name), "")))
+  raw == "1" or raw == "true" or raw == "yes" or raw == "on"
+end
+
+function env_falsey(name: text): boolean
+  intent: env_get lowercase trim raw compare
+  let raw: text = lowercase(trim(unwrap_or(env_get(name), "")))
+  raw == "0" or raw == "false" or raw == "no" or raw == "off"
+end
+
+function is_gemma4_model(model: text): boolean
+  intent: return true when the configured model name looks like a Gemma 4 model
+  let lower: text = lowercase(model)
+  contains_text(lower, "gemma-4") or contains_text(lower, "gemma4")
+end
+
+function resolve_local_native_tools(model: text): boolean
+  intent: enable native local tool calling when forced or when the model is Gemma 4 unless explicitly disabled
+  if env_falsey("LEGIBLE_CODER_LOCAL_TOOLS") then
+    false
+  else if env_truthy("LEGIBLE_CODER_LOCAL_TOOLS") then
+    true
+  else
+    is_gemma4_model(model)
+  end
+end
+
+function print_local_tool_mode(is_local: boolean, include_tools: boolean): nothing
+  intent: print local tool mode when base_url is local
+  if is_local and include_tools then
+    print("  local tool mode: native OpenAI tool schemas")
+  else if is_local then
+    print("  local tool mode: manual TOOL protocol")
+  end
+end
+
 function main(): nothing
   intent: read base_url, api_key, and models, print the banner, then loop reading user messages
   let base_url: text = unwrap_or(env_get("LEGIBLE_CODER_BASE_URL"), "https://api.groq.com/openai/v1")
   let key: text = resolve_api_key(base_url)
   let is_local: boolean = contains_text(base_url, "localhost") or contains_text(base_url, "127.0.0.1")
-  let include_tools: boolean = not is_local
-  let include_dir_tools: boolean = not is_local
   let full_model: text = unwrap_or(env_get("LEGIBLE_CODER_MODEL"), "openai/gpt-oss-120b")
+  let include_tools: boolean = not is_local or resolve_local_native_tools(full_model)
+  let include_dir_tools: boolean = include_tools
   let fast_model: text = if is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "openai/gpt-oss-20b") end
   let expert_model: text = if is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "") end
   let max_tools: integer = resolve_max_tools(is_local)
-  let max_output_tokens: integer = if is_local then 750 else 16384 end
+  let max_output_tokens: integer = resolve_max_output_tokens(is_local, include_tools)
+  let context_budget: integer = resolve_context_budget(is_local)
+  let preserve_recent_messages: integer = resolve_context_keep_messages(is_local)
   print_banner(full_model, base_url)
-  let sys_prompt: text = if is_local then local_system_prompt() else system_prompt(include_tools, include_dir_tools) end
+  print_local_tool_mode(is_local, include_tools)
+  let sys_prompt: text = if is_local and not include_tools then local_system_prompt() else system_prompt(include_tools, include_dir_tools) end
   let sys_msg: a mapping from text to text = {"role": "system", "content": sys_prompt}
   let local_bootstrap_msg: a mapping from text to text = {"role": "system", "content": local_model_context()}
   mutable messages: a list of a mapping from text to text = [sys_msg]
@@ -1120,7 +1358,7 @@ function main(): nothing
       if turn_model == fast_model and text_length(fast_model) > 0 then print("  [fast model: " ++ fast_model ++ "]") end
       set messages = append(messages, {"role": "user", "content": user_input})
       let start: integer = length(messages)
-      set messages = run_inner_loop(messages, start, key, base_url, turn_model, max_tools, include_tools, include_dir_tools, max_output_tokens)
+      set messages = run_inner_loop(messages, start, key, base_url, turn_model, max_tools, include_tools, include_dir_tools, max_output_tokens, context_budget, preserve_recent_messages)
     end
   end
 end

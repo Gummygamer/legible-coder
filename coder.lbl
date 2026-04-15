@@ -551,6 +551,24 @@ function truncate_tool_output(raw: text, max_chars: integer): text
   end
 end
 
+function mask_old_tool_results(msgs: a list of a mapping from text to text, keep_recent: integer): a list of a mapping from text to text
+  intent: replace tool message content with a short marker for older messages to reduce context tokens
+  let total: integer = length(msgs)
+  let mask_before: integer = max(total - keep_recent, 0)
+  mutable result: a list of a mapping from text to text = []
+  mutable i: integer = 0
+  while i < total do
+    let msg: a mapping from text to text = get(msgs, i)
+    if i < mask_before and get(msg, "role") == "tool" then
+      set result = append(result, put(msg, "content", "[tool result removed]"))
+    else
+      set result = append(result, msg)
+    end
+    set i = i + 1
+  end
+  result
+end
+
 function compact_summary_marker(): text
   intent: return compacted session summary marker
   "COMPACTED SESSION SUMMARY:"
@@ -722,8 +740,10 @@ function compact_context_if_needed(msgs: a list of a mapping from text to text, 
 end
 
 function prune_local_messages(msgs: a list of a mapping from text to text): a list of a mapping from text to text
-  intent: compact context with resolve_context_budget and resolve_context_keep_messages
-  compact_context_if_needed(msgs, resolve_context_budget(true), resolve_context_keep_messages(true))
+  intent: mask old tool results then compact context for local mode
+  let keep: integer = resolve_context_keep_messages(true)
+  let masked: a list of a mapping from text to text = mask_old_tool_results(msgs, keep * 2)
+  compact_context_if_needed(masked, resolve_context_budget(true), keep)
 end
 
 function seen_tool_for_path(msgs: a list of a mapping from text to text, tool_name: text, path: text): boolean
@@ -1119,6 +1139,34 @@ function handle_tool_round(msg: a mapping from text to text, msgs: a list of a m
   end
 end
 
+function handle_length_finish(msg: a mapping from text to text, msgs: a list of a mapping from text to text, total_tools: integer, last_batch: text, explore_count: integer, acted: boolean): LoopStep
+  intent: handle a length-truncated response by preserving partial content and requesting continuation
+  let content: text = unwrap_or(get(msg, "content"), "")
+  print("  [warn] response truncated by token limit (finish_reason=length)]")
+  if text_length(content) > 0 then
+    let with_partial: a list of a mapping from text to text = append(msgs, {"role": "assistant", "content": content})
+    LoopStep {
+      messages: append(with_partial, {"role": "user", "content": "Your response was cut off. Please continue from exactly where you stopped."}),
+      count: total_tools,
+      last_batch: last_batch,
+      waiting: true,
+      must_force_text: false,
+      explore_count: explore_count,
+      acted: acted
+    }
+  else
+    LoopStep {
+      messages: append(msgs, {"role": "user", "content": "Context is full. Please answer concisely in plain text without calling any tools."}),
+      count: total_tools,
+      last_batch: last_batch,
+      waiting: true,
+      must_force_text: true,
+      explore_count: explore_count,
+      acted: acted
+    }
+  end
+end
+
 function handle_text_response(msg: a mapping from text to text, msgs: a list of a mapping from text to text): a list of a mapping from text to text
   intent: print content between separators and append it to msgs as an assistant message
   let content: text = unwrap_or(get(msg, "content"), "")
@@ -1141,6 +1189,8 @@ function handle_success_response(resp_body: text, include_tools: boolean, msgs: 
   let finish: text = unwrap_or(get(choice, "finish_reason"), "stop")
   if not include_tools then
     handle_local_text_round(msg, msgs, total_tools, max_tools, last_batch, explore_count, acted)
+  else if finish == "length" then
+    handle_length_finish(msg, msgs, total_tools, last_batch, explore_count, acted)
   else if finish == "tool_calls" or length(unwrap_or(get(msg, "tool_calls"), [])) > 0 then
     handle_tool_round(msg, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted)
   else
@@ -1157,9 +1207,10 @@ function handle_success_response(resp_body: text, include_tools: boolean, msgs: 
 end
 
 function compact_loop_messages(msgs: a list of a mapping from text to text, context_budget: integer, preserve_recent_messages: integer): a list of a mapping from text to text
-  intent: compact loop messages when estimated tokens exceed the configured context budget
+  intent: mask old tool results then compact loop messages when tokens exceed the context budget
   let tokens_before: integer = estimate_messages_tokens(msgs)
-  let compacted: a list of a mapping from text to text = compact_context_if_needed(msgs, context_budget, preserve_recent_messages)
+  let masked: a list of a mapping from text to text = mask_old_tool_results(msgs, preserve_recent_messages * 2)
+  let compacted: a list of a mapping from text to text = compact_context_if_needed(masked, context_budget, preserve_recent_messages)
   let tokens_after: integer = estimate_messages_tokens(compacted)
   if tokens_after < tokens_before then
     print("  [context] compacted transcript " ++ to_text(tokens_before) ++ " -> " ++ to_text(tokens_after) ++ " estimated tokens")
@@ -1263,7 +1314,7 @@ end
 
 function resolve_context_budget(is_local: boolean): integer
   intent: read LEGIBLE_CODER_CONTEXT_TOKENS or use a local or remote default budget
-  let default_text: text = if is_local then "16000" else "90000" end
+  let default_text: text = if is_local then "6000" else "90000" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_TOKENS"), default_text)
   max(to_integer(raw), 1000)
 end

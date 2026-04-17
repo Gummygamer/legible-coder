@@ -53,11 +53,17 @@ function search_tools(): a list of a mapping from text to text
   [shell_tool, grep_tool]
 end
 
-function tool_definitions(include_dir_tools: boolean): a list of a mapping from text to text
-  intent: combine file tools and search tools into one list
+function screenshot_tool(): a mapping from text to text
+  intent: build the take_screenshot tool schema for visual evaluation of GUI output
+  make_tool("take_screenshot", "Take a screenshot of the screen after running GUI code. Use this after launching a GUI program in the background (e.g. shell_exec with &) to visually evaluate the result. Optional delay parameter (default 1 second) lets the window appear first.", ["delay"], ["Seconds to wait before capturing (default: 1)"], [])
+end
+
+function tool_definitions(include_dir_tools: boolean, include_vision: boolean): a list of a mapping from text to text
+  intent: combine file, search, and optionally vision tools into one list
   let ft: a list of a mapping from text to text = file_tools(include_dir_tools)
   let st: a list of a mapping from text to text = search_tools()
-  reduce(st, ft, fn(acc: a list of a mapping from text to text, t: a mapping from text to text): a list of a mapping from text to text => append(acc, t))
+  let combined: a list of a mapping from text to text = reduce(st, ft, fn(acc: a list of a mapping from text to text, t: a mapping from text to text): a list of a mapping from text to text => append(acc, t))
+  if include_vision then append(combined, screenshot_tool()) else combined end
 end
 
 -- ─── Tool validation ──────────────────────────────────────────────────────────
@@ -77,14 +83,14 @@ function is_known_tool(name: text): boolean
   intent: compare the cleaned name to the supported tool names
   let n: text = clean_tool_name(name)
   n == "read_file" or n == "read_file_lines" or n == "write_file" or n == "shell_exec" or
-  n == "list_dir" or n == "read_dir_recursive" or n == "grep"
+  n == "list_dir" or n == "read_dir_recursive" or n == "grep" or n == "take_screenshot"
 end
 
 function is_local_known_tool(name: text): boolean
   intent: compare the cleaned name to the local manual-tool names that exclude full-file reads
   let n: text = clean_tool_name(name)
   n == "read_file_lines" or n == "write_file" or n == "shell_exec" or
-  n == "list_dir" or n == "read_dir_recursive" or n == "grep"
+  n == "list_dir" or n == "read_dir_recursive" or n == "grep" or n == "take_screenshot"
 end
 
 function describe_tool_call(name: text, arguments: text): text
@@ -104,6 +110,8 @@ function describe_tool_call(name: text, arguments: text): text
     let pat: text = unwrap_or(get(args, "pattern"), "")
     let path: text = unwrap_or(get(args, "path"), ".")
     name ++ "  /" ++ pat ++ "/  " ++ path
+  else if name == "take_screenshot" then
+    name
   else
     name
   end
@@ -172,6 +180,28 @@ function exec_read_file_lines(args: a mapping from text to text): text
   end
 end
 
+function exec_take_screenshot(args: a mapping from text to text): text
+  intent: take a screenshot using available system tools and return the saved file path
+  let path: text = "/tmp/legible_coder_screenshot.png"
+  let delay: text = unwrap_or(get(args, "delay"), "1")
+  let cmd: text = "sleep " ++ delay ++ " && (DISPLAY=${DISPLAY:-:0} scrot -z " ++ path ++ " 2>/dev/null || DISPLAY=${DISPLAY:-:0} import -window root " ++ path ++ " 2>/dev/null || DISPLAY=${DISPLAY:-:0} gnome-screenshot -f " ++ path ++ " 2>/dev/null || WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0} grim " ++ path ++ " 2>/dev/null)"
+  let result: a mapping from text to text = shell_exec(cmd)
+  if file_exists(path) then path else "Error: screenshot failed (exit " ++ to_text(get(result, "exit_code")) ++ "). Install scrot, imagemagick, grim, or gnome-screenshot." end
+end
+
+function build_vision_eval_message(screenshot_path: text): a mapping from text to text
+  intent: read the screenshot as base64 and build a multimodal user message for visual evaluation
+  let b64: text = trim(get(shell_exec("base64 -w 0 < " ++ screenshot_path), "stdout"))
+  let data_url: text = "data:image/png;base64," ++ b64
+  {
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "I ran the GUI code and took this screenshot. Evaluate: does it look correct visually? Note any layout issues, missing elements, or improvements needed."},
+      {"type": "image_url", "image_url": {"url": data_url}}
+    ]
+  }
+end
+
 function execute_tool(name: text, arguments: text): text
   intent: parse arguments and dispatch to the supported tool implementations
   let args: a mapping from text to text = json_parse(arguments)
@@ -191,6 +221,8 @@ function execute_tool(name: text, arguments: text): text
     get(shell_exec("find " ++ get(args, "path") ++ " -type f | sort 2>&1 | head -200"), "stdout")
   else if name == "grep" then
     exec_grep(args)
+  else if name == "take_screenshot" then
+    exec_take_screenshot(args)
   else
     "Error: unknown tool: " ++ name
   end
@@ -257,7 +289,11 @@ function prompt_builtins_and_example(): text
   "  read_file(path)  write_file(path, content)  file_exists(path)\n" ++
   "  shell_exec(cmd)  env_get(name)  get_cwd()  list_dir(path)  is_dir(path)\n" ++
   "  json_parse(text)  json_encode(value)  json_valid(text)\n" ++
-  "  http_client_get(url, headers)  http_client_post(url, headers, body)\n\n" ++
+  "  http_client_get(url, headers)  http_client_post(url, headers, body)\n" ++
+  "  sdl_init(title,w,h)  sdl_clear(r,g,b)  sdl_fill_rect(x,y,w,h,r,g,b)  sdl_present()\n" ++
+  "  sdl_draw_text(text,x,y,r,g,b)  sdl_load_font(path,size)  sdl_poll_events()\n" ++
+  "  sdl_is_key_pressed(key)  sdl_delay(ms)  sdl_get_ticks()  sdl_quit()\n" ++
+  "  sdl_screenshot(path)  -- saves canvas as PNG; call before sdl_quit for visual evaluation\n\n" ++
   "COMPLETE EXAMPLE:\n" ++
   "  record Creature\n" ++
   "    name: text\n" ++
@@ -310,12 +346,16 @@ function prompt_rules(): text
   "- You have a limited tool budget per turn; gather what you need efficiently and then provide your answer"
 end
 
-function tool_names_text(include_tools: boolean, include_dir_tools: boolean): text
-  intent: return none or the read_file write_file shell_exec list_dir read_dir_recursive grep tool names
+function tool_names_text(include_tools: boolean, include_dir_tools: boolean, include_vision: boolean): text
+  intent: return none or the available tool names based on include flags
   if not include_tools then
     "none"
+  else if include_dir_tools and include_vision then
+    "read_file, read_file_lines, write_file, shell_exec, list_dir, read_dir_recursive, grep, take_screenshot"
   else if include_dir_tools then
     "read_file, read_file_lines, write_file, shell_exec, list_dir, read_dir_recursive, grep"
+  else if include_vision then
+    "read_file, read_file_lines, write_file, shell_exec, grep, take_screenshot"
   else
     "read_file, read_file_lines, write_file, shell_exec, grep"
   end
@@ -373,14 +413,15 @@ function local_system_prompt(): text
   "- use ASCII in code\n"
 end
 
-function system_prompt(include_tools: boolean, include_dir_tools: boolean): text
+function system_prompt(include_tools: boolean, include_dir_tools: boolean, include_vision: boolean): text
   intent: compose the header, syntax reference, builtins, example, and rules into the full system prompt
   let cwd: text = get_cwd()
   "You are legible-coder, an interactive CLI coding assistant. " ++
   "You write code in the Legible programming language and perform tasks by running Legible scripts.\n\n" ++
   "Current working directory: " ++ cwd ++ "\n\n" ++
-  "TOOLS: " ++ tool_names_text(include_tools, include_dir_tools) ++ ".\n" ++
+  "TOOLS: " ++ tool_names_text(include_tools, include_dir_tools, include_vision) ++ ".\n" ++
   if not include_tools then "No runtime tools are available in this session. Rely on the preloaded workspace snapshot and answer in plain text.\n\n" else if include_dir_tools then "Use read_dir_recursive to understand project structure in ONE call instead of many list_dir calls.\n\n" else "For local models, rely on the preloaded workspace snapshot before making tool calls.\n\n" end ++
+  if include_vision then "VISUAL EVALUATION: For GUI tasks, run the program in background with shell_exec (append & to the command), then call take_screenshot to capture the result. You will receive the screenshot as an image for evaluation.\n\n" else "" end ++
   prompt_syntax_ref() ++
   prompt_builtins_and_example() ++
   prompt_rules()
@@ -413,10 +454,10 @@ function local_model_context(): text
   "Read specific files with tools before proposing changes."
 end
 
-function build_request(model: text, messages: a list of a mapping from text to text, force_text: boolean, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer): a mapping from text to text
+function build_request(model: text, messages: a list of a mapping from text to text, force_text: boolean, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, include_vision: boolean): a mapping from text to text
   intent: put model, messages, tools, tool_choice, and token limits into the chat completions request mapping
   let tc: text = if force_text or not include_tools then "none" else "auto" end
-  let tools: a list of a mapping from text to text = if include_tools then tool_definitions(include_dir_tools) else [] end
+  let tools: a list of a mapping from text to text = if include_tools then tool_definitions(include_dir_tools, include_vision) else [] end
   {
     "model": model,
     "messages": messages,
@@ -483,12 +524,13 @@ record ManualToolRequest
   final_text: text
 end
 
-function run_tool_batch(messages: a list of a mapping from text to text, valid_calls: a list of a mapping from text to text, tool_count: integer, max_tools: integer): BatchResult
-  intent: append the assistant tool_calls message, execute each call, and return updated messages and count
+function run_tool_batch(messages: a list of a mapping from text to text, valid_calls: a list of a mapping from text to text, tool_count: integer, max_tools: integer, include_vision: boolean): BatchResult
+  intent: execute tool calls, inject vision evaluation message if screenshot was taken, return updated messages
   print("  batch: " ++ to_text(length(valid_calls)) ++ " calls")
   let asst_msg: a mapping from text to text = {"role": "assistant", "content": none, "tool_calls": valid_calls}
   mutable msgs: a list of a mapping from text to text = append(messages, asst_msg)
   mutable n: integer = tool_count
+  mutable screenshot_path: text = ""
   for tc in valid_calls do
     let fn_info: a mapping from text to text = get(tc, "function")
     let tc_id: text = unwrap_or(get(tc, "id"), "")
@@ -497,8 +539,15 @@ function run_tool_batch(messages: a list of a mapping from text to text, valid_c
     set n = n + 1
     print("  [" ++ to_text(n) ++ "] " ++ describe_tool_call(fn_name, fn_args))
     let raw: text = execute_tool(fn_name, fn_args)
+    if fn_name == "take_screenshot" and include_vision and file_exists(trim(raw)) then
+      set screenshot_path = trim(raw)
+    end
     let result: text = if text_length(raw) > 8000 then substring(raw, 0, 8000) ++ "\n... (truncated)" else raw end
     set msgs = append(msgs, {"role": "tool", "tool_call_id": tc_id, "content": result})
+  end
+  if include_vision and text_length(screenshot_path) > 0 then
+    print("  [vision] attaching screenshot for model evaluation]")
+    set msgs = append(msgs, build_vision_eval_message(screenshot_path))
   end
   let hit_cap: boolean = n >= max_tools
   if hit_cap then print("  [warn] reached " ++ to_text(max_tools) ++ " tool calls this turn, stopping") end
@@ -1110,7 +1159,7 @@ function prompt_loop_step(msgs: a list of a mapping from text to text, total_too
   }
 end
 
-function handle_tool_round(msg: a mapping from text to text, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, round: integer, force_text: boolean, explore_count: integer, acted: boolean): LoopStep
+function handle_tool_round(msg: a mapping from text to text, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, round: integer, force_text: boolean, explore_count: integer, acted: boolean, include_vision: boolean): LoopStep
   intent: process one tool-calling response and decide whether the loop should continue
   if force_text then
     print("  [round " ++ to_text(round) ++ " - forcing text response]")
@@ -1119,7 +1168,7 @@ function handle_tool_round(msg: a mapping from text to text, msgs: a list of a m
     let valid_calls: a list of a mapping from text to text = dedupe_tool_calls(filter_valid_calls(unwrap_or(get(msg, "tool_calls"), [])))
     let current_batch: text = batch_fingerprint(valid_calls)
     if length(valid_calls) > 0 and current_batch != last_batch then
-      let batch: BatchResult = run_tool_batch(msgs, valid_calls, total_tools, max_tools)
+      let batch: BatchResult = run_tool_batch(msgs, valid_calls, total_tools, max_tools, include_vision)
       LoopStep {
         messages: batch.messages,
         count: batch.count,
@@ -1182,7 +1231,7 @@ function handle_text_response(msg: a mapping from text to text, msgs: a list of 
   end
 end
 
-function handle_success_response(resp_body: text, include_tools: boolean, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, round: integer, force_text: boolean, explore_count: integer, acted: boolean): LoopStep
+function handle_success_response(resp_body: text, include_tools: boolean, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, round: integer, force_text: boolean, explore_count: integer, acted: boolean, include_vision: boolean): LoopStep
   intent: process a successful API response and return the next loop state
   let choice: a mapping from text to text = get(get(json_parse(resp_body), "choices"), 0)
   let msg: a mapping from text to text = get(choice, "message")
@@ -1192,7 +1241,7 @@ function handle_success_response(resp_body: text, include_tools: boolean, msgs: 
   else if finish == "length" then
     handle_length_finish(msg, msgs, total_tools, last_batch, explore_count, acted)
   else if finish == "tool_calls" or length(unwrap_or(get(msg, "tool_calls"), [])) > 0 then
-    handle_tool_round(msg, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted)
+    handle_tool_round(msg, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted, include_vision)
   else
     LoopStep {
       messages: handle_text_response(msg, msgs),
@@ -1218,7 +1267,7 @@ function compact_loop_messages(msgs: a list of a mapping from text to text, cont
   compacted
 end
 
-function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer): a list of a mapping from text to text
+function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer, include_vision: boolean): a list of a mapping from text to text
   intent: call the API in a loop executing tool calls until text response or round limit
   mutable msgs: a list of a mapping from text to text = init_messages
   mutable waiting: boolean = true
@@ -1234,7 +1283,7 @@ function run_inner_loop(init_messages: a list of a mapping from text to text, me
     let force_text: boolean = if include_tools then must_force_text or round > max_tools / 2 else false end
     set must_force_text = false
     set msgs = compact_loop_messages(msgs, context_budget, preserve_recent_messages)
-    let resp: a mapping from text to text = call_api(key, base_url, build_request(model, msgs, force_text, include_tools, include_dir_tools, max_output_tokens))
+    let resp: a mapping from text to text = call_api(key, base_url, build_request(model, msgs, force_text, include_tools, include_dir_tools, max_output_tokens, include_vision))
     let status: text = get(resp, "status")
     print("  [" ++ to_text(round) ++ "] status=" ++ status)
     if status != "200" then
@@ -1242,7 +1291,7 @@ function run_inner_loop(init_messages: a list of a mapping from text to text, me
       set msgs = take(msgs, messages_start)
       set waiting = false
     else
-      let step: LoopStep = handle_success_response(get(resp, "body"), include_tools, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted)
+      let step: LoopStep = handle_success_response(get(resp, "body"), include_tools, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted, include_vision)
       set msgs = step.messages
       set total_tools = step.count
       set last_batch = step.last_batch
@@ -1351,6 +1400,21 @@ function is_gemma4_model(model: text): boolean
   contains_text(lower, "gemma-4") or contains_text(lower, "gemma4")
 end
 
+function resolve_include_vision(model: text): boolean
+  intent: return true when vision is enabled via env or the model is known to support multimodal input
+  if env_falsey("LEGIBLE_CODER_VISION") then
+    false
+  else if env_truthy("LEGIBLE_CODER_VISION") then
+    true
+  else
+    let lower: text = lowercase(model)
+    contains_text(lower, "gemma-4") or contains_text(lower, "gemma4") or
+    contains_text(lower, "llama-4") or contains_text(lower, "vision") or
+    contains_text(lower, "llava") or contains_text(lower, "claude-3") or
+    contains_text(lower, "claude-4") or contains_text(lower, "gpt-4")
+  end
+end
+
 function resolve_local_native_tools(model: text): boolean
   intent: enable native local tool calling when forced or when the model is Gemma 4 unless explicitly disabled
   if env_falsey("LEGIBLE_CODER_LOCAL_TOOLS") then
@@ -1385,9 +1449,10 @@ function main(): nothing
   let max_output_tokens: integer = resolve_max_output_tokens(is_local, include_tools)
   let context_budget: integer = resolve_context_budget(is_local)
   let preserve_recent_messages: integer = resolve_context_keep_messages(is_local)
+  let include_vision: boolean = include_tools and resolve_include_vision(full_model)
   print_banner(full_model, base_url)
   print_local_tool_mode(is_local, include_tools)
-  let sys_prompt: text = if is_local and not include_tools then local_system_prompt() else system_prompt(include_tools, include_dir_tools) end
+  let sys_prompt: text = if is_local and not include_tools then local_system_prompt() else system_prompt(include_tools, include_dir_tools, include_vision) end
   let sys_msg: a mapping from text to text = {"role": "system", "content": sys_prompt}
   let local_bootstrap_msg: a mapping from text to text = {"role": "system", "content": local_model_context()}
   mutable messages: a list of a mapping from text to text = [sys_msg]
@@ -1409,7 +1474,7 @@ function main(): nothing
       if turn_model == fast_model and text_length(fast_model) > 0 then print("  [fast model: " ++ fast_model ++ "]") end
       set messages = append(messages, {"role": "user", "content": user_input})
       let start: integer = length(messages)
-      set messages = run_inner_loop(messages, start, key, base_url, turn_model, max_tools, include_tools, include_dir_tools, max_output_tokens, context_budget, preserve_recent_messages)
+      set messages = run_inner_loop(messages, start, key, base_url, turn_model, max_tools, include_tools, include_dir_tools, max_output_tokens, context_budget, preserve_recent_messages, include_vision)
     end
   end
 end

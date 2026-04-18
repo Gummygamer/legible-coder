@@ -55,7 +55,7 @@ end
 
 function screenshot_tool(): a mapping from text to text
   intent: build the take_screenshot tool schema for visual evaluation of GUI output
-  make_tool("take_screenshot", "Take a screenshot of the screen after running GUI code. Use this after launching a GUI program in the background (e.g. shell_exec with &) to visually evaluate the result. Optional delay parameter (default 1 second) lets the window appear first.", ["delay"], ["Seconds to wait before capturing (default: 1)"], [])
+  make_tool("take_screenshot", "Launch a GUI program and capture a screenshot for visual evaluation. Pass the program command in 'command' — it will be started in the background, the screen captured after 'delay' seconds, then the process killed. Do NOT use shell_exec to launch GUI apps separately; use this tool instead so the capture happens while the window is open.", ["command", "delay"], ["The shell command to launch the GUI app (will be run in background)", "Seconds to wait for the window to appear before capturing (default: 2)"], [])
 end
 
 function tool_definitions(include_dir_tools: boolean, include_vision: boolean): a list of a mapping from text to text
@@ -181,10 +181,16 @@ function exec_read_file_lines(args: a mapping from text to text): text
 end
 
 function exec_take_screenshot(args: a mapping from text to text): text
-  intent: take a screenshot using available system tools and return the saved file path
+  intent: launch optional GUI command in background then capture a screenshot and return the path
   let path: text = "/tmp/legible_coder_screenshot.png"
-  let delay: text = unwrap_or(get(args, "delay"), "1")
-  let cmd: text = "sleep " ++ delay ++ " && (DISPLAY=${DISPLAY:-:0} scrot -z " ++ path ++ " 2>/dev/null || DISPLAY=${DISPLAY:-:0} import -window root " ++ path ++ " 2>/dev/null || DISPLAY=${DISPLAY:-:0} gnome-screenshot -f " ++ path ++ " 2>/dev/null || WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0} grim " ++ path ++ " 2>/dev/null)"
+  let delay: text = unwrap_or(get(args, "delay"), "2")
+  let capture: text = "(scrot -z " ++ path ++ " 2>/dev/null || import -window root " ++ path ++ " 2>/dev/null || gnome-screenshot -f " ++ path ++ " 2>/dev/null || grim " ++ path ++ " 2>/dev/null)"
+  let command: text = unwrap_or(get(args, "command"), "")
+  let cmd: text = if text_length(command) > 0 then
+    command ++ " & APP_PID=$!; sleep " ++ delay ++ " && " ++ capture ++ "; kill $APP_PID 2>/dev/null; wait $APP_PID 2>/dev/null"
+  else
+    "sleep " ++ delay ++ " && " ++ capture
+  end
   let result: a mapping from text to text = shell_exec(cmd)
   if file_exists(path) then path else "Error: screenshot failed (exit " ++ to_text(get(result, "exit_code")) ++ "). Install scrot, imagemagick, grim, or gnome-screenshot." end
 end
@@ -273,8 +279,8 @@ function prompt_syntax_ref(): text
   "  module_name.foo()         -- call an exported function\n\n"
 end
 
-function prompt_builtins_and_example(): text
-  intent: return the built-ins list and a complete working Legible example
+function prompt_builtins(): text
+  intent: return the built-ins list section
   "BUILT-INS:\n" ++
   "  print(v)  read_line()  to_text(v)  to_integer(v)  to_decimal(v)\n" ++
   "  length(list)  append(list, item)  filter(list, fn)  map(list, fn)  reduce(list, init, fn)\n" ++
@@ -293,7 +299,11 @@ function prompt_builtins_and_example(): text
   "  sdl_init(title,w,h)  sdl_clear(r,g,b)  sdl_fill_rect(x,y,w,h,r,g,b)  sdl_present()\n" ++
   "  sdl_draw_text(text,x,y,r,g,b)  sdl_load_font(path,size)  sdl_poll_events()\n" ++
   "  sdl_is_key_pressed(key)  sdl_delay(ms)  sdl_get_ticks()  sdl_quit()\n" ++
-  "  sdl_screenshot(path)  -- saves canvas as PNG; call before sdl_quit for visual evaluation\n\n" ++
+  "  sdl_screenshot(path)  -- saves canvas as PNG; call before sdl_quit for visual evaluation\n\n"
+end
+
+function prompt_example(): text
+  intent: return a complete working Legible example program
   "COMPLETE EXAMPLE:\n" ++
   "  record Creature\n" ++
   "    name: text\n" ++
@@ -421,9 +431,10 @@ function system_prompt(include_tools: boolean, include_dir_tools: boolean, inclu
   "Current working directory: " ++ cwd ++ "\n\n" ++
   "TOOLS: " ++ tool_names_text(include_tools, include_dir_tools, include_vision) ++ ".\n" ++
   if not include_tools then "No runtime tools are available in this session. Rely on the preloaded workspace snapshot and answer in plain text.\n\n" else if include_dir_tools then "Use read_dir_recursive to understand project structure in ONE call instead of many list_dir calls.\n\n" else "For local models, rely on the preloaded workspace snapshot before making tool calls.\n\n" end ++
-  if include_vision then "VISUAL EVALUATION: For GUI tasks, run the program in background with shell_exec (append & to the command), then call take_screenshot to capture the result. You will receive the screenshot as an image for evaluation.\n\n" else "" end ++
+  if include_vision then "VISUAL EVALUATION: For GUI tasks, use take_screenshot with the 'command' parameter set to the launch command (e.g. 'legible run gui.lbl'). The tool starts the app in the background, waits for 'delay' seconds (default 2), captures the screen, then kills the app. Do NOT run GUI programs via shell_exec — they block until closed, making a screenshot impossible.\n\n" else "" end ++
   prompt_syntax_ref() ++
-  prompt_builtins_and_example() ++
+  prompt_builtins() ++
+  prompt_example() ++
   prompt_rules()
 end
 
@@ -625,7 +636,7 @@ end
 
 function message_text(msg: a mapping from text to text): text
   intent: return content tool_calls text
-  let content: text = unwrap_or(get(msg, "content"), "")
+  let content: text = to_text(unwrap_or(get(msg, "content"), ""))
   let calls: text = if has_key(msg, "tool_calls") then to_text(get(msg, "tool_calls")) else "" end
   trim(content ++ "\n" ++ calls)
 end

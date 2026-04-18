@@ -57,7 +57,7 @@ end
 
 function screenshot_tool(): a mapping from text to text
   intent: build the take_screenshot tool schema for visual evaluation of GUI output
-  make_tool("take_screenshot", "Launch a GUI program and capture a screenshot for visual evaluation. Pass the program command in 'command' — it will be started in the background, the screen captured after 'delay' seconds, then the process killed. Do NOT use shell_exec to launch GUI apps separately; use this tool instead so the capture happens while the window is open.", ["command", "delay"], ["The shell command to launch the GUI app (will be run in background)", "Seconds to wait for the window to appear before capturing (default: 2)"], [])
+  make_tool("take_screenshot", "Launch a GUI program and capture a screenshot for visual evaluation. Pass the program command in 'command' — it will be started in the background, the screen captured after 'delay' seconds, then the process killed. If the app exits before the delay elapses, the tool returns the captured stdout/stderr so you can diagnose the crash. Do NOT use shell_exec to launch GUI apps separately; use this tool instead so the capture happens while the window is open. Increase 'delay' (e.g. 5) if the window is slow to render.", ["command", "delay"], ["The shell command to launch the GUI app (will be run in background)", "Seconds to wait for the window to appear before capturing (default: 3)"], [])
 end
 
 function tool_definitions(include_dir_tools: boolean, include_vision: boolean): a list of a mapping from text to text
@@ -182,19 +182,46 @@ function exec_read_file_lines(args: a mapping from text to text): text
   end
 end
 
+function screenshot_capture_cmd(path: text): text
+  intent: shell chain that tries grim then X11 screenshot tools in order, overwriting prior files
+  "(grim " ++ path ++ " 2>/dev/null || scrot -o " ++ path ++ " 2>/dev/null || import -window root " ++ path ++ " 2>/dev/null || gnome-screenshot -f " ++ path ++ " 2>/dev/null)"
+end
+
+function screenshot_launch_script(command: text, path: text, log_path: text, delay: text): text
+  intent: launch GUI in background, verify it survived the delay, capture screen, then kill it
+  "rm -f " ++ path ++ " " ++ log_path ++ "; " ++
+  "(" ++ command ++ ") > " ++ log_path ++ " 2>&1 & APP_PID=$!; " ++
+  "sleep " ++ delay ++ "; " ++
+  "if kill -0 $APP_PID 2>/dev/null; then " ++ screenshot_capture_cmd(path) ++ "; " ++
+  "kill $APP_PID 2>/dev/null; wait $APP_PID 2>/dev/null; " ++
+  "else echo APP_EXITED_EARLY >&2; fi"
+end
+
+function screenshot_result(path: text, log_path: text, result: a mapping from text to text): text
+  intent: classify screenshot outcome and return path or an error message including captured app log
+  let stderr: text = unwrap_or(get(result, "stderr"), "")
+  if contains_text(stderr, "APP_EXITED_EARLY") then
+    let log: text = if file_exists(log_path) then read_file(log_path) else "(no log)" end
+    "Error: GUI app exited before screenshot could be taken. App output:\n" ++ log
+  else if file_exists(path) then
+    path
+  else
+    "Error: screenshot failed (exit " ++ to_text(get(result, "exit_code")) ++ "). Install grim, scrot, imagemagick, or gnome-screenshot."
+  end
+end
+
 function exec_take_screenshot(args: a mapping from text to text): text
   intent: launch optional GUI command in background then capture a screenshot and return the path
   let path: text = "/tmp/legible_coder_screenshot.png"
-  let delay: text = unwrap_or(get(args, "delay"), "2")
-  let capture: text = "(scrot -z " ++ path ++ " 2>/dev/null || import -window root " ++ path ++ " 2>/dev/null || gnome-screenshot -f " ++ path ++ " 2>/dev/null || grim " ++ path ++ " 2>/dev/null)"
+  let log_path: text = "/tmp/legible_coder_app.log"
+  let delay: text = unwrap_or(get(args, "delay"), "3")
   let command: text = unwrap_or(get(args, "command"), "")
   let cmd: text = if text_length(command) > 0 then
-    command ++ " & APP_PID=$!; sleep " ++ delay ++ " && " ++ capture ++ "; kill $APP_PID 2>/dev/null; wait $APP_PID 2>/dev/null"
+    screenshot_launch_script(command, path, log_path, delay)
   else
-    "sleep " ++ delay ++ " && " ++ capture
+    "rm -f " ++ path ++ "; sleep " ++ delay ++ " && " ++ screenshot_capture_cmd(path)
   end
-  let result: a mapping from text to text = shell_exec(cmd)
-  if file_exists(path) then path else "Error: screenshot failed (exit " ++ to_text(get(result, "exit_code")) ++ "). Install scrot, imagemagick, grim, or gnome-screenshot." end
+  screenshot_result(path, log_path, shell_exec(cmd))
 end
 
 function build_vision_eval_message(screenshot_path: text): a mapping from text to text

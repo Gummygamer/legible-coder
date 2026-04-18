@@ -1,6 +1,8 @@
 -- legible-coder: an interactive CLI coding assistant for the Legible language
--- Powered by openai/gpt-oss-120b via the Groq API
--- Model can be overridden with the LEGIBLE_CODER_MODEL environment variable
+-- Defaults to Gemma 4 via a local LM Studio endpoint (http://localhost:1234/v1)
+-- Override with LEGIBLE_CODER_MODEL and LEGIBLE_CODER_BASE_URL env vars
+-- For Groq: set LEGIBLE_CODER_BASE_URL=https://api.groq.com/openai/v1 and LEGIBLE_CODER_MODEL=openai/gpt-oss-120b
+-- Default model: google/gemma-4-26b-a4b
 
 -- ─── Tool schema helpers ──────────────────────────────────────────────────────
 
@@ -634,9 +636,14 @@ function compact_summary_marker(): text
   "COMPACTED SESSION SUMMARY:"
 end
 
+function msg_content_text(msg: a mapping from text to text): text
+  intent: safely extract msg content as text even when the content is a multimodal list
+  to_text(unwrap_or(get(msg, "content"), ""))
+end
+
 function message_text(msg: a mapping from text to text): text
   intent: return content tool_calls text
-  let content: text = to_text(unwrap_or(get(msg, "content"), ""))
+  let content: text = msg_content_text(msg)
   let calls: text = if has_key(msg, "tool_calls") then to_text(get(msg, "tool_calls")) else "" end
   trim(content ++ "\n" ++ calls)
 end
@@ -657,7 +664,7 @@ end
 
 function is_compact_summary_message(msg: a mapping from text to text): boolean
   intent: return true when msg is a synthetic compacted context summary
-  get(msg, "role") == "system" and starts_with(unwrap_or(get(msg, "content"), ""), compact_summary_marker())
+  get(msg, "role") == "system" and starts_with(msg_content_text(msg), compact_summary_marker())
 end
 
 function leading_system_count(msgs: a list of a mapping from text to text): integer
@@ -808,13 +815,13 @@ end
 
 function seen_tool_for_path(msgs: a list of a mapping from text to text, tool_name: text, path: text): boolean
   intent: return true when prior local messages already contain a tool result line for tool_name and path
-  is_some(find(msgs, fn(msg: a mapping from text to text): boolean => contains_text(unwrap_or(get(msg, "content"), ""), "Tool result for " ++ tool_name) and contains_text(unwrap_or(get(msg, "content"), ""), "\"path\":\"" ++ path ++ "\"")))
+  is_some(find(msgs, fn(msg: a mapping from text to text): boolean => contains_text(msg_content_text(msg), "Tool result for " ++ tool_name) and contains_text(msg_content_text(msg), "\"path\":\"" ++ path ++ "\"")))
 end
 
 function seen_manual_tool_request(msgs: a list of a mapping from text to text, name: text, arguments: text): boolean
   intent: return true when prior local messages already contain the same tool name and exact arguments
   let marker: text = "Tool result for " ++ to_text(name) ++ " " ++ to_text(arguments) ++ ":"
-  is_some(find(msgs, fn(msg: a mapping from text to text): boolean => contains_text(unwrap_or(get(msg, "content"), ""), marker)))
+  is_some(find(msgs, fn(msg: a mapping from text to text): boolean => contains_text(msg_content_text(msg), marker)))
 end
 
 function json_escape_text(content: text): text
@@ -1448,10 +1455,10 @@ end
 
 function main(): nothing
   intent: read base_url, api_key, and models, print the banner, then loop reading user messages
-  let base_url: text = unwrap_or(env_get("LEGIBLE_CODER_BASE_URL"), "https://api.groq.com/openai/v1")
+  let base_url: text = unwrap_or(env_get("LEGIBLE_CODER_BASE_URL"), "http://localhost:1234/v1")
   let key: text = resolve_api_key(base_url)
   let is_local: boolean = contains_text(base_url, "localhost") or contains_text(base_url, "127.0.0.1")
-  let full_model: text = unwrap_or(env_get("LEGIBLE_CODER_MODEL"), "openai/gpt-oss-120b")
+  let full_model: text = unwrap_or(env_get("LEGIBLE_CODER_MODEL"), "google/gemma-4-26b-a4b")
   let include_tools: boolean = not is_local or resolve_local_native_tools(full_model)
   let include_dir_tools: boolean = include_tools
   let fast_model: text = if is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "openai/gpt-oss-20b") end

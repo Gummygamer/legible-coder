@@ -631,6 +631,25 @@ function mask_old_tool_results(msgs: a list of a mapping from text to text, keep
   result
 end
 
+function strip_old_vision_images(msgs: a list of a mapping from text to text, keep_recent: integer): a list of a mapping from text to text
+  intent: replace base64 image data in old vision messages with a compact text marker to free context tokens
+  let total: integer = length(msgs)
+  let mask_before: integer = max(total - keep_recent, 0)
+  mutable result: a list of a mapping from text to text = []
+  mutable i: integer = 0
+  while i < total do
+    let msg: a mapping from text to text = get(msgs, i)
+    let is_vision: boolean = get(msg, "role") == "user" and contains_text(msg_content_text(msg), "image_url")
+    if i < mask_before and is_vision then
+      set result = append(result, put(msg, "content", "[screenshot evaluated — image removed from context]"))
+    else
+      set result = append(result, msg)
+    end
+    set i = i + 1
+  end
+  result
+end
+
 function compact_summary_marker(): text
   intent: return compacted session summary marker
   "COMPACTED SESSION SUMMARY:"
@@ -807,9 +826,10 @@ function compact_context_if_needed(msgs: a list of a mapping from text to text, 
 end
 
 function prune_local_messages(msgs: a list of a mapping from text to text): a list of a mapping from text to text
-  intent: mask old tool results then compact context for local mode
+  intent: strip old vision images, mask old tool results, then compact context for local mode
   let keep: integer = resolve_context_keep_messages(true)
-  let masked: a list of a mapping from text to text = mask_old_tool_results(msgs, keep * 2)
+  let stripped: a list of a mapping from text to text = strip_old_vision_images(msgs, 2)
+  let masked: a list of a mapping from text to text = mask_old_tool_results(stripped, keep * 2)
   compact_context_if_needed(masked, resolve_context_budget(true), keep)
 end
 
@@ -1274,9 +1294,10 @@ function handle_success_response(resp_body: text, include_tools: boolean, msgs: 
 end
 
 function compact_loop_messages(msgs: a list of a mapping from text to text, context_budget: integer, preserve_recent_messages: integer): a list of a mapping from text to text
-  intent: mask old tool results then compact loop messages when tokens exceed the context budget
+  intent: mask old tool results, strip old vision images, then compact when tokens exceed the context budget
   let tokens_before: integer = estimate_messages_tokens(msgs)
-  let masked: a list of a mapping from text to text = mask_old_tool_results(msgs, preserve_recent_messages * 2)
+  let stripped: a list of a mapping from text to text = strip_old_vision_images(msgs, 2)
+  let masked: a list of a mapping from text to text = mask_old_tool_results(stripped, preserve_recent_messages * 2)
   let compacted: a list of a mapping from text to text = compact_context_if_needed(masked, context_budget, preserve_recent_messages)
   let tokens_after: integer = estimate_messages_tokens(compacted)
   if tokens_after < tokens_before then

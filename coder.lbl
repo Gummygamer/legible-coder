@@ -470,7 +470,8 @@ end
 
 function extract_error_message(body: text): text
   intent: extract an API error message from a JSON body or fall back to the raw body text
-  if json_valid(body) then
+  let trimmed: text = trim(body)
+  if json_valid(body) and starts_with(trimmed, "{") then
     let parsed: a mapping from text to text = json_parse(body)
     if has_key(parsed, "error") then
       to_text(get(parsed, "error"))

@@ -1,8 +1,7 @@
 -- legible-coder: an interactive CLI coding assistant for the Legible language
--- Defaults to Gemma 4 via a local LM Studio endpoint (http://localhost:1234/v1)
+-- Default backend: Gemini API (GEMINI_API_KEY), falls back to Groq (GROQ_API_KEY), then LM Studio
 -- Override with LEGIBLE_CODER_MODEL and LEGIBLE_CODER_BASE_URL env vars
--- For Groq: set LEGIBLE_CODER_BASE_URL=https://api.groq.com/openai/v1 and LEGIBLE_CODER_MODEL=openai/gpt-oss-120b
--- Default model: google/gemma-4-26b-a4b
+-- Default model: gemini-2.5-flash (free tier via Gemini API)
 
 -- ─── Tool schema helpers ──────────────────────────────────────────────────────
 
@@ -459,7 +458,7 @@ function system_prompt(include_tools: boolean, include_dir_tools: boolean, inclu
   "You write code in the Legible programming language and perform tasks by running Legible scripts.\n\n" ++
   "Current working directory: " ++ cwd ++ "\n\n" ++
   "TOOLS: " ++ tool_names_text(include_tools, include_dir_tools, include_vision) ++ ".\n" ++
-  if not include_tools then "No runtime tools are available in this session. Rely on the preloaded workspace snapshot and answer in plain text.\n\n" else if include_dir_tools then "Use read_dir_recursive to understand project structure in ONE call instead of many list_dir calls.\n\n" else "For local models, rely on the preloaded workspace snapshot before making tool calls.\n\n" end ++
+  if not include_tools then "No runtime tools are available in this session. Rely on the preloaded workspace snapshot and answer in plain text.\n\n" else if include_dir_tools then "Use read_dir_recursive to understand project structure in ONE call instead of many list_dir calls.\nIMPORTANT: When the user asks you to take any action (run commands, check git status, read/write files, commit code, run tests), you MUST call a tool immediately. Do NOT describe what you would do, ask clarifying questions, or claim you cannot do something that a tool can accomplish. Use shell_exec for git and shell commands.\n\n" else "For local models, rely on the preloaded workspace snapshot before making tool calls.\n\n" end ++
   if include_vision then "VISUAL EVALUATION: For GUI tasks, use take_screenshot with the 'command' parameter set to the launch command (e.g. 'legible run gui.lbl'). The tool starts the app in the background, waits for 'delay' seconds (default 2), captures the screen, then kills the app. Do NOT run GUI programs via shell_exec — they block until closed, making a screenshot impossible.\n\n" else "" end ++
   prompt_syntax_ref() ++
   prompt_builtins() ++
@@ -517,11 +516,44 @@ function call_api(api_key: text, base_url: text, request_body: a mapping from te
   http_client_post(base_url ++ "/chat/completions", headers, json_encode(request_body))
 end
 
+-- ─── Provider helpers ─────────────────────────────────────────────────────────
+
+function gemini_base_url(): text
+  intent: return the Google AI OpenAI-compatible base URL
+  "https://generativelanguage.googleapis.com/v1beta/openai"
+end
+
+function is_gemini_url(url: text): boolean
+  intent: return true when url points to the Google AI Gemini endpoint
+  contains_text(url, "generativelanguage.googleapis.com")
+end
+
+function is_groq_url(url: text): boolean
+  intent: return true when url points to the Groq cloud endpoint
+  contains_text(url, "groq.com")
+end
+
+function backend_name(base_url: text): text
+  intent: return a human-readable backend label for base_url
+  if is_gemini_url(base_url) then "Gemini"
+  else if is_groq_url(base_url) then "Groq"
+  else "LM Studio (" ++ base_url ++ ")"
+  end
+end
+
+function provider_tier(base_url: text): text
+  intent: return gemini groq or local based on the base URL for context-window tuning
+  if is_gemini_url(base_url) then "gemini"
+  else if is_groq_url(base_url) then "groq"
+  else "local"
+  end
+end
+
 -- ─── UI helpers ───────────────────────────────────────────────────────────────
 
 function print_banner(model: text, base_url: text): nothing
   intent: print the legible-coder name, model, base_url, and cwd as the startup header
-  let backend: text = if contains_text(base_url, "localhost") or contains_text(base_url, "127.0.0.1") then "LM Studio (" ++ base_url ++ ")" else "Groq" end
+  let backend: text = backend_name(base_url)
   print("")
   print("  legible-coder")
   print("  Interactive Legible coding assistant")
@@ -854,10 +886,10 @@ end
 
 function prune_local_messages(msgs: a list of a mapping from text to text): a list of a mapping from text to text
   intent: strip old vision images, mask old tool results, then compact context for local mode
-  let keep: integer = resolve_context_keep_messages(true)
+  let keep: integer = resolve_context_keep_messages("local")
   let stripped: a list of a mapping from text to text = strip_old_vision_images(msgs, 2)
   let masked: a list of a mapping from text to text = mask_old_tool_results(stripped, keep * 2)
-  compact_context_if_needed(masked, resolve_context_budget(true), keep)
+  compact_context_if_needed(masked, resolve_context_budget("local"), keep)
 end
 
 function seen_tool_for_path(msgs: a list of a mapping from text to text, tool_name: text, path: text): boolean
@@ -1384,10 +1416,12 @@ function is_expert_task(input: text): boolean
 end
 
 function is_complex_task(input: text): boolean
-  intent: return true when input is long or contains error codes suggesting a non-trivial task
+  intent: return true when input is long, contains error codes, or is an action request requiring tool use
   let long_input: boolean = text_length(input) > 200
   let has_error: boolean = contains_text(input, "E_") or contains_text(lowercase(input), "error")
-  long_input or has_error
+  let lower: text = lowercase(input)
+  let is_action: boolean = contains_text(lower, "commit") or contains_text(lower, "push") or contains_text(lower, "run ") or contains_text(lower, "install") or contains_text(lower, "git ") or contains_text(lower, "check ") or contains_text(lower, "test ") or contains_text(lower, "build") or contains_text(lower, "execute") or contains_text(lower, "deploy")
+  long_input or has_error or is_action
 end
 
 function pick_model(input: text, full_model: text, fast_model: text, expert_model: text): text
@@ -1404,11 +1438,18 @@ end
 -- ─── Main loop ────────────────────────────────────────────────────────────────
 
 function resolve_api_key(base_url: text): text
-  intent: return LEGIBLE_CODER_API_KEY if set, else GROQ_API_KEY for Groq, else lm-studio for local endpoints
+  intent: return LEGIBLE_CODER_API_KEY if set, then the provider-specific key, or lm-studio for local
   let explicit_key: an optional text = env_get("LEGIBLE_CODER_API_KEY")
   if is_some(explicit_key) then
     unwrap(explicit_key)
-  else if contains_text(base_url, "groq.com") then
+  else if is_gemini_url(base_url) then
+    let gemini_key: an optional text = env_get("GEMINI_API_KEY")
+    if is_none(gemini_key) then
+      print("Error: GEMINI_API_KEY is not set. Set it or use LEGIBLE_CODER_API_KEY.")
+      exit_process(1)
+    end
+    unwrap(gemini_key)
+  else if is_groq_url(base_url) then
     let groq_key: an optional text = env_get("GROQ_API_KEY")
     if is_none(groq_key) then
       print("Error: GROQ_API_KEY is not set. Set it or use LEGIBLE_CODER_API_KEY.")
@@ -1420,30 +1461,32 @@ function resolve_api_key(base_url: text): text
   end
 end
 
-function resolve_max_tools(is_local: boolean): integer
-  intent: read LEGIBLE_CODER_MAX_TOOLS or use default 60 local and 30 remote
-  let default_text: text = if is_local then "60" else "30" end
+function resolve_max_tools(tier: text): integer
+  intent: read LEGIBLE_CODER_MAX_TOOLS or use default 60 for local and 30 for cloud providers
+  let default_text: text = if tier == "local" then "60" else "30" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_MAX_TOOLS"), default_text)
   max(to_integer(raw), 1)
 end
 
-function resolve_context_budget(is_local: boolean): integer
-  intent: read LEGIBLE_CODER_CONTEXT_TOKENS or use a local or remote default budget
-  let default_text: text = if is_local then "6000" else "90000" end
+function resolve_context_budget(tier: text): integer
+  intent: read LEGIBLE_CODER_CONTEXT_TOKENS or use a provider-appropriate token budget before compaction
+  -- gemini-2.5-flash has a 1M token context, groq models vary but 90K is safe, local is very limited
+  let default_text: text = if tier == "local" then "6000" else if tier == "gemini" then "700000" else "90000" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_TOKENS"), default_text)
   max(to_integer(raw), 1000)
 end
 
-function resolve_context_keep_messages(is_local: boolean): integer
-  intent: read LEGIBLE_CODER_CONTEXT_KEEP_MESSAGES or use a local or remote recent-message default
-  let default_text: text = if is_local then "8" else "12" end
+function resolve_context_keep_messages(tier: text): integer
+  intent: read LEGIBLE_CODER_CONTEXT_KEEP_MESSAGES or use a provider-appropriate recent-message default
+  let default_text: text = if tier == "local" then "8" else if tier == "gemini" then "24" else "12" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_KEEP_MESSAGES"), default_text)
   max(to_integer(raw), 2)
 end
 
-function resolve_max_output_tokens(is_local: boolean, include_tools: boolean): integer
-  intent: read LEGIBLE_CODER_MAX_OUTPUT_TOKENS or pick a default suited to the backend mode
-  let default_text: text = if is_local and include_tools then "4096" else if is_local then "750" else "16384" end
+function resolve_max_output_tokens(tier: text, include_tools: boolean): integer
+  intent: read LEGIBLE_CODER_MAX_OUTPUT_TOKENS or pick a default suited to the backend
+  -- gemini-2.5-flash supports up to 65K output, groq up to ~16K, local is small
+  let default_text: text = if tier == "local" and include_tools then "4096" else if tier == "local" then "750" else if tier == "gemini" then "32768" else "16384" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_MAX_OUTPUT_TOKENS"), default_text)
   max(to_integer(raw), 128)
 end
@@ -1474,6 +1517,7 @@ function resolve_include_vision(model: text): boolean
     true
   else
     let lower: text = lowercase(model)
+    contains_text(lower, "gemini") or
     contains_text(lower, "gemma-4") or contains_text(lower, "gemma4") or
     contains_text(lower, "llama-4") or contains_text(lower, "vision") or
     contains_text(lower, "llava") or contains_text(lower, "claude-3") or
@@ -1501,30 +1545,98 @@ function print_local_tool_mode(is_local: boolean, include_tools: boolean): nothi
   end
 end
 
-function main(): nothing
-  intent: read base_url, api_key, and models, print the banner, then loop reading user messages
-  let base_url: text = unwrap_or(env_get("LEGIBLE_CODER_BASE_URL"), "http://localhost:1234/v1")
-  let key: text = resolve_api_key(base_url)
-  let is_local: boolean = contains_text(base_url, "localhost") or contains_text(base_url, "127.0.0.1")
-  let full_model: text = unwrap_or(env_get("LEGIBLE_CODER_MODEL"), "google/gemma-4-26b-a4b")
-  let include_tools: boolean = not is_local or resolve_local_native_tools(full_model)
-  let include_dir_tools: boolean = include_tools
-  let fast_model: text = if is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "openai/gpt-oss-20b") end
-  let expert_model: text = if is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "") end
-  let max_tools: integer = resolve_max_tools(is_local)
-  let max_output_tokens: integer = resolve_max_output_tokens(is_local, include_tools)
-  let context_budget: integer = resolve_context_budget(is_local)
-  let preserve_recent_messages: integer = resolve_context_keep_messages(is_local)
-  let include_vision: boolean = include_tools and resolve_include_vision(full_model)
-  print_banner(full_model, base_url)
-  print_local_tool_mode(is_local, include_tools)
-  let sys_prompt: text = if is_local and not include_tools then local_system_prompt() else system_prompt(include_tools, include_dir_tools, include_vision) end
-  let sys_msg: a mapping from text to text = {"role": "system", "content": sys_prompt}
-  let local_bootstrap_msg: a mapping from text to text = {"role": "system", "content": local_model_context()}
-  mutable messages: a list of a mapping from text to text = [sys_msg]
-  if is_local then
-    set messages = append(messages, local_bootstrap_msg)
+function build_custom_provider(url: text, model_override: an optional text): a mapping from text to text
+  intent: build a provider mapping for an explicitly configured base URL
+  let key: text = resolve_api_key(url)
+  let default_model: text = if is_gemini_url(url) then "gemini-2.5-flash" else if is_groq_url(url) then "openai/gpt-oss-120b" else "google/gemma-4-26b-a4b" end
+  let model: text = unwrap_or(model_override, default_model)
+  let url_is_local: boolean = contains_text(url, "localhost") or contains_text(url, "127.0.0.1")
+  let fast_model: text = if url_is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), model) end
+  let expert_model: text = if url_is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "") end
+  {"name": "Custom", "key": key, "url": url, "full": model, "fast": fast_model, "expert": expert_model}
+end
+
+function build_gemini_provider(key: text, model_override: an optional text): a mapping from text to text
+  intent: build a provider mapping for the Gemini API using the free-tier default
+  let model: text = unwrap_or(model_override, "gemini-2.5-flash")
+  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "gemini-2.5-flash-lite")
+  let expert_model: text = unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "")
+  {"name": "Gemini", "key": key, "url": gemini_base_url(), "full": model, "fast": fast_model, "expert": expert_model}
+end
+
+function build_groq_provider(key: text, model_override: an optional text): a mapping from text to text
+  intent: build a provider mapping for the Groq cloud API with its default models
+  let model: text = unwrap_or(model_override, "openai/gpt-oss-120b")
+  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "openai/gpt-oss-20b")
+  let expert_model: text = unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "")
+  {"name": "Groq", "key": key, "url": "https://api.groq.com/openai/v1", "full": model, "fast": fast_model, "expert": expert_model}
+end
+
+function build_local_provider(model_override: an optional text): a mapping from text to text
+  intent: build a provider mapping for the local LM Studio endpoint as the final fallback
+  let model: text = unwrap_or(model_override, "google/gemma-4-26b-a4b")
+  {"name": "LM Studio", "key": "lm-studio", "url": "http://localhost:1234/v1", "full": model, "fast": "", "expert": ""}
+end
+
+function build_default_provider_list(model_override: an optional text, gemini_key_opt: an optional text, groq_key_opt: an optional text): a list of a mapping from text to text
+  intent: build the ordered fallback provider list based on which API keys are available
+  let with_gemini: a list of a mapping from text to text = if is_some(gemini_key_opt) then [build_gemini_provider(unwrap(gemini_key_opt), model_override)] else [] end
+  let with_groq: a list of a mapping from text to text = if is_some(groq_key_opt) then append(with_gemini, build_groq_provider(unwrap(groq_key_opt), model_override)) else with_gemini end
+  append(with_groq, build_local_provider(model_override))
+end
+
+function build_provider_list(): a list of a mapping from text to text
+  intent: pick single-provider mode if LEGIBLE_CODER_BASE_URL is set, otherwise build the auto-detected fallback list
+  let custom_url_opt: an optional text = env_get("LEGIBLE_CODER_BASE_URL")
+  let model_override: an optional text = env_get("LEGIBLE_CODER_MODEL")
+  if is_some(custom_url_opt) then
+    [build_custom_provider(unwrap(custom_url_opt), model_override)]
+  else
+    build_default_provider_list(model_override, env_get("GEMINI_API_KEY"), env_get("GROQ_API_KEY"))
   end
+end
+
+function print_turn_model_banner(try_idx: integer, prov: a mapping from text to text, turn_model: text, p_full: text, p_fast: text, p_expert: text): nothing
+  intent: print the fallback notice or the expert/fast model banner before a turn runs
+  if try_idx > 0 then
+    print("  [fallback] trying " ++ get(prov, "name") ++ " with model " ++ turn_model)
+  end
+  if try_idx == 0 and turn_model == p_expert and text_length(p_expert) > 0 then
+    print("  [expert model: " ++ p_expert ++ "]")
+  end
+  if try_idx == 0 and turn_model == p_fast and text_length(p_fast) > 0 and p_fast != p_full then
+    print("  [fast model: " ++ p_fast ++ "]")
+  end
+end
+
+function run_turn_with_fallback(messages: a list of a mapping from text to text, user_input: text, start: integer, providers: a list of a mapping from text to text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer, include_vision: boolean): a list of a mapping from text to text
+  intent: try each provider in order for one turn, returning updated messages when one succeeds or after all have failed
+  mutable msgs: a list of a mapping from text to text = messages
+  mutable try_idx: integer = 0
+  mutable turn_done: boolean = false
+  while not turn_done do
+    let prov: a mapping from text to text = get(providers, try_idx)
+    let p_full: text = get(prov, "full")
+    let p_fast: text = get(prov, "fast")
+    let p_expert: text = get(prov, "expert")
+    let turn_model: text = pick_model(user_input, p_full, p_fast, p_expert)
+    print_turn_model_banner(try_idx, prov, turn_model, p_full, p_fast, p_expert)
+    set msgs = run_inner_loop(msgs, start, get(prov, "key"), get(prov, "url"), turn_model, max_tools, include_tools, include_dir_tools, max_output_tokens, context_budget, preserve_recent_messages, include_vision)
+    if length(msgs) > start then
+      set turn_done = true
+    else
+      set try_idx = try_idx + 1
+      if try_idx >= length(providers) then
+        set turn_done = true
+      end
+    end
+  end
+  msgs
+end
+
+function run_repl(init_messages: a list of a mapping from text to text, providers: a list of a mapping from text to text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer, include_vision: boolean): nothing
+  intent: run the interactive read-eval-print loop, dispatching each user turn through the provider fallback chain
+  mutable messages: a list of a mapping from text to text = init_messages
   mutable running: boolean = true
   while running do
     print("  > ")
@@ -1535,12 +1647,49 @@ function main(): nothing
     else if text_length(user_input) == 0 then
       print("")
     else
-      let turn_model: text = pick_model(user_input, full_model, fast_model, expert_model)
-      if turn_model == expert_model and text_length(expert_model) > 0 then print("  [expert model: " ++ expert_model ++ "]") end
-      if turn_model == fast_model and text_length(fast_model) > 0 then print("  [fast model: " ++ fast_model ++ "]") end
       set messages = append(messages, {"role": "user", "content": user_input})
       let start: integer = length(messages)
-      set messages = run_inner_loop(messages, start, key, base_url, turn_model, max_tools, include_tools, include_dir_tools, max_output_tokens, context_budget, preserve_recent_messages, include_vision)
+      set messages = run_turn_with_fallback(messages, user_input, start, providers, max_tools, include_tools, include_dir_tools, max_output_tokens, context_budget, preserve_recent_messages, include_vision)
     end
   end
+end
+
+function provider_name_list(providers: a list of a mapping from text to text): a list of text
+  intent: extract the name field from each provider mapping into a list of text
+  map(providers, fn(p: a mapping from text to text): text => get(p, "name"))
+end
+
+function initial_messages(is_local: boolean, sys_prompt: text): a list of a mapping from text to text
+  intent: build the starting message list with the system prompt and optional local bootstrap
+  let sys_msg: a mapping from text to text = {"role": "system", "content": sys_prompt}
+  if is_local then
+    [sys_msg, {"role": "system", "content": local_model_context()}]
+  else
+    [sys_msg]
+  end
+end
+
+function main(): nothing
+  intent: build the provider list, compute tier-based settings, print the banner, and start the REPL
+  let providers: a list of a mapping from text to text = build_provider_list()
+  let primary: a mapping from text to text = get(providers, 0)
+  let primary_url: text = get(primary, "url")
+  let primary_model: text = get(primary, "full")
+  let tier: text = provider_tier(primary_url)
+  let is_local: boolean = tier == "local"
+  let include_tools: boolean = not is_local or resolve_local_native_tools(primary_model)
+  let include_dir_tools: boolean = include_tools
+  let max_tools: integer = resolve_max_tools(tier)
+  let max_output_tokens: integer = resolve_max_output_tokens(tier, include_tools)
+  let context_budget: integer = resolve_context_budget(tier)
+  let preserve_recent_messages: integer = resolve_context_keep_messages(tier)
+  let include_vision: boolean = include_tools and resolve_include_vision(primary_model)
+  print_banner(primary_model, primary_url)
+  if length(providers) > 1 then
+    print("  Fallbacks: " ++ join(drop(provider_name_list(providers), 1), " -> "))
+  end
+  print_local_tool_mode(is_local, include_tools)
+  let sys_prompt: text = if is_local and not include_tools then local_system_prompt() else system_prompt(include_tools, include_dir_tools, include_vision) end
+  let messages: a list of a mapping from text to text = initial_messages(is_local, sys_prompt)
+  run_repl(messages, providers, max_tools, include_tools, include_dir_tools, max_output_tokens, context_budget, preserve_recent_messages, include_vision)
 end

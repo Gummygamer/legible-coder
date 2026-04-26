@@ -1343,25 +1343,45 @@ end
 
 function handle_success_response(resp_body: text, include_tools: boolean, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, round: integer, force_text: boolean, explore_count: integer, acted: boolean, include_vision: boolean): LoopStep
   intent: process a successful API response and return the next loop state
-  let choice: a mapping from text to text = get(get(json_parse(resp_body), "choices"), 0)
-  let msg: a mapping from text to text = get(choice, "message")
-  let finish: text = unwrap_or(get(choice, "finish_reason"), "stop")
-  if not include_tools then
-    handle_local_text_round(msg, msgs, total_tools, max_tools, last_batch, explore_count, acted)
-  else if finish == "length" then
-    handle_length_finish(msg, msgs, total_tools, last_batch, explore_count, acted)
-  else if finish == "tool_calls" or length(unwrap_or(get(msg, "tool_calls"), [])) > 0 then
-    handle_tool_round(msg, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted, include_vision)
+  let no_choices_step: LoopStep = LoopStep {
+    messages: msgs,
+    count: total_tools,
+    last_batch: last_batch,
+    waiting: false,
+    must_force_text: false,
+    explore_count: explore_count,
+    acted: acted
+  }
+  if not json_valid(resp_body) or not starts_with(trim(resp_body), "\{") then
+    print("  API error: non-JSON response body")
+    no_choices_step
   else
-    LoopStep {
-      messages: handle_text_response(msg, msgs),
-      count: total_tools,
-      last_batch: last_batch,
-      waiting: false,
-      must_force_text: false,
-      explore_count: explore_count,
-      acted: acted
-    }
+    let parsed: a mapping from text to text = json_parse(resp_body)
+    if not has_key(parsed, "choices") or length(get(parsed, "choices")) == 0 then
+      print("  API error: no choices in response: " ++ extract_error_message(resp_body))
+      no_choices_step
+    else
+      let choice: a mapping from text to text = get(get(parsed, "choices"), 0)
+      let msg: a mapping from text to text = get(choice, "message")
+      let finish: text = unwrap_or(get(choice, "finish_reason"), "stop")
+      if not include_tools then
+        handle_local_text_round(msg, msgs, total_tools, max_tools, last_batch, explore_count, acted)
+      else if finish == "length" then
+        handle_length_finish(msg, msgs, total_tools, last_batch, explore_count, acted)
+      else if finish == "tool_calls" or length(unwrap_or(get(msg, "tool_calls"), [])) > 0 then
+        handle_tool_round(msg, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted, include_vision)
+      else
+        LoopStep {
+          messages: handle_text_response(msg, msgs),
+          count: total_tools,
+          last_batch: last_batch,
+          waiting: false,
+          must_force_text: false,
+          explore_count: explore_count,
+          acted: acted
+        }
+      end
+    end
   end
 end
 

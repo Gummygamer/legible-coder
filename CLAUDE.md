@@ -1,6 +1,6 @@
 # legible-coder
 
-An interactive CLI coding assistant written in the Legible programming language. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is `gpt-oss-120b` via the Groq API.
+An interactive CLI coding assistant written in the Legible programming language. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is `gemini-2.5-flash` via the Gemini API, with OpenRouter's free models router and Groq as remote fallbacks.
 
 ## Architecture
 
@@ -48,7 +48,8 @@ whose OpenAI-compatible tool support is incomplete.
 ## Running
 
 ```bash
-export GROQ_API_KEY="your-key-here"
+export GEMINI_API_KEY="your-gemini-key-here"
+export OPENROUTER_API_KEY="your-openrouter-key-here"
 cd your-project-directory
 legible run /path/to/legible-coder/coder.lbl
 ```
@@ -56,8 +57,9 @@ legible run /path/to/legible-coder/coder.lbl
 ## Requirements
 
 - The Legible interpreter built with HTTP client and process builtins
-- A valid Groq API key in the `GROQ_API_KEY` environment variable
-- Network access to `api.groq.com`, or an OpenAI-compatible local server via
+- A valid Gemini API key in the `GEMINI_API_KEY` environment variable
+- Optionally, an OpenRouter API key in `OPENROUTER_API_KEY` for the first remote fallback
+- Network access to Gemini, OpenRouter, Groq, or an OpenAI-compatible local server via
   `LEGIBLE_CODER_BASE_URL`
 
 ## Legible language quick reference

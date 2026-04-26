@@ -1,11 +1,11 @@
 # legible-coder
 
-An interactive CLI coding assistant for the [Legible programming language](../legible/), styled after Claude Code. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is `gpt-oss-120b` via the [Groq API](https://groq.com/).
+An interactive CLI coding assistant for the [Legible programming language](../legible/), styled after Claude Code. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is `gemini-2.5-flash` via the Gemini API, with OpenRouter's free models router as the first fallback when configured.
 
 ```
   legible-coder
   Interactive Legible coding assistant
-  Powered by gpt-oss-120b via Groq
+  Model: gemini-2.5-flash via Gemini
   ────────────────────────────────────────────
   cwd: /your/project
   Type your request, or 'quit' to exit.
@@ -23,7 +23,8 @@ An interactive CLI coding assistant for the [Legible programming language](../le
 
 - The Legible interpreter (`legible` binary) in your `PATH`
 - SDL2 runtime libraries: `libsdl2-2.0-0` and `libsdl2-ttf-2.0-0` on Debian/Ubuntu
-- A [Groq API key](https://console.groq.com/)
+- A [Gemini API key](https://aistudio.google.com/app/apikey)
+- Optional fallback keys: [OpenRouter](https://openrouter.ai/settings/keys), then [Groq](https://console.groq.com/)
 
 Build the interpreter from source:
 
@@ -55,7 +56,9 @@ legible run /path/to/legible-coder/coder.lbl
 ## Usage
 
 ```bash
-export GROQ_API_KEY="your-key-here"
+export GEMINI_API_KEY="your-gemini-key-here"
+export OPENROUTER_API_KEY="your-openrouter-key-here"   # optional first fallback
+export GROQ_API_KEY="your-groq-key-here"               # optional second fallback
 cd your-project-directory
 legible-coder
 ```
@@ -147,11 +150,13 @@ legible-coder/
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GROQ_API_KEY` | For Groq | Groq API key when using the default Groq endpoint |
+| `GEMINI_API_KEY` | For Gemini | Gemini API key for the default primary provider |
+| `OPENROUTER_API_KEY` | For OpenRouter | OpenRouter API key for the first fallback. Uses `openrouter/free` by default |
+| `GROQ_API_KEY` | For Groq | Groq API key for the second fallback |
 | `LEGIBLE_CODER_API_KEY` | No | Explicit API key override. Local endpoints default to `lm-studio` |
-| `LEGIBLE_CODER_BASE_URL` | No | OpenAI-compatible base URL. Default: `https://api.groq.com/openai/v1` |
-| `LEGIBLE_CODER_MODEL` | No | Primary model. Default: `openai/gpt-oss-120b` |
-| `LEGIBLE_CODER_FAST_MODEL` | No | Remote fast model for simple turns. Default: `openai/gpt-oss-20b` |
+| `LEGIBLE_CODER_BASE_URL` | No | OpenAI-compatible base URL. Auto-detects Gemini, OpenRouter, Groq, then local LM Studio when unset |
+| `LEGIBLE_CODER_MODEL` | No | Primary model. Default: `gemini-2.5-flash` for Gemini, `openrouter/free` for OpenRouter, `openai/gpt-oss-120b` for Groq |
+| `LEGIBLE_CODER_FAST_MODEL` | No | Remote fast model for simple turns. Default: `gemini-2.5-flash-lite` for Gemini, `openrouter/free` for OpenRouter, `openai/gpt-oss-20b` for Groq |
 | `LEGIBLE_CODER_EXPERT_MODEL` | No | Optional remote expert model for architecture/refactor/design turns |
 | `LEGIBLE_CODER_LOCAL_TOOLS` | No | `1` forces native tools for local models, `0` forces manual local protocol. Gemma 4 names auto-enable native tools |
 | `LEGIBLE_CODER_MAX_TOOLS` | No | Maximum tool calls per user turn. Defaults: `60` local, `30` remote |

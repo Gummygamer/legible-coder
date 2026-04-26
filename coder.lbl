@@ -1,5 +1,5 @@
 -- legible-coder: an interactive CLI coding assistant for the Legible language
--- Default backend: Gemini API (GEMINI_API_KEY), falls back to Groq (GROQ_API_KEY), then LM Studio
+-- Default backend: Gemini API (GEMINI_API_KEY), falls back to OpenRouter (OPENROUTER_API_KEY), Groq (GROQ_API_KEY), then LM Studio
 -- Override with LEGIBLE_CODER_MODEL and LEGIBLE_CODER_BASE_URL env vars
 -- Default model: gemini-2.5-flash (free tier via Gemini API)
 
@@ -524,9 +524,19 @@ function gemini_base_url(): text
   "https://generativelanguage.googleapis.com/v1beta/openai"
 end
 
+function openrouter_base_url(): text
+  intent: return the OpenRouter OpenAI-compatible base URL
+  "https://openrouter.ai/api/v1"
+end
+
 function is_gemini_url(url: text): boolean
   intent: return true when url points to the Google AI Gemini endpoint
   contains_text(url, "generativelanguage.googleapis.com")
+end
+
+function is_openrouter_url(url: text): boolean
+  intent: return true when url points to the OpenRouter endpoint
+  contains_text(url, "openrouter.ai")
 end
 
 function is_groq_url(url: text): boolean
@@ -537,14 +547,16 @@ end
 function backend_name(base_url: text): text
   intent: return a human-readable backend label for base_url
   if is_gemini_url(base_url) then "Gemini"
+  else if is_openrouter_url(base_url) then "OpenRouter"
   else if is_groq_url(base_url) then "Groq"
   else "LM Studio (" ++ base_url ++ ")"
   end
 end
 
 function provider_tier(base_url: text): text
-  intent: return gemini groq or local based on the base URL for context-window tuning
+  intent: return gemini openrouter groq or local based on the base URL for context-window tuning
   if is_gemini_url(base_url) then "gemini"
+  else if is_openrouter_url(base_url) then "openrouter"
   else if is_groq_url(base_url) then "groq"
   else "local"
   end
@@ -1450,6 +1462,13 @@ function resolve_api_key(base_url: text): text
       exit_process(1)
     end
     unwrap(gemini_key)
+  else if is_openrouter_url(base_url) then
+    let openrouter_key: an optional text = env_get("OPENROUTER_API_KEY")
+    if is_none(openrouter_key) then
+      print("Error: OPENROUTER_API_KEY is not set. Set it or use LEGIBLE_CODER_API_KEY.")
+      exit_process(1)
+    end
+    unwrap(openrouter_key)
   else if is_groq_url(base_url) then
     let groq_key: an optional text = env_get("GROQ_API_KEY")
     if is_none(groq_key) then
@@ -1549,7 +1568,7 @@ end
 function build_custom_provider(url: text, model_override: an optional text): a mapping from text to text
   intent: build a provider mapping for an explicitly configured base URL
   let key: text = resolve_api_key(url)
-  let default_model: text = if is_gemini_url(url) then "gemini-2.5-flash" else if is_groq_url(url) then "openai/gpt-oss-120b" else "google/gemma-4-26b-a4b" end
+  let default_model: text = if is_gemini_url(url) then "gemini-2.5-flash" else if is_openrouter_url(url) then "openrouter/free" else if is_groq_url(url) then "openai/gpt-oss-120b" else "google/gemma-4-26b-a4b" end
   let model: text = unwrap_or(model_override, default_model)
   let url_is_local: boolean = contains_text(url, "localhost") or contains_text(url, "127.0.0.1")
   let fast_model: text = if url_is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), model) end
@@ -1563,6 +1582,14 @@ function build_gemini_provider(key: text, model_override: an optional text): a m
   let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "gemini-2.5-flash-lite")
   let expert_model: text = unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "")
   {"name": "Gemini", "key": key, "url": gemini_base_url(), "full": model, "fast": fast_model, "expert": expert_model}
+end
+
+function build_openrouter_provider(key: text, model_override: an optional text): a mapping from text to text
+  intent: build a provider mapping for OpenRouter using its free models router
+  let model: text = unwrap_or(model_override, "openrouter/free")
+  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "openrouter/free")
+  let expert_model: text = unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "")
+  {"name": "OpenRouter", "key": key, "url": openrouter_base_url(), "full": model, "fast": fast_model, "expert": expert_model}
 end
 
 function build_groq_provider(key: text, model_override: an optional text): a mapping from text to text
@@ -1579,10 +1606,11 @@ function build_local_provider(model_override: an optional text): a mapping from 
   {"name": "LM Studio", "key": "lm-studio", "url": "http://localhost:1234/v1", "full": model, "fast": "", "expert": ""}
 end
 
-function build_default_provider_list(model_override: an optional text, gemini_key_opt: an optional text, groq_key_opt: an optional text): a list of a mapping from text to text
+function build_default_provider_list(model_override: an optional text, gemini_key_opt: an optional text, openrouter_key_opt: an optional text, groq_key_opt: an optional text): a list of a mapping from text to text
   intent: build the ordered fallback provider list based on which API keys are available
   let with_gemini: a list of a mapping from text to text = if is_some(gemini_key_opt) then [build_gemini_provider(unwrap(gemini_key_opt), model_override)] else [] end
-  let with_groq: a list of a mapping from text to text = if is_some(groq_key_opt) then append(with_gemini, build_groq_provider(unwrap(groq_key_opt), model_override)) else with_gemini end
+  let with_openrouter: a list of a mapping from text to text = if is_some(openrouter_key_opt) then append(with_gemini, build_openrouter_provider(unwrap(openrouter_key_opt), model_override)) else with_gemini end
+  let with_groq: a list of a mapping from text to text = if is_some(groq_key_opt) then append(with_openrouter, build_groq_provider(unwrap(groq_key_opt), model_override)) else with_openrouter end
   append(with_groq, build_local_provider(model_override))
 end
 
@@ -1593,7 +1621,7 @@ function build_provider_list(): a list of a mapping from text to text
   if is_some(custom_url_opt) then
     [build_custom_provider(unwrap(custom_url_opt), model_override)]
   else
-    build_default_provider_list(model_override, env_get("GEMINI_API_KEY"), env_get("GROQ_API_KEY"))
+    build_default_provider_list(model_override, env_get("GEMINI_API_KEY"), env_get("OPENROUTER_API_KEY"), env_get("GROQ_API_KEY"))
   end
 end
 

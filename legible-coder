@@ -11,12 +11,22 @@ DIR="$(dirname "$SCRIPT")"
 CODER="$DIR/coder.lbl"
 LOCAL_LEGIBLE="$DIR/../legible/target/release/legible"
 
+print_sdl_error() {
+  echo "Error: the Legible interpreter is missing SDL2 runtime libraries." >&2
+  echo "Install them on Debian/Ubuntu with:" >&2
+  echo "  sudo apt-get install libsdl2-2.0-0 libsdl2-ttf-2.0-0" >&2
+}
+
 if [ ! -f "$CODER" ]; then
   echo "Error: cannot find coder.lbl at $CODER" >&2
   exit 1
 fi
 
 if [ -x "$LOCAL_LEGIBLE" ]; then
+  if command -v ldd &>/dev/null && ldd "$LOCAL_LEGIBLE" 2>/dev/null | grep -q "not found"; then
+    print_sdl_error
+    exit 1
+  fi
   exec "$LOCAL_LEGIBLE" run "$CODER" "$@"
 fi
 

@@ -22,11 +22,13 @@ An interactive CLI coding assistant for the [Legible programming language](../le
 ## Prerequisites
 
 - The Legible interpreter (`legible` binary) in your `PATH`
+- SDL2 runtime libraries: `libsdl2-2.0-0` and `libsdl2-ttf-2.0-0` on Debian/Ubuntu
 - A [Groq API key](https://console.groq.com/)
 
 Build the interpreter from source:
 
 ```bash
+sudo apt-get install libsdl2-2.0-0 libsdl2-ttf-2.0-0
 cd ../legible
 cargo build --release
 cp target/release/legible ~/.cargo/bin/   # or anywhere on your PATH

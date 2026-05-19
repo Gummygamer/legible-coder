@@ -94,6 +94,55 @@ function is_local_known_tool(name: text): boolean
   n == "list_dir" or n == "read_dir_recursive" or n == "grep" or n == "take_screenshot"
 end
 
+function strip_path_quotes(path: text): text
+  intent: remove a single pair of surrounding double or single quotes from path if present
+  let n: integer = text_length(path)
+  if n >= 2 and starts_with(path, "\"") and ends_with(path, "\"") then
+    substring(path, 1, n - 2)
+  else if n >= 2 and starts_with(path, "'") and ends_with(path, "'") then
+    substring(path, 1, n - 2)
+  else
+    path
+  end
+end
+
+function strip_trailing_slash(path: text): text
+  intent: remove a single trailing slash from path unless path is exactly "/"
+  let n: integer = text_length(path)
+  if n > 1 and ends_with(path, "/") then
+    substring(path, 0, n - 1)
+  else
+    path
+  end
+end
+
+function normalize_cd_path(path: text): text
+  intent: strip surrounding quotes and a trailing slash from path so it can be compared to get_cwd
+  strip_trailing_slash(strip_path_quotes(path))
+end
+
+function strip_redundant_cd(command: text): text
+  intent: when command starts with "cd <cwd> && rest" drop the redundant cd so only rest is executed
+  let trimmed: text = trim(command)
+  if not starts_with(trimmed, "cd ") then
+    trimmed
+  else
+    let amp_idx: integer = unwrap_or(index_of(trimmed, " && "), -1)
+    if amp_idx < 3 then
+      trimmed
+    else
+      let path_raw: text = trim(substring(trimmed, 3, amp_idx - 3))
+      let path_canon: text = normalize_cd_path(path_raw)
+      let cwd_canon: text = normalize_cd_path(get_cwd())
+      if text_length(path_canon) > 0 and path_canon == cwd_canon then
+        trim(substring(trimmed, amp_idx + 4, text_length(trimmed) - amp_idx - 4))
+      else
+        trimmed
+      end
+    end
+  end
+end
+
 function describe_tool_call(name: text, arguments: text): text
   intent: format name with its path, command, or pattern argument as a short label
   let args: a mapping from text to text = json_parse(arguments)
@@ -104,7 +153,7 @@ function describe_tool_call(name: text, arguments: text): text
   else if name == "write_file" then
     name ++ "  " ++ unwrap_or(get(args, "path"), "")
   else if name == "shell_exec" then
-    let cmd: text = unwrap_or(get(args, "command"), "")
+    let cmd: text = strip_redundant_cd(unwrap_or(get(args, "command"), ""))
     let preview: text = if text_length(cmd) > 60 then substring(cmd, 0, 60) ++ "…" else cmd end
     name ++ "  $ " ++ preview
   else if name == "grep" then
@@ -141,7 +190,7 @@ end
 
 function exec_shell(args: a mapping from text to text): text
   intent: run the command and return exit_code, stdout, and stderr as text
-  let result: a mapping from text to text = shell_exec(get(args, "command"))
+  let result: a mapping from text to text = shell_exec(strip_redundant_cd(get(args, "command")))
   let base: text = "exit_code: " ++ to_text(get(result, "exit_code"))
   let with_out: text = if text_length(get(result, "stdout")) > 0 then base ++ "\nstdout:\n" ++ get(result, "stdout") else base end
   if text_length(get(result, "stderr")) > 0 then with_out ++ "\nstderr:\n" ++ get(result, "stderr") else with_out end

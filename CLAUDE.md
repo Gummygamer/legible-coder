@@ -1,6 +1,6 @@
 # legible-coder
 
-An interactive CLI coding assistant written in the Legible programming language. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is `gemini-2.5-flash` via the Gemini API, with OpenRouter's free models router and Groq as remote fallbacks.
+An interactive CLI coding assistant written in the Legible programming language. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is `gemini-2.5-flash` via the Gemini API, with NVIDIA NIM (Nemotron), OpenRouter's free models router, and Groq as remote fallbacks.
 
 ## Architecture
 
@@ -49,6 +49,7 @@ whose OpenAI-compatible tool support is incomplete.
 
 ```bash
 export GEMINI_API_KEY="your-gemini-key-here"
+export NVIDIA_API_KEY="your-nvidia-nim-key-here"
 export OPENROUTER_API_KEY="your-openrouter-key-here"
 cd your-project-directory
 legible run /path/to/legible-coder/coder.lbl
@@ -58,8 +59,9 @@ legible run /path/to/legible-coder/coder.lbl
 
 - The Legible interpreter built with HTTP client and process builtins
 - A valid Gemini API key in the `GEMINI_API_KEY` environment variable
-- Optionally, an OpenRouter API key in `OPENROUTER_API_KEY` for the first remote fallback
-- Network access to Gemini, OpenRouter, Groq, or an OpenAI-compatible local server via
+- Optionally, an NVIDIA NIM API key in `NVIDIA_API_KEY` for the first remote fallback (free Nemotron models)
+- Optionally, an OpenRouter API key in `OPENROUTER_API_KEY` for the second remote fallback
+- Network access to Gemini, NIM, OpenRouter, Groq, or an OpenAI-compatible local server via
   `LEGIBLE_CODER_BASE_URL`
 
 ## Legible language quick reference

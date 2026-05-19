@@ -1,7 +1,7 @@
 -- legible-coder: an interactive CLI coding assistant for the Legible language
--- Default backend: Gemini API (GEMINI_API_KEY), falls back to NIM (NVIDIA_API_KEY), OpenRouter (OPENROUTER_API_KEY), Groq (GROQ_API_KEY), then LM Studio
+-- Default backend: NIM (NVIDIA_API_KEY), falls back to Gemini (GEMINI_API_KEY), OpenRouter (OPENROUTER_API_KEY), Groq (GROQ_API_KEY), then LM Studio
 -- Override with LEGIBLE_CODER_MODEL and LEGIBLE_CODER_BASE_URL env vars
--- Default model: gemini-2.5-flash (free tier via Gemini API)
+-- Default model: z-ai/glm-5.1 via NVIDIA NIM
 
 -- ─── Tool schema helpers ──────────────────────────────────────────────────────
 
@@ -1655,9 +1655,9 @@ end
 
 function build_default_provider_list(model_override: an optional text, gemini_key_opt: an optional text, nims_key_opt: an optional text, openrouter_key_opt: an optional text, groq_key_opt: an optional text): a list of a mapping from text to text
   intent: build the ordered fallback provider list based on which API keys are available
-  let with_gemini: a list of a mapping from text to text = if is_some(gemini_key_opt) then [build_gemini_provider(unwrap(gemini_key_opt), model_override)] else [] end
-  let with_nims: a list of a mapping from text to text = if is_some(nims_key_opt) then append(with_gemini, build_nims_provider(unwrap(nims_key_opt), model_override)) else with_gemini end
-  let with_openrouter: a list of a mapping from text to text = if is_some(openrouter_key_opt) then append(with_nims, build_openrouter_provider(unwrap(openrouter_key_opt), model_override)) else with_nims end
+  let with_nims: a list of a mapping from text to text = if is_some(nims_key_opt) then [build_nims_provider(unwrap(nims_key_opt), model_override)] else [] end
+  let with_gemini: a list of a mapping from text to text = if is_some(gemini_key_opt) then append(with_nims, build_gemini_provider(unwrap(gemini_key_opt), model_override)) else with_nims end
+  let with_openrouter: a list of a mapping from text to text = if is_some(openrouter_key_opt) then append(with_gemini, build_openrouter_provider(unwrap(openrouter_key_opt), model_override)) else with_gemini end
   let with_groq: a list of a mapping from text to text = if is_some(groq_key_opt) then append(with_openrouter, build_groq_provider(unwrap(groq_key_opt), model_override)) else with_openrouter end
   append(with_groq, build_local_provider(model_override))
 end

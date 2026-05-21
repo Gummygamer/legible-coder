@@ -173,6 +173,8 @@ function exec_write_file(args: a mapping from text to text): text
   intent: write content to path and print a diff if the file already existed
   let path: text = get(args, "path")
   let content: text = get(args, "content")
+  -- ensure the parent directory exists so writes to new subdirs don't fail
+  let ignored: a mapping from text to text = shell_exec("mkdir -p \"$(dirname \"" ++ path ++ "\")\"")
   if file_exists(path) then
     let old_content: text = read_file(path)
     write_file("/tmp/legible_coder_old", old_content)

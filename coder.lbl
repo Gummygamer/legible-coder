@@ -95,7 +95,7 @@ function is_local_known_tool(name: text): boolean
 end
 
 function strip_path_quotes(path: text): text
-  intent: remove a single pair of surrounding double or single quotes from path if present
+  intent: use starts_with and ends_with to detect surrounding quotes in path and return the inner substring
   let n: integer = text_length(path)
   if n >= 2 and starts_with(path, "\"") and ends_with(path, "\"") then
     substring(path, 1, n - 2)
@@ -107,7 +107,7 @@ function strip_path_quotes(path: text): text
 end
 
 function strip_trailing_slash(path: text): text
-  intent: remove a single trailing slash from path unless path is exactly "/"
+  intent: use ends_with to check path for a trailing slash and return the substring without it
   let n: integer = text_length(path)
   if n > 1 and ends_with(path, "/") then
     substring(path, 0, n - 1)
@@ -231,7 +231,7 @@ function exec_read_file_lines(args: a mapping from text to text): text
 end
 
 function screenshot_capture_cmd(path: text): text
-  intent: shell chain that tries grim then X11 screenshot tools in order, overwriting prior files
+  intent: build a shell command string with grim, scrot, import, and gnome-screenshot to capture to path
   "(grim " ++ path ++ " 2>/dev/null || scrot -o " ++ path ++ " 2>/dev/null || import -window root " ++ path ++ " 2>/dev/null || gnome-screenshot -f " ++ path ++ " 2>/dev/null)"
 end
 
@@ -574,12 +574,12 @@ function gemini_base_url(): text
 end
 
 function openrouter_base_url(): text
-  intent: return the OpenRouter OpenAI-compatible base URL
+  intent: return the openrouter.ai api URL string
   "https://openrouter.ai/api/v1"
 end
 
 function nims_base_url(): text
-  intent: return the NVIDIA NIM OpenAI-compatible base URL
+  intent: return the integrate.api.nvidia.com URL string for NIM
   "https://integrate.api.nvidia.com/v1"
 end
 
@@ -594,7 +594,7 @@ function is_openrouter_url(url: text): boolean
 end
 
 function is_groq_url(url: text): boolean
-  intent: return true when url points to the Groq cloud endpoint
+  intent: use contains_text to check if url contains groq.com
   contains_text(url, "groq.com")
 end
 
@@ -604,7 +604,7 @@ function is_nims_url(url: text): boolean
 end
 
 function backend_name(base_url: text): text
-  intent: return a human-readable backend label for base_url
+  intent: call is_gemini_url, is_nims_url, is_openrouter_url, and is_groq_url to return a label for base_url
   if is_gemini_url(base_url) then "Gemini"
   else if is_nims_url(base_url) then "NIM"
   else if is_openrouter_url(base_url) then "OpenRouter"
@@ -747,7 +747,7 @@ function truncate_tool_output(raw: text, max_chars: integer): text
 end
 
 function mask_old_tool_results(msgs: a list of a mapping from text to text, keep_recent: integer): a list of a mapping from text to text
-  intent: replace tool message content with a short marker for older messages to reduce context tokens
+  intent: iterate msgs and use put to replace content in tool role messages older than keep_recent with a marker string
   let total: integer = length(msgs)
   let mask_before: integer = max(total - keep_recent, 0)
   mutable result: a list of a mapping from text to text = []
@@ -1654,7 +1654,7 @@ function print_local_tool_mode(is_local: boolean, include_tools: boolean): nothi
 end
 
 function build_custom_provider(url: text, model_override: an optional text): a mapping from text to text
-  intent: build a provider mapping for an explicitly configured base URL
+  intent: call resolve_api_key and env_get to build a provider mapping for an explicitly configured url with model and fast_model
   let key: text = resolve_api_key(url)
   let default_model: text = if is_gemini_url(url) then "gemini-2.5-flash" else if is_nims_url(url) then "z-ai/glm-5.1" else if is_openrouter_url(url) then "openrouter/free" else if is_groq_url(url) then "openai/gpt-oss-120b" else "google/gemma-4-26b-a4b" end
   let model: text = unwrap_or(model_override, default_model)
@@ -1681,7 +1681,7 @@ function build_openrouter_provider(key: text, model_override: an optional text):
 end
 
 function build_groq_provider(key: text, model_override: an optional text): a mapping from text to text
-  intent: build a provider mapping for the Groq cloud API with its default models
+  intent: use unwrap_or and env_get to build a provider mapping for Groq with model, fast_model, and expert_model
   let model: text = unwrap_or(model_override, "openai/gpt-oss-120b")
   let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "openai/gpt-oss-20b")
   let expert_model: text = unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "")
@@ -1703,7 +1703,7 @@ function build_local_provider(model_override: an optional text): a mapping from 
 end
 
 function build_default_provider_list(model_override: an optional text, gemini_key_opt: an optional text, nims_key_opt: an optional text, openrouter_key_opt: an optional text, groq_key_opt: an optional text): a list of a mapping from text to text
-  intent: build the ordered fallback provider list based on which API keys are available
+  intent: use is_some and append to build the nims, gemini, openrouter, groq, and local provider fallback list
   let with_nims: a list of a mapping from text to text = if is_some(nims_key_opt) then [build_nims_provider(unwrap(nims_key_opt), model_override)] else [] end
   let with_gemini: a list of a mapping from text to text = if is_some(gemini_key_opt) then append(with_nims, build_gemini_provider(unwrap(gemini_key_opt), model_override)) else with_nims end
   let with_openrouter: a list of a mapping from text to text = if is_some(openrouter_key_opt) then append(with_gemini, build_openrouter_provider(unwrap(openrouter_key_opt), model_override)) else with_gemini end
@@ -1712,7 +1712,7 @@ function build_default_provider_list(model_override: an optional text, gemini_ke
 end
 
 function build_provider_list(): a list of a mapping from text to text
-  intent: pick single-provider mode if LEGIBLE_CODER_BASE_URL is set, otherwise build the auto-detected fallback list
+  intent: use env_get to read LEGIBLE_CODER_BASE_URL and is_some to pick build_custom_provider or build_default_provider_list
   let custom_url_opt: an optional text = env_get("LEGIBLE_CODER_BASE_URL")
   let model_override: an optional text = env_get("LEGIBLE_CODER_MODEL")
   if is_some(custom_url_opt) then

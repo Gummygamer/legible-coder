@@ -1,6 +1,6 @@
 # legible-coder
 
-An interactive CLI coding assistant written in the Legible programming language. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is `gemini-2.5-flash` via the Gemini API, with NVIDIA NIM (Nemotron), OpenRouter's free models router, and Groq as remote fallbacks.
+An interactive CLI coding assistant written in the Legible programming language. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. On the `experimental` branch, the default backend is a local `Legible-Nano` checkpoint shim, with NVIDIA NIM, Gemini, OpenRouter, Groq, and LM Studio kept as fallbacks.
 
 ## Architecture
 
@@ -36,7 +36,10 @@ The model has access to these tools:
 - `read_dir_recursive` — recursively list files (via `find`)
 - `grep` — search for patterns in files
 
-Local endpoints default to the manual `TOOL name JSON_arguments` protocol unless
+The Legible-Nano shim is exposed by `./legible-nano-server` at
+`http://127.0.0.1:8765/v1` and loads `../Legible-Nano/out/legible-nano/ckpt.pt`.
+It is a source-generation checkpoint, not a chat or tool-calling model, so keep
+changes around this path clearly marked as experimental. Local endpoints default to the manual `TOOL name JSON_arguments` protocol unless
 the model name looks like Gemma 4 or `LEGIBLE_CODER_LOCAL_TOOLS=1` is set. Set
 `LEGIBLE_CODER_LOCAL_TOOLS=0` to force the manual fallback for a local server
 whose OpenAI-compatible tool support is incomplete.

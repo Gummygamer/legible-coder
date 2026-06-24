@@ -585,6 +585,11 @@ function nims_base_url(): text
   "https://integrate.api.nvidia.com/v1"
 end
 
+function legible_nano_base_url(): text
+  intent: return http 127 0 0 1 8765 v1 for the local nano shim url
+  "http://127.0.0.1:8765/v1"
+end
+
 function is_gemini_url(url: text): boolean
   intent: return true when url points to the Google AI Gemini endpoint
   contains_text(url, "generativelanguage.googleapis.com")
@@ -605,12 +610,18 @@ function is_nims_url(url: text): boolean
   contains_text(url, "integrate.api.nvidia.com")
 end
 
+function is_legible_nano_url(url: text): boolean
+  intent: check if url contains 127 0 0 1 8765 or localhost 8765
+  contains_text(url, "127.0.0.1:8765") or contains_text(url, "localhost:8765")
+end
+
 function backend_name(base_url: text): text
   intent: call is_gemini_url, is_nims_url, is_openrouter_url, and is_groq_url to return a label for base_url
   if is_gemini_url(base_url) then "Gemini"
   else if is_nims_url(base_url) then "NIM"
   else if is_openrouter_url(base_url) then "OpenRouter"
   else if is_groq_url(base_url) then "Groq"
+  else if is_legible_nano_url(base_url) then "Legible-Nano"
   else "LM Studio (" ++ base_url ++ ")"
   end
 end
@@ -1077,8 +1088,8 @@ function parse_manual_tool_request(content: text): ManualToolRequest
       ManualToolRequest {valid: false, final: false, name: "", arguments: "", final_text: trimmed}
     end
   else if is_some(final_line) then
-    let line: text = trim(unwrap(final_line))
-    ManualToolRequest {valid: false, final: true, name: "", arguments: "", final_text: trim(substring(line, 6, text_length(line) - 6))}
+    let idx: integer = unwrap_or(index_of(trimmed, "FINAL:"), 0)
+    ManualToolRequest {valid: false, final: true, name: "", arguments: "", final_text: trim(substring(trimmed, idx + 6, text_length(trimmed) - idx - 6))}
   else
     ManualToolRequest {valid: false, final: false, name: "", arguments: "", final_text: trimmed}
   end
@@ -1538,6 +1549,8 @@ function resolve_api_key(base_url: text): text
   let explicit_key: an optional text = env_get("LEGIBLE_CODER_API_KEY")
   if is_some(explicit_key) then
     unwrap(explicit_key)
+  else if is_legible_nano_url(base_url) then
+    "legible-nano"
   else if is_gemini_url(base_url) then
     let gemini_key: an optional text = env_get("GEMINI_API_KEY")
     if is_none(gemini_key) then
@@ -1658,7 +1671,7 @@ end
 function build_custom_provider(url: text, model_override: an optional text): a mapping from text to text
   intent: call resolve_api_key and env_get to build a provider mapping for an explicitly configured url with model and fast_model
   let key: text = resolve_api_key(url)
-  let default_model: text = if is_gemini_url(url) then "gemini-2.5-flash" else if is_nims_url(url) then "z-ai/glm-5.1" else if is_openrouter_url(url) then "openrouter/free" else if is_groq_url(url) then "openai/gpt-oss-120b" else "google/gemma-4-26b-a4b" end
+  let default_model: text = if is_gemini_url(url) then "gemini-2.5-flash" else if is_nims_url(url) then "z-ai/glm-5.1" else if is_openrouter_url(url) then "openrouter/free" else if is_groq_url(url) then "openai/gpt-oss-120b" else if is_legible_nano_url(url) then "legible-nano-checkpoint" else "google/gemma-4-26b-a4b" end
   let model: text = unwrap_or(model_override, default_model)
   let url_is_local: boolean = contains_text(url, "localhost") or contains_text(url, "127.0.0.1")
   let fast_model: text = if url_is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), model) end
@@ -1698,19 +1711,26 @@ function build_nims_provider(key: text, model_override: an optional text): a map
   {"name": "NIM", "key": key, "url": nims_base_url(), "full": model, "fast": fast_model, "expert": expert_model}
 end
 
-function build_local_provider(model_override: an optional text): a mapping from text to text
+function build_legible_nano_provider(model_override: an optional text): a mapping from text to text
+  intent: build a provider mapping for the local experimental Legible-Nano checkpoint shim
+  let model: text = unwrap_or(model_override, "legible-nano-checkpoint")
+  {"name": "Legible-Nano", "key": "legible-nano", "url": legible_nano_base_url(), "full": model, "fast": "", "expert": ""}
+end
+
+function build_lm_studio_provider(model_override: an optional text): a mapping from text to text
   intent: build a provider mapping for the local LM Studio endpoint as the final fallback
   let model: text = unwrap_or(model_override, "google/gemma-4-26b-a4b")
   {"name": "LM Studio", "key": "lm-studio", "url": "http://localhost:1234/v1", "full": model, "fast": "", "expert": ""}
 end
 
 function build_default_provider_list(model_override: an optional text, gemini_key_opt: an optional text, nims_key_opt: an optional text, openrouter_key_opt: an optional text, groq_key_opt: an optional text): a list of a mapping from text to text
-  intent: use is_some and append to build the nims, gemini, openrouter, groq, and local provider fallback list
-  let with_nims: a list of a mapping from text to text = if is_some(nims_key_opt) then [build_nims_provider(unwrap(nims_key_opt), model_override)] else [] end
+  intent: use is_some and append to build the legible nano, nims, gemini, openrouter, groq, and local provider fallback list
+  let with_nano: a list of a mapping from text to text = [build_legible_nano_provider(model_override)]
+  let with_nims: a list of a mapping from text to text = if is_some(nims_key_opt) then append(with_nano, build_nims_provider(unwrap(nims_key_opt), model_override)) else with_nano end
   let with_gemini: a list of a mapping from text to text = if is_some(gemini_key_opt) then append(with_nims, build_gemini_provider(unwrap(gemini_key_opt), model_override)) else with_nims end
   let with_openrouter: a list of a mapping from text to text = if is_some(openrouter_key_opt) then append(with_gemini, build_openrouter_provider(unwrap(openrouter_key_opt), model_override)) else with_gemini end
   let with_groq: a list of a mapping from text to text = if is_some(groq_key_opt) then append(with_openrouter, build_groq_provider(unwrap(groq_key_opt), model_override)) else with_openrouter end
-  append(with_groq, build_local_provider(model_override))
+  append(with_groq, build_lm_studio_provider(model_override))
 end
 
 function build_provider_list(): a list of a mapping from text to text

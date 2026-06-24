@@ -1,11 +1,11 @@
 # legible-coder
 
-An interactive CLI coding assistant for the [Legible programming language](../legible/), styled after Claude Code. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is `gemini-2.5-flash` via the Gemini API, with OpenRouter's free models router as the first fallback when configured.
+An interactive CLI coding assistant for the [Legible programming language](../legible/), styled after Claude Code. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. On this experimental branch, the default backend is the local `Legible-Nano` checkpoint shim, with the existing remote providers and LM Studio kept as fallbacks when configured.
 
 ```
   legible-coder
   Interactive Legible coding assistant
-  Model: gemini-2.5-flash via Gemini
+  Model: legible-nano-checkpoint via Legible-Nano
   ────────────────────────────────────────────
   cwd: /your/project
   Type your request, or 'quit' to exit.
@@ -23,8 +23,8 @@ An interactive CLI coding assistant for the [Legible programming language](../le
 
 - The Legible interpreter (`legible` binary) in your `PATH`
 - SDL2 runtime libraries: `libsdl2-2.0-0` and `libsdl2-ttf-2.0-0` on Debian/Ubuntu
-- A [Gemini API key](https://aistudio.google.com/app/apikey)
-- Optional fallback keys: [OpenRouter](https://openrouter.ai/settings/keys), then [Groq](https://console.groq.com/)
+- The sibling [Legible-Nano](../Legible-Nano/) checkout with `out/legible-nano/ckpt.pt`
+- Optional fallback keys: [Gemini](https://aistudio.google.com/app/apikey), [OpenRouter](https://openrouter.ai/settings/keys), then [Groq](https://console.groq.com/)
 
 Build the interpreter from source:
 
@@ -56,12 +56,24 @@ legible run /path/to/legible-coder/coder.lbl
 ## Usage
 
 ```bash
+./legible-nano-server
+```
+
+In another shell:
+
+```bash
 export GEMINI_API_KEY="your-gemini-key-here"
 export OPENROUTER_API_KEY="your-openrouter-key-here"   # optional first fallback
 export GROQ_API_KEY="your-groq-key-here"               # optional second fallback
 cd your-project-directory
 legible-coder
 ```
+
+The Nano shim listens on `http://127.0.0.1:8765/v1` and exposes the
+`legible-nano-checkpoint` model through a minimal OpenAI-compatible
+`/chat/completions` endpoint. The checkpoint is a small Legible source model,
+not a chat or tool-calling model, so this path is best treated as a source
+generation experiment.
 
 For a local OpenAI-compatible server such as LM Studio:
 
@@ -154,8 +166,8 @@ legible-coder/
 | `OPENROUTER_API_KEY` | For OpenRouter | OpenRouter API key for the first fallback. Uses `openrouter/free` by default |
 | `GROQ_API_KEY` | For Groq | Groq API key for the second fallback |
 | `LEGIBLE_CODER_API_KEY` | No | Explicit API key override. Local endpoints default to `lm-studio` |
-| `LEGIBLE_CODER_BASE_URL` | No | OpenAI-compatible base URL. Auto-detects Gemini, OpenRouter, Groq, then local LM Studio when unset |
-| `LEGIBLE_CODER_MODEL` | No | Primary model. Default: `gemini-2.5-flash` for Gemini, `openrouter/free` for OpenRouter, `openai/gpt-oss-120b` for Groq |
+| `LEGIBLE_CODER_BASE_URL` | No | OpenAI-compatible base URL. Auto-detects Legible-Nano, Gemini, OpenRouter, Groq, then local LM Studio when unset |
+| `LEGIBLE_CODER_MODEL` | No | Primary model. Default: `legible-nano-checkpoint` for Legible-Nano, `gemini-2.5-flash` for Gemini, `openrouter/free` for OpenRouter, `openai/gpt-oss-120b` for Groq |
 | `LEGIBLE_CODER_FAST_MODEL` | No | Remote fast model for simple turns. Default: `gemini-2.5-flash-lite` for Gemini, `openrouter/free` for OpenRouter, `openai/gpt-oss-20b` for Groq |
 | `LEGIBLE_CODER_EXPERT_MODEL` | No | Optional remote expert model for architecture/refactor/design turns |
 | `LEGIBLE_CODER_LOCAL_TOOLS` | No | `1` forces native tools for local models, `0` forces manual local protocol. Gemma 4 names auto-enable native tools |
@@ -164,3 +176,6 @@ legible-coder/
 | `LEGIBLE_CODER_MAX_OUTPUT_TOKENS` | No | Response cap. Defaults: `750` local manual, `4096` local native tools, `16384` remote |
 | `LEGIBLE_CODER_CONTEXT_TOKENS` | No | Rough transcript compaction budget. Defaults: `16000` local, `90000` remote |
 | `LEGIBLE_CODER_CONTEXT_KEEP_MESSAGES` | No | Recent messages preserved verbatim during compaction. Defaults: `8` local, `12` remote |
+| `LEGIBLE_NANO_CHECKPOINT` | No | Checkpoint path for `./legible-nano-server`. Defaults to `../Legible-Nano/out/legible-nano/ckpt.pt` |
+| `LEGIBLE_NANO_PORT` | No | Port for the Nano shim. Defaults to `8765` |
+| `LEGIBLE_NANO_DEVICE` | No | `auto`, `cpu`, or `cuda` for the Nano shim. Defaults to `auto` |

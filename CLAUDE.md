@@ -36,6 +36,11 @@ The model has access to these tools:
 - `read_dir_recursive` — recursively list files (via `find`)
 - `grep` — search for patterns in files
 
+`write_file` strips a wrapping markdown code fence from the content (some
+models, notably on NIM, wrap file content in ``` fences) and runs
+`legible check` on written `.lbl` files, feeding any errors back to the model
+in the tool result so it can immediately rewrite the file.
+
 Local endpoints default to the manual `TOOL name JSON_arguments` protocol unless
 the model name looks like Gemma 4 or `LEGIBLE_CODER_LOCAL_TOOLS=1` is set. Set
 `LEGIBLE_CODER_LOCAL_TOOLS=0` to force the manual fallback for a local server

@@ -169,10 +169,43 @@ end
 
 -- ─── Tool execution ───────────────────────────────────────────────────────────
 
+function strip_code_fences(content: text): text
+  intent: trim content and when it starts_with a markdown fence split the lines, drop the fence lines, and join the inner lines back
+  let trimmed: text = trim(content)
+  if not starts_with(trimmed, "```") then
+    content
+  else
+    let lines: a list of text = split(trimmed, "\n")
+    let n: integer = length(lines)
+    if n >= 2 and trim(unwrap_or(get(lines, n - 1), "")) == "```" then
+      mutable inner: a list of text = []
+      mutable i: integer = 1
+      while i <= n - 2 do
+        set inner = append(inner, unwrap_or(get(lines, i), ""))
+        set i = i + 1
+      end
+      join(inner, "\n") ++ "\n"
+    else
+      content
+    end
+  end
+end
+
+function legible_check_report(path: text): text
+  intent: run legible check on a written .lbl file and return its error output or empty text
+  if not ends_with(path, ".lbl") then
+    ""
+  else
+    let cmd: text = "if command -v legible >/dev/null 2>&1; then legible check \"" ++ path ++ "\" 2>&1 | head -40; fi"
+    let output: text = trim(get(shell_exec(cmd), "stdout"))
+    if text_length(output) == 0 or contains_text(output, "No errors found") then "" else output end
+  end
+end
+
 function exec_write_file(args: a mapping from text to text): text
-  intent: write content to path and print a diff if the file already existed
+  intent: write content to path, print a diff if the file existed, and run legible_check_report on .lbl files
   let path: text = get(args, "path")
-  let content: text = get(args, "content")
+  let content: text = strip_code_fences(get(args, "content"))
   -- ensure the parent directory exists so writes to new subdirs don't fail
   let ignored: a mapping from text to text = shell_exec("mkdir -p \"$(dirname \"" ++ path ++ "\")\"")
   if file_exists(path) then
@@ -187,7 +220,12 @@ function exec_write_file(args: a mapping from text to text): text
   else
     write_file(path, content)
   end
-  "File written successfully: " ++ path
+  let check_report: text = legible_check_report(path)
+  if text_length(check_report) == 0 then
+    "File written successfully: " ++ path
+  else
+    "File written: " ++ path ++ "\nWARNING: legible check found errors in the file you just wrote:\n" ++ check_report ++ "\nFix these errors and call write_file again with corrected code."
+  end
 end
 
 function exec_shell(args: a mapping from text to text): text
@@ -430,6 +468,8 @@ function prompt_rules(): text
   "- if-branches cannot be empty; use skip() as a no-op: if cond then skip() end\n" ++
   "- Avoid Unicode characters in code: use ASCII dash - not em-dash, straight quotes not curly quotes\n" ++
   "- Write code to files with write_file, then run with shell_exec\n" ++
+  "- write_file content must be the raw file text; never wrap it in markdown code fences\n" ++
+  "- If a write_file result reports legible check errors, fix them and rewrite the file before doing anything else\n" ++
   "- Keep responses concise; use tools to act rather than describing what you would do\n" ++
   "- Do NOT repeat the same tool call in one turn; if you already read a file or listed a directory, use what you have and answer\n" ++
   "- You have a limited tool budget per turn; gather what you need efficiently and then provide your answer"

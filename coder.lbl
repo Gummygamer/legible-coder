@@ -1444,9 +1444,51 @@ function handle_text_response(msg: a mapping from text to text, msgs: a list of 
   end
 end
 
-function handle_success_response(resp_body: text, include_tools: boolean, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, round: integer, force_text: boolean, explore_count: integer, acted: boolean, include_vision: boolean): LoopStep
-  intent: process a successful API response and return the next loop state
-  let no_choices_step: LoopStep = LoopStep {
+function empty_response_detail(resp_body: text): text
+  intent: return a short excerpt of the response body for an empty-response diagnostic
+  let flat: text = trim(resp_body)
+  if text_length(flat) > 500 then
+    substring(flat, 0, 500) ++ "... (truncated)"
+  else
+    flat
+  end
+end
+
+function handle_empty_text_response(resp_body: text, finish: text, msgs: a list of a mapping from text to text, total_tools: integer, last_batch: text, force_text: boolean, explore_count: integer, acted: boolean): LoopStep
+  intent: ask once for a plain-text answer when the model returns empty content, then report an explicit diagnostic instead of stopping silently
+  if not force_text then
+    print("  [warn] model returned status 200 with empty text (finish_reason=" ++ finish ++ "); asking once for a plain-text answer]")
+    LoopStep {
+      messages: append(msgs, {"role": "user", "content": "Your last response contained no text at all. Do not call any tools. Write your complete answer as plain text now."}),
+      count: total_tools,
+      last_batch: last_batch,
+      waiting: true,
+      must_force_text: true,
+      explore_count: explore_count,
+      acted: acted
+    }
+  else
+    print("")
+    print_separator()
+    print("  [error] the model returned status 200 but no assistant text (finish_reason=" ++ finish ++ ").")
+    print("  response body: " ++ empty_response_detail(resp_body))
+    print_separator()
+    print("")
+    LoopStep {
+      messages: msgs,
+      count: total_tools,
+      last_batch: last_batch,
+      waiting: false,
+      must_force_text: false,
+      explore_count: explore_count,
+      acted: acted
+    }
+  end
+end
+
+function terminal_loop_step(msgs: a list of a mapping from text to text, total_tools: integer, last_batch: text, explore_count: integer, acted: boolean): LoopStep
+  intent: return a LoopStep that stops the current response loop
+  LoopStep {
     messages: msgs,
     count: total_tools,
     last_batch: last_batch,
@@ -1455,14 +1497,18 @@ function handle_success_response(resp_body: text, include_tools: boolean, msgs: 
     explore_count: explore_count,
     acted: acted
   }
+end
+
+function handle_success_response(resp_body: text, include_tools: boolean, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, round: integer, force_text: boolean, explore_count: integer, acted: boolean, include_vision: boolean): LoopStep
+  intent: process a successful API response and return the next loop state
   if not json_valid(resp_body) or not starts_with(trim(resp_body), "\{") then
     print("  API error: non-JSON response body")
-    no_choices_step
+    terminal_loop_step(msgs, total_tools, last_batch, explore_count, acted)
   else
     let parsed: a mapping from text to text = json_parse(resp_body)
     if not has_key(parsed, "choices") or length(get(parsed, "choices")) == 0 then
       print("  API error: no choices in response: " ++ extract_error_message(resp_body))
-      no_choices_step
+      terminal_loop_step(msgs, total_tools, last_batch, explore_count, acted)
     else
       let choice: a mapping from text to text = get(get(parsed, "choices"), 0)
       let msg: a mapping from text to text = get(choice, "message")
@@ -1473,6 +1519,8 @@ function handle_success_response(resp_body: text, include_tools: boolean, msgs: 
         handle_length_finish(msg, msgs, total_tools, last_batch, explore_count, acted)
       else if finish == "tool_calls" or length(unwrap_or(get(msg, "tool_calls"), [])) > 0 then
         handle_tool_round(msg, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted, include_vision)
+      else if text_length(unwrap_or(get(msg, "content"), "")) == 0 then
+        handle_empty_text_response(resp_body, finish, msgs, total_tools, last_batch, force_text, explore_count, acted)
       else
         LoopStep {
           messages: handle_text_response(msg, msgs),
@@ -1499,6 +1547,26 @@ function compact_loop_messages(msgs: a list of a mapping from text to text, cont
     print("  [context] compacted transcript " ++ to_text(tokens_before) ++ " -> " ++ to_text(tokens_after) ++ " estimated tokens")
   end
   compacted
+end
+
+function finish_inner_loop(msgs: a list of a mapping from text to text, messages_start: integer, last_is_assistant_text: boolean): a list of a mapping from text to text
+  intent: warn and append a placeholder assistant message when a changed turn has no assistant text
+  if length(msgs) > messages_start and not last_is_assistant_text then
+    print("  [warn] this turn ended without an assistant reply; see the diagnostics above]")
+    append(msgs, {"role": "assistant", "content": "(no answer text was produced for this turn)"})
+  else
+    msgs
+  end
+end
+
+function last_message_is_assistant_text(msgs: a list of a mapping from text to text): boolean
+  intent: return true when the final message is an assistant message carrying non-empty text
+  if length(msgs) == 0 then
+    false
+  else
+    let last_msg: a mapping from text to text = get(msgs, length(msgs) - 1)
+    unwrap_or(get(last_msg, "role"), "") == "assistant" and text_length(unwrap_or(get(last_msg, "content"), "")) > 0
+  end
 end
 
 function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer, include_vision: boolean): a list of a mapping from text to text
@@ -1539,7 +1607,7 @@ function run_inner_loop(init_messages: a list of a mapping from text to text, me
       set waiting = false
     end
   end
-  msgs
+  finish_inner_loop(msgs, messages_start, last_message_is_assistant_text(msgs))
 end
 
 -- ─── Model selection ─────────────────────────────────────────────────────────

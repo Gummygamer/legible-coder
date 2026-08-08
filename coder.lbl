@@ -1,7 +1,7 @@
 -- legible-coder: an interactive CLI coding assistant for the Legible language
 -- Default backend: NIM (NVIDIA_API_KEY), falls back to Gemini (GEMINI_API_KEY), OpenRouter (OPENROUTER_API_KEY), Groq (GROQ_API_KEY), then LM Studio
 -- Override with LEGIBLE_CODER_MODEL and LEGIBLE_CODER_BASE_URL env vars
--- Default model: z-ai/glm-5.1 via NVIDIA NIM
+-- Default model: z-ai/glm-5.2 via NVIDIA NIM
 
 -- ─── Tool schema helpers ──────────────────────────────────────────────────────
 
@@ -1620,7 +1620,7 @@ end
 
 function resolve_context_budget(tier: text): integer
   intent: read LEGIBLE_CODER_CONTEXT_TOKENS or use a provider-appropriate token budget before compaction
-  -- gemini-2.5-flash has a 1M token context, glm-5.1 has 131K, groq models vary but 90K is safe, local is very limited
+  -- gemini-2.5-flash has a 1M token context, glm-5.2 has 131K, groq models vary but 90K is safe, local is very limited
   let default_text: text = if tier == "local" then "6000" else if tier == "gemini" then "700000" else if tier == "nims" then "120000" else "90000" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_TOKENS"), default_text)
   max(to_integer(raw), 1000)
@@ -1635,7 +1635,7 @@ end
 
 function resolve_max_output_tokens(tier: text, include_tools: boolean): integer
   intent: read LEGIBLE_CODER_MAX_OUTPUT_TOKENS or pick a default suited to the backend
-  -- gemini-2.5-flash supports up to 65K output, glm-5.1 supports up to 131K, groq up to ~16K, local is small
+  -- gemini-2.5-flash supports up to 65K output, glm-5.2 supports up to 131K, groq up to ~16K, local is small
   let default_text: text = if tier == "local" and include_tools then "4096" else if tier == "local" then "750" else if tier == "gemini" then "32768" else if tier == "nims" then "32768" else "16384" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_MAX_OUTPUT_TOKENS"), default_text)
   max(to_integer(raw), 128)
@@ -1698,7 +1698,7 @@ end
 function build_custom_provider(url: text, model_override: an optional text): a mapping from text to text
   intent: call resolve_api_key and env_get to build a provider mapping for an explicitly configured url with model and fast_model
   let key: text = resolve_api_key(url)
-  let default_model: text = if is_gemini_url(url) then "gemini-2.5-flash" else if is_nims_url(url) then "z-ai/glm-5.1" else if is_openrouter_url(url) then "openrouter/free" else if is_groq_url(url) then "openai/gpt-oss-120b" else "google/gemma-4-26b-a4b" end
+  let default_model: text = if is_gemini_url(url) then "gemini-2.5-flash" else if is_nims_url(url) then "z-ai/glm-5.2" else if is_openrouter_url(url) then "openrouter/free" else if is_groq_url(url) then "openai/gpt-oss-120b" else "google/gemma-4-26b-a4b" end
   let model: text = unwrap_or(model_override, default_model)
   let url_is_local: boolean = contains_text(url, "localhost") or contains_text(url, "127.0.0.1")
   let fast_model: text = if url_is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), model) end
@@ -1731,9 +1731,9 @@ function build_groq_provider(key: text, model_override: an optional text): a map
 end
 
 function build_nims_provider(key: text, model_override: an optional text): a mapping from text to text
-  intent: build a provider mapping for the NVIDIA NIM API using the GLM-5.1 model
-  let model: text = unwrap_or(model_override, "z-ai/glm-5.1")
-  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "z-ai/glm-5.1")
+  intent: build a provider mapping for the NVIDIA NIM API using the GLM-5.2 model
+  let model: text = unwrap_or(model_override, "z-ai/glm-5.2")
+  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "z-ai/glm-5.2")
   let expert_model: text = unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "")
   {"name": "NIM", "key": key, "url": nims_base_url(), "full": model, "fast": fast_model, "expert": expert_model}
 end

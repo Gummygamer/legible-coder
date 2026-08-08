@@ -1445,7 +1445,7 @@ function handle_text_response(msg: a mapping from text to text, msgs: a list of 
 end
 
 function empty_response_detail(resp_body: text): text
-  intent: return a short excerpt of the response body for an empty-response diagnostic
+  intent: trim resp_body into flat and use substring to keep 500 characters marked truncated when its text_length exceeds 500
   let flat: text = trim(resp_body)
   if text_length(flat) > 500 then
     substring(flat, 0, 500) ++ "... (truncated)"
@@ -1560,7 +1560,7 @@ function finish_inner_loop(msgs: a list of a mapping from text to text, messages
 end
 
 function last_message_is_assistant_text(msgs: a list of a mapping from text to text): boolean
-  intent: return true when the final message is an assistant message carrying non-empty text
+  intent: get the last_msg from msgs and check its role is assistant and the text_length of its content is greater than 0
   if length(msgs) == 0 then
     false
   else

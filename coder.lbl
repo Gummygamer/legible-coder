@@ -1766,7 +1766,7 @@ end
 function build_custom_provider(url: text, model_override: an optional text): a mapping from text to text
   intent: call resolve_api_key and env_get to build a provider mapping for an explicitly configured url with model and fast_model
   let key: text = resolve_api_key(url)
-  let default_model: text = if is_gemini_url(url) then "gemini-2.5-flash" else if is_nims_url(url) then "z-ai/glm-5.2" else if is_openrouter_url(url) then "openrouter/free" else if is_groq_url(url) then "openai/gpt-oss-120b" else "google/gemma-4-26b-a4b" end
+  let default_model: text = if is_gemini_url(url) then "gemini-2.5-flash" else if is_nims_url(url) then "deepseek-ai/deepseek-v4-flash-0731" else if is_openrouter_url(url) then "openrouter/free" else if is_groq_url(url) then "openai/gpt-oss-120b" else "google/gemma-4-26b-a4b" end
   let model: text = unwrap_or(model_override, default_model)
   let url_is_local: boolean = contains_text(url, "localhost") or contains_text(url, "127.0.0.1")
   let fast_model: text = if url_is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), model) end
@@ -1799,9 +1799,9 @@ function build_groq_provider(key: text, model_override: an optional text): a map
 end
 
 function build_nims_provider(key: text, model_override: an optional text): a mapping from text to text
-  intent: build a provider mapping for the NVIDIA NIM API using the GLM-5.2 model
-  let model: text = unwrap_or(model_override, "z-ai/glm-5.2")
-  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "z-ai/glm-5.2")
+  intent: build a provider mapping for the NVIDIA NIM API using the deepseek-v4-flash-0731 model
+  let model: text = unwrap_or(model_override, "deepseek-ai/deepseek-v4-flash-0731")
+  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "deepseek-ai/deepseek-v4-flash-0731")
   let expert_model: text = unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "")
   {"name": "NIM", "key": key, "url": nims_base_url(), "full": model, "fast": fast_model, "expert": expert_model}
 end

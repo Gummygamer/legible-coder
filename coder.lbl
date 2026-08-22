@@ -143,6 +143,23 @@ function strip_redundant_cd(command: text): text
   end
 end
 
+function normalize_tool_call_arguments(arguments: text): text
+  intent: json_parse arguments into a mapping, use keys and get and to_text and is_none to coerce every value to text, then put each into a normalized mapping and json_encode it
+  if not json_valid(arguments) then
+    arguments
+  else
+    let args: a mapping from text to text = json_parse(arguments)
+    let ks: a list of text = keys(args)
+    mutable normalized: a mapping from text to text = {}
+    for k in ks do
+      let raw: text = get(args, k)
+      let coerced: text = if is_none(raw) then raw else to_text(raw) end
+      set normalized = put(normalized, k, coerced)
+    end
+    json_encode(normalized)
+  end
+end
+
 function describe_tool_call(name: text, arguments: text): text
   intent: format name with its path, command, or pattern argument as a short label
   let args: a mapping from text to text = json_parse(arguments)
@@ -723,7 +740,7 @@ function run_tool_batch(messages: a list of a mapping from text to text, valid_c
     let fn_info: a mapping from text to text = get(tc, "function")
     let tc_id: text = unwrap_or(get(tc, "id"), "")
     let fn_name: text = clean_tool_name(get(fn_info, "name"))
-    let fn_args: text = get(fn_info, "arguments")
+    let fn_args: text = normalize_tool_call_arguments(get(fn_info, "arguments"))
     set n = n + 1
     print("  [" ++ to_text(n) ++ "] " ++ describe_tool_call(fn_name, fn_args))
     let raw: text = execute_tool(fn_name, fn_args)

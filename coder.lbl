@@ -1,7 +1,7 @@
 -- legible-coder: an interactive CLI coding assistant for the Legible language
--- Default backend: NIM (NVIDIA_API_KEY), falls back to Gemini (GEMINI_API_KEY), OpenRouter (OPENROUTER_API_KEY), Groq (GROQ_API_KEY), then LM Studio
+-- Default backend: Gemini (GEMINI_API_KEY), falls back to OrcaRouter (ORCAROUTER_API_KEY), NIM (NVIDIA_API_KEY), OpenRouter (OPENROUTER_API_KEY), Groq (GROQ_API_KEY), then LM Studio
 -- Override with LEGIBLE_CODER_MODEL and LEGIBLE_CODER_BASE_URL env vars
--- Default model: z-ai/glm-5.2 via NVIDIA NIM
+-- Default model: gemini-3.7-flash via Gemini
 
 -- ─── Tool schema helpers ──────────────────────────────────────────────────────
 
@@ -625,6 +625,18 @@ function call_api(api_key: text, base_url: text, request_body: a mapping from te
   http_client_post(base_url ++ "/chat/completions", headers, json_encode(request_body))
 end
 
+function shell_quote(value: text): text
+  intent: concatenate quoted text around value after replace escapes its single quotes
+  "'" ++ replace(value, "'", "'\"'\"'") ++ "'"
+end
+
+function provider_is_reachable(base_url: text): boolean
+  intent: use curl through shell_exec to check whether the provider endpoint is reachable before calling its model
+  let url: text = shell_quote(base_url ++ "/models")
+  let cmd: text = "if ! command -v curl >/dev/null 2>&1; then exit 0; fi; curl --silent --output /dev/null --connect-timeout 5 --max-time 15 " ++ url
+  to_text(get(shell_exec(cmd), "exit_code")) == "0"
+end
+
 -- ─── Provider helpers ─────────────────────────────────────────────────────────
 
 function gemini_base_url(): text
@@ -635,6 +647,11 @@ end
 function openrouter_base_url(): text
   intent: return the openrouter.ai api URL string
   "https://openrouter.ai/api/v1"
+end
+
+function orcarouter_base_url(): text
+  intent: return the api.orcarouter.ai URL string
+  "https://api.orcarouter.ai/v1"
 end
 
 function nims_base_url(): text
@@ -652,6 +669,11 @@ function is_openrouter_url(url: text): boolean
   contains_text(url, "openrouter.ai")
 end
 
+function is_orcarouter_url(url: text): boolean
+  intent: return true when url points to the OrcaRouter endpoint
+  contains_text(url, "orcarouter.ai")
+end
+
 function is_groq_url(url: text): boolean
   intent: use contains_text to check if url contains groq.com
   contains_text(url, "groq.com")
@@ -663,8 +685,9 @@ function is_nims_url(url: text): boolean
 end
 
 function backend_name(base_url: text): text
-  intent: call is_gemini_url, is_nims_url, is_openrouter_url, and is_groq_url to return a label for base_url
+  intent: call is_gemini_url, is_orcarouter_url, is_nims_url, is_openrouter_url, and is_groq_url to return a label for base_url
   if is_gemini_url(base_url) then "Gemini"
+  else if is_orcarouter_url(base_url) then "OrcaRouter"
   else if is_nims_url(base_url) then "NIM"
   else if is_openrouter_url(base_url) then "OpenRouter"
   else if is_groq_url(base_url) then "Groq"
@@ -673,8 +696,9 @@ function backend_name(base_url: text): text
 end
 
 function provider_tier(base_url: text): text
-  intent: return gemini nims openrouter groq or local based on the base URL for context-window tuning
+  intent: return gemini orcarouter nims openrouter groq or local based on the base URL for context-window tuning
   if is_gemini_url(base_url) then "gemini"
+  else if is_orcarouter_url(base_url) then "orcarouter"
   else if is_nims_url(base_url) then "nims"
   else if is_openrouter_url(base_url) then "openrouter"
   else if is_groq_url(base_url) then "groq"
@@ -719,6 +743,11 @@ record LoopStep
   must_force_text: boolean
   explore_count: integer
   acted: boolean
+end
+
+record InnerLoopResult
+  messages: a list of a mapping from text to text
+  used_model: boolean
 end
 
 record ManualToolRequest
@@ -1586,10 +1615,11 @@ function last_message_is_assistant_text(msgs: a list of a mapping from text to t
   end
 end
 
-function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer, include_vision: boolean): a list of a mapping from text to text
-  intent: call the API in a loop executing tool calls until text response or round limit
+function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer, include_vision: boolean): InnerLoopResult
+  intent: call the API in a loop executing tool calls and return messages plus whether the model was used successfully
   mutable msgs: a list of a mapping from text to text = init_messages
   mutable waiting: boolean = true
+  mutable used_model: boolean = false
   mutable round: integer = 0
   mutable total_tools: integer = 0
   mutable last_batch: text = ""
@@ -1610,6 +1640,7 @@ function run_inner_loop(init_messages: a list of a mapping from text to text, me
       set msgs = take(msgs, messages_start)
       set waiting = false
     else
+      set used_model = true
       let step: LoopStep = handle_success_response(get(resp, "body"), include_tools, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted, include_vision)
       set msgs = step.messages
       set total_tools = step.count
@@ -1624,7 +1655,7 @@ function run_inner_loop(init_messages: a list of a mapping from text to text, me
       set waiting = false
     end
   end
-  finish_inner_loop(msgs, messages_start, last_message_is_assistant_text(msgs))
+  InnerLoopResult {messages: finish_inner_loop(msgs, messages_start, last_message_is_assistant_text(msgs)), used_model: used_model}
 end
 
 -- ─── Model selection ─────────────────────────────────────────────────────────
@@ -1658,39 +1689,31 @@ end
 
 -- ─── Main loop ────────────────────────────────────────────────────────────────
 
+function require_provider_api_key(env_name: text, provider_name: text): text
+  intent: read env_name and return its API key or print a provider-specific error and exit
+  let key_opt: an optional text = env_get(env_name)
+  if is_none(key_opt) then
+    print("Error: " ++ env_name ++ " is not set for " ++ provider_name ++ ". Set it or use LEGIBLE_CODER_API_KEY.")
+    exit_process(1)
+  end
+  unwrap(key_opt)
+end
+
 function resolve_api_key(base_url: text): text
   intent: return LEGIBLE_CODER_API_KEY if set, then the provider-specific key, or lm-studio for local
   let explicit_key: an optional text = env_get("LEGIBLE_CODER_API_KEY")
   if is_some(explicit_key) then
     unwrap(explicit_key)
   else if is_gemini_url(base_url) then
-    let gemini_key: an optional text = env_get("GEMINI_API_KEY")
-    if is_none(gemini_key) then
-      print("Error: GEMINI_API_KEY is not set. Set it or use LEGIBLE_CODER_API_KEY.")
-      exit_process(1)
-    end
-    unwrap(gemini_key)
+    require_provider_api_key("GEMINI_API_KEY", "Gemini")
+  else if is_orcarouter_url(base_url) then
+    require_provider_api_key("ORCAROUTER_API_KEY", "OrcaRouter")
   else if is_openrouter_url(base_url) then
-    let openrouter_key: an optional text = env_get("OPENROUTER_API_KEY")
-    if is_none(openrouter_key) then
-      print("Error: OPENROUTER_API_KEY is not set. Set it or use LEGIBLE_CODER_API_KEY.")
-      exit_process(1)
-    end
-    unwrap(openrouter_key)
+    require_provider_api_key("OPENROUTER_API_KEY", "OpenRouter")
   else if is_nims_url(base_url) then
-    let nims_key: an optional text = env_get("NVIDIA_API_KEY")
-    if is_none(nims_key) then
-      print("Error: NVIDIA_API_KEY is not set. Set it or use LEGIBLE_CODER_API_KEY.")
-      exit_process(1)
-    end
-    unwrap(nims_key)
+    require_provider_api_key("NVIDIA_API_KEY", "NIM")
   else if is_groq_url(base_url) then
-    let groq_key: an optional text = env_get("GROQ_API_KEY")
-    if is_none(groq_key) then
-      print("Error: GROQ_API_KEY is not set. Set it or use LEGIBLE_CODER_API_KEY.")
-      exit_process(1)
-    end
-    unwrap(groq_key)
+    require_provider_api_key("GROQ_API_KEY", "Groq")
   else
     "lm-studio"
   end
@@ -1705,8 +1728,8 @@ end
 
 function resolve_context_budget(tier: text): integer
   intent: read LEGIBLE_CODER_CONTEXT_TOKENS or use a provider-appropriate token budget before compaction
-  -- gemini-3.7-flash has a 1M token context, glm-5.2 has 131K, groq models vary but 90K is safe, local is very limited
-  let default_text: text = if tier == "local" then "6000" else if tier == "gemini" then "700000" else if tier == "nims" then "120000" else "90000" end
+  -- gemini-3.7-flash has a 1M token context, OrcaRouter Qwen3.8 has 65K, NIM has 131K, local is very limited
+  let default_text: text = if tier == "local" then "6000" else if tier == "gemini" then "700000" else if tier == "orcarouter" then "60000" else if tier == "nims" then "120000" else "90000" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_TOKENS"), default_text)
   max(to_integer(raw), 1000)
 end
@@ -1783,7 +1806,7 @@ end
 function build_custom_provider(url: text, model_override: an optional text): a mapping from text to text
   intent: call resolve_api_key and env_get to build a provider mapping for an explicitly configured url with model and fast_model
   let key: text = resolve_api_key(url)
-  let default_model: text = if is_gemini_url(url) then "gemini-3.7-flash" else if is_nims_url(url) then "deepseek-ai/deepseek-v4-flash-0731" else if is_openrouter_url(url) then "openrouter/free" else if is_groq_url(url) then "openai/gpt-oss-120b" else "google/gemma-4-26b-a4b" end
+  let default_model: text = if is_gemini_url(url) then "gemini-3.7-flash" else if is_orcarouter_url(url) then "qwen/qwen3.8-27b-free" else if is_nims_url(url) then "deepseek-ai/deepseek-v4-flash-0731" else if is_openrouter_url(url) then "openrouter/free" else if is_groq_url(url) then "openai/gpt-oss-120b" else "google/gemma-4-26b-a4b" end
   let model: text = unwrap_or(model_override, default_model)
   let url_is_local: boolean = contains_text(url, "localhost") or contains_text(url, "127.0.0.1")
   let fast_model: text = if url_is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), model) end
@@ -1797,6 +1820,14 @@ function build_gemini_provider(key: text, model_override: an optional text): a m
   let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "gemini-3.7-flash-lite")
   let expert_model: text = unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "")
   {"name": "Gemini", "key": key, "url": gemini_base_url(), "full": model, "fast": fast_model, "expert": expert_model}
+end
+
+function build_orcarouter_provider(key: text, model_override: an optional text): a mapping from text to text
+  intent: build a provider mapping for OrcaRouter using the free Qwen3.8 27B model
+  let model: text = unwrap_or(model_override, "qwen/qwen3.8-27b-free")
+  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "qwen/qwen3.8-27b-free")
+  let expert_model: text = unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "")
+  {"name": "OrcaRouter", "key": key, "url": orcarouter_base_url(), "full": model, "fast": fast_model, "expert": expert_model}
 end
 
 function build_openrouter_provider(key: text, model_override: an optional text): a mapping from text to text
@@ -1829,10 +1860,11 @@ function build_local_provider(model_override: an optional text): a mapping from 
   {"name": "LM Studio", "key": "lm-studio", "url": "http://localhost:1234/v1", "full": model, "fast": "", "expert": ""}
 end
 
-function build_default_provider_list(model_override: an optional text, gemini_key_opt: an optional text, nims_key_opt: an optional text, openrouter_key_opt: an optional text, groq_key_opt: an optional text): a list of a mapping from text to text
-  intent: use is_some and append to build the nims, gemini, openrouter, groq, and local provider fallback list
+function build_default_provider_list(model_override: an optional text, gemini_key_opt: an optional text, orcarouter_key_opt: an optional text, nims_key_opt: an optional text, openrouter_key_opt: an optional text, groq_key_opt: an optional text): a list of a mapping from text to text
+  intent: use is_some and append to build the gemini, orcarouter, nims, openrouter, groq, and local provider fallback list
   let with_gemini: a list of a mapping from text to text = if is_some(gemini_key_opt) then [build_gemini_provider(unwrap(gemini_key_opt), model_override)] else [] end
-  let with_nims: a list of a mapping from text to text = if is_some(nims_key_opt) then append(with_gemini, build_nims_provider(unwrap(nims_key_opt), model_override)) else with_gemini end
+  let with_orcarouter: a list of a mapping from text to text = if is_some(orcarouter_key_opt) then append(with_gemini, build_orcarouter_provider(unwrap(orcarouter_key_opt), model_override)) else with_gemini end
+  let with_nims: a list of a mapping from text to text = if is_some(nims_key_opt) then append(with_orcarouter, build_nims_provider(unwrap(nims_key_opt), model_override)) else with_orcarouter end
   let with_openrouter: a list of a mapping from text to text = if is_some(openrouter_key_opt) then append(with_nims, build_openrouter_provider(unwrap(openrouter_key_opt), model_override)) else with_nims end
   let with_groq: a list of a mapping from text to text = if is_some(groq_key_opt) then append(with_openrouter, build_groq_provider(unwrap(groq_key_opt), model_override)) else with_openrouter end
   append(with_groq, build_local_provider(model_override))
@@ -1845,42 +1877,58 @@ function build_provider_list(): a list of a mapping from text to text
   if is_some(custom_url_opt) then
     [build_custom_provider(unwrap(custom_url_opt), model_override)]
   else
-    build_default_provider_list(model_override, env_get("GEMINI_API_KEY"), env_get("NVIDIA_API_KEY"), env_get("OPENROUTER_API_KEY"), env_get("GROQ_API_KEY"))
+    build_default_provider_list(model_override, env_get("GEMINI_API_KEY"), env_get("ORCAROUTER_API_KEY"), env_get("NVIDIA_API_KEY"), env_get("OPENROUTER_API_KEY"), env_get("GROQ_API_KEY"))
   end
 end
 
-function print_turn_model_banner(try_idx: integer, prov: a mapping from text to text, turn_model: text, p_full: text, p_fast: text, p_expert: text): nothing
+function print_turn_model_banner(provider_idx: integer, switched: boolean, prov: a mapping from text to text, turn_model: text, p_full: text, p_fast: text, p_expert: text): nothing
   intent: print the fallback notice or the expert/fast model banner before a turn runs
-  if try_idx > 0 then
+  if provider_idx > 0 or switched then
     print("  [fallback] trying " ++ get(prov, "name") ++ " with model " ++ turn_model)
   end
-  if try_idx == 0 and turn_model == p_expert and text_length(p_expert) > 0 then
+  if provider_idx == 0 and not switched and turn_model == p_expert and text_length(p_expert) > 0 then
     print("  [expert model: " ++ p_expert ++ "]")
   end
-  if try_idx == 0 and turn_model == p_fast and text_length(p_fast) > 0 and p_fast != p_full then
+  if provider_idx == 0 and not switched and turn_model == p_fast and text_length(p_fast) > 0 and p_fast != p_full then
     print("  [fast model: " ++ p_fast ++ "]")
   end
 end
 
 function run_turn_with_fallback(messages: a list of a mapping from text to text, user_input: text, start: integer, providers: a list of a mapping from text to text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer, include_vision: boolean): a list of a mapping from text to text
-  intent: try each provider in order for one turn, returning updated messages when one succeeds or after all have failed
+  intent: cycle providers until the turn succeeds or every provider fails consecutively since the last successful model usage
   mutable msgs: a list of a mapping from text to text = messages
-  mutable try_idx: integer = 0
+  mutable provider_idx: integer = 0
+  mutable consecutive_failures: integer = 0
+  mutable attempts: integer = 0
   mutable turn_done: boolean = false
   while not turn_done do
-    let prov: a mapping from text to text = get(providers, try_idx)
+    let prov: a mapping from text to text = get(providers, provider_idx)
     let p_full: text = get(prov, "full")
     let p_fast: text = get(prov, "fast")
     let p_expert: text = get(prov, "expert")
     let turn_model: text = pick_model(user_input, p_full, p_fast, p_expert)
-    print_turn_model_banner(try_idx, prov, turn_model, p_full, p_fast, p_expert)
-    set msgs = run_inner_loop(msgs, start, get(prov, "key"), get(prov, "url"), turn_model, max_tools, include_tools, include_dir_tools, max_output_tokens, context_budget, preserve_recent_messages, include_vision)
+    print_turn_model_banner(provider_idx, attempts > 0, prov, turn_model, p_full, p_fast, p_expert)
+    if provider_is_reachable(get(prov, "url")) then
+      let inner: InnerLoopResult = run_inner_loop(msgs, start, get(prov, "key"), get(prov, "url"), turn_model, max_tools, include_tools, include_dir_tools, max_output_tokens, context_budget, preserve_recent_messages, include_vision)
+      set msgs = inner.messages
+      if inner.used_model then
+        set consecutive_failures = 0
+      end
+    else
+      print("  [unavailable] cannot reach " ++ get(prov, "name"))
+    end
     if length(msgs) > start then
       set turn_done = true
     else
-      set try_idx = try_idx + 1
-      if try_idx >= length(providers) then
-        set turn_done = true
+      set consecutive_failures = consecutive_failures + 1
+      if consecutive_failures >= length(providers) then
+        print("Error: no model is available.")
+        exit_process(1)
+      end
+      set provider_idx = (provider_idx + 1) % length(providers)
+      set attempts = attempts + 1
+      if provider_idx == 0 then
+        print("  [retry] reached the end of the fallback chain; trying the first option")
       end
     end
   end

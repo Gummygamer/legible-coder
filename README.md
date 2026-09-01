@@ -1,11 +1,11 @@
 # legible-coder
 
-An interactive CLI coding assistant for the [Legible programming language](../legible/), styled after Claude Code. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is Gemini, with OrcaRouter's free Qwen3.8 27B model as the first fallback when configured, followed by NVIDIA NIM, OpenRouter, Groq, and local LM Studio.
+An interactive CLI coding assistant for the [Legible programming language](../legible/), styled after Claude Code. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is Qwen with `qwen3.8-max`, followed by Gemini, OrcaRouter, NVIDIA NIM, OpenRouter, Groq, and local LM Studio.
 
 ```
   legible-coder
   Interactive Legible coding assistant
-  Model: gemini-3.7-flash via Gemini
+  Model: qwen3.8-max via Qwen
   ────────────────────────────────────────────
   cwd: /your/project
   Type your request, or 'quit' to exit.
@@ -23,8 +23,8 @@ An interactive CLI coding assistant for the [Legible programming language](../le
 
 - The Legible interpreter (`legible` binary) in your `PATH`
 - SDL2 runtime libraries: `libsdl2-2.0-0` and `libsdl2-ttf-2.0-0` on Debian/Ubuntu
-- A [Gemini API key](https://aistudio.google.com/app/apikey)
-- Optional fallback keys: [OrcaRouter](https://www.orcarouter.ai/), [NVIDIA NIM](https://build.nvidia.com/), [OpenRouter](https://openrouter.ai/settings/keys), then [Groq](https://console.groq.com/)
+- A Qwen/DashScope API key
+- Optional fallback keys: [Gemini](https://aistudio.google.com/app/apikey), [OrcaRouter](https://www.orcarouter.ai/), [NVIDIA NIM](https://build.nvidia.com/), [OpenRouter](https://openrouter.ai/settings/keys), then [Groq](https://console.groq.com/)
 
 Build the interpreter from source:
 
@@ -56,11 +56,12 @@ legible run /path/to/legible-coder/coder.lbl
 ## Usage
 
 ```bash
-export GEMINI_API_KEY="your-gemini-key-here"
-export ORCAROUTER_API_KEY="your-orcarouter-key-here"   # optional first fallback
-export NVIDIA_API_KEY="your-nvidia-nim-key-here"       # optional second fallback
-export OPENROUTER_API_KEY="your-openrouter-key-here"   # optional third fallback
-export GROQ_API_KEY="your-groq-key-here"               # optional fourth fallback
+export OPENAI_API_KEY="your-qwen-key-here"
+export GEMINI_API_KEY="your-gemini-key-here"           # optional first fallback
+export ORCAROUTER_API_KEY="your-orcarouter-key-here"   # optional second fallback
+export NVIDIA_API_KEY="your-nvidia-nim-key-here"       # optional third fallback
+export OPENROUTER_API_KEY="your-openrouter-key-here"   # optional fourth fallback
+export GROQ_API_KEY="your-groq-key-here"               # optional fifth fallback
 cd your-project-directory
 legible-coder
 ```
@@ -152,14 +153,17 @@ legible-coder/
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GEMINI_API_KEY` | For Gemini | Gemini API key for the default primary provider |
-| `ORCAROUTER_API_KEY` | For OrcaRouter | OrcaRouter API key for the first fallback. Uses `qwen/qwen3.8-27b-free` by default |
-| `NVIDIA_API_KEY` | For NIM | NVIDIA NIM API key for the second fallback |
-| `OPENROUTER_API_KEY` | For OpenRouter | OpenRouter API key for the third fallback. Uses `openrouter/free` by default |
-| `GROQ_API_KEY` | For Groq | Groq API key for the fourth fallback |
+| `OPENAI_API_KEY` | For Qwen | Qwen API key for the default primary provider. Uses `qwen3.8-max` by default |
+| `DASHSCOPE_API_KEY` | For Qwen | Provider-specific alternative to `OPENAI_API_KEY` (takes precedence when both are set) |
+| `ALIBABA_TOKEN_PLAN_API_KEY` | For Qwen | Provider-specific alternative to `OPENAI_API_KEY` (used after `DASHSCOPE_API_KEY`) |
+| `GEMINI_API_KEY` | For Gemini | Gemini API key for the first fallback |
+| `ORCAROUTER_API_KEY` | For OrcaRouter | OrcaRouter API key for the second fallback. Uses `qwen/qwen3.8-27b-free` by default |
+| `NVIDIA_API_KEY` | For NIM | NVIDIA NIM API key for the third fallback |
+| `OPENROUTER_API_KEY` | For OpenRouter | OpenRouter API key for the fourth fallback. Uses `openrouter/free` by default |
+| `GROQ_API_KEY` | For Groq | Groq API key for the fifth fallback |
 | `LEGIBLE_CODER_API_KEY` | No | Explicit API key override. Local endpoints default to `lm-studio` |
-| `LEGIBLE_CODER_BASE_URL` | No | OpenAI-compatible base URL. Auto-detects Gemini, OrcaRouter, NIM, OpenRouter, Groq, then local LM Studio when unset |
-| `LEGIBLE_CODER_MODEL` | No | Primary model. Defaults include `gemini-3.7-flash` for Gemini, `qwen/qwen3.8-27b-free` for OrcaRouter, and provider-specific models for other backends |
+| `LEGIBLE_CODER_BASE_URL` | No | OpenAI-compatible base URL. Auto-detects Qwen, Gemini, OrcaRouter, NIM, OpenRouter, Groq, then local LM Studio when unset |
+| `LEGIBLE_CODER_MODEL` | No | Primary model. Defaults include `qwen3.8-max` for Qwen, `gemini-3.7-flash` for Gemini, and provider-specific models for other backends |
 | `LEGIBLE_CODER_FAST_MODEL` | No | Remote fast model for simple turns. Defaults to the provider's fast or primary model |
 | `LEGIBLE_CODER_EXPERT_MODEL` | No | Optional remote expert model for architecture/refactor/design turns |
 | `LEGIBLE_CODER_LOCAL_TOOLS` | No | `1` forces native tools for local models, `0` forces manual local protocol. Gemma 4 names auto-enable native tools |

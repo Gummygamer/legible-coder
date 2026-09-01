@@ -53,7 +53,7 @@ whose OpenAI-compatible tool support is incomplete.
 ## Running
 
 ```bash
-export DASHSCOPE_API_KEY="your-dashscope-key-here"
+export OPENAI_API_KEY="your-qwen-key-here"
 export GEMINI_API_KEY="your-gemini-key-here"
 export ORCAROUTER_API_KEY="your-orcarouter-key-here"
 export NVIDIA_API_KEY="your-nvidia-nim-key-here"
@@ -65,8 +65,10 @@ legible run /path/to/legible-coder/coder.lbl
 ## Requirements
 
 - The Legible interpreter built with HTTP client and process builtins
-- A valid Qwen API key in the `DASHSCOPE_API_KEY` environment variable (used with the DashScope
-  OpenAI-compatible endpoint `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`)
+- A valid Qwen API key in `OPENAI_API_KEY`, `DASHSCOPE_API_KEY`, or
+  `ALIBABA_TOKEN_PLAN_API_KEY`. When multiple names are set, the precedence is
+  `DASHSCOPE_API_KEY`, `ALIBABA_TOKEN_PLAN_API_KEY`, then `OPENAI_API_KEY`. It uses the DashScope OpenAI-compatible
+  endpoint `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`
 - Optionally, a Gemini API key in `GEMINI_API_KEY` for the first remote fallback
 - Optionally, an OrcaRouter API key in `ORCAROUTER_API_KEY` for the second remote fallback (`qwen/qwen3.8-27b-free`)
 - Optionally, an NVIDIA NIM API key in `NVIDIA_API_KEY` for the third remote fallback

@@ -1,5 +1,5 @@
 -- legible-coder: an interactive CLI coding assistant for the Legible language
--- Default backend: Qwen (DASHSCOPE_API_KEY), falls back to Gemini (GEMINI_API_KEY), OrcaRouter (ORCAROUTER_API_KEY), NIM (NVIDIA_API_KEY), OpenRouter (OPENROUTER_API_KEY), Groq (GROQ_API_KEY), then LM Studio
+-- Default backend: Qwen (OPENAI_API_KEY, DASHSCOPE_API_KEY, or ALIBABA_TOKEN_PLAN_API_KEY), falls back to Gemini (GEMINI_API_KEY), OrcaRouter (ORCAROUTER_API_KEY), NIM (NVIDIA_API_KEY), OpenRouter (OPENROUTER_API_KEY), Groq (GROQ_API_KEY), then LM Studio
 -- Override with LEGIBLE_CODER_MODEL and LEGIBLE_CODER_BASE_URL env vars
 -- Default model: qwen3.8-max via Qwen
 
@@ -485,6 +485,7 @@ function prompt_rules(): text
   "- if-branches cannot be empty; use skip() as a no-op: if cond then skip() end\n" ++
   "- Avoid Unicode characters in code: use ASCII dash - not em-dash, straight quotes not curly quotes\n" ++
   "- Write code to files with write_file, then run with shell_exec\n" ++
+  "- Invoke assistant tools through the registered native tool schemas. Never print write_file(...), shell_exec(...), or another tool invocation as prose or inside a code fence; printed calls are not executed\n" ++
   "- write_file content must be the raw file text; never wrap it in markdown code fences\n" ++
   "- If a write_file result reports legible check errors, fix them and rewrite the file before doing anything else\n" ++
   "- Keep responses concise; use tools to act rather than describing what you would do\n" ++
@@ -1447,7 +1448,7 @@ function handle_tool_round(msg: a mapping from text to text, msgs: a list of a m
         waiting: not batch.stop,
         must_force_text: false,
         explore_count: explore_count,
-        acted: acted
+        acted: true
       }
     else if length(valid_calls) > 0 then
       print("  [warn] model repeated the same tool batch; forcing text response]")
@@ -1557,6 +1558,54 @@ function terminal_loop_step(msgs: a list of a mapping from text to text, total_t
   }
 end
 
+function textual_tool_retry_marker(): text
+  intent: return the textual tool retry marker
+  "__textual_tool_call_retry__"
+end
+
+function line_is_textual_tool_call(line: text): boolean
+  intent: detect a manual TOOL line or a supported tool name followed by an opening parenthesis
+  let value: text = trim(line)
+  starts_with(value, "TOOL ") or
+  starts_with(value, "read_file(") or starts_with(value, "read_file_lines(") or
+  starts_with(value, "write_file(") or starts_with(value, "shell_exec(") or
+  starts_with(value, "list_dir(") or starts_with(value, "read_dir_recursive(") or
+  starts_with(value, "grep(") or starts_with(value, "take_screenshot(")
+end
+
+function looks_like_textual_tool_call(content: text): boolean
+  intent: split model content into lines and find a line that looks like a printed tool invocation
+  is_some(find(split(content, "\n"), fn(line: text): boolean => line_is_textual_tool_call(line)))
+end
+
+function handle_textual_tool_call_response(content: text, msgs: a list of a mapping from text to text, total_tools: integer, last_batch: text, explore_count: integer, acted: boolean): LoopStep
+  intent: retry one cloud response that printed a tool call and then force plain text if the retry is also textual
+  let with_response: a list of a mapping from text to text = append(msgs, {"role": "assistant", "content": content})
+  if last_batch == textual_tool_retry_marker() then
+    print("  [warn] model printed a tool invocation again; forcing a plain-text answer]")
+    LoopStep {
+      messages: append(with_response, {"role": "user", "content": "The printed tool invocation was not executed. Do not print or call tools now. Give a concise plain-text answer explaining that the requested action was not completed."}),
+      count: total_tools,
+      last_batch: last_batch,
+      waiting: true,
+      must_force_text: true,
+      explore_count: explore_count,
+      acted: acted
+    }
+  else
+    print("  [warn] model printed a tool invocation instead of calling it; retrying once]")
+    LoopStep {
+      messages: append(with_response, {"role": "user", "content": "Your previous response printed a tool invocation as text, so it was not executed. Resend that operation now using the registered native tool schema. Do not include prose or a code fence."}),
+      count: total_tools,
+      last_batch: textual_tool_retry_marker(),
+      waiting: true,
+      must_force_text: false,
+      explore_count: explore_count,
+      acted: acted
+    }
+  end
+end
+
 function handle_success_response(resp_body: text, include_tools: boolean, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, round: integer, force_text: boolean, explore_count: integer, acted: boolean, include_vision: boolean): LoopStep
   intent: process a successful API response and return the next loop state
   if not json_valid(resp_body) or not starts_with(trim(resp_body), "\{") then
@@ -1577,6 +1626,8 @@ function handle_success_response(resp_body: text, include_tools: boolean, msgs: 
         handle_length_finish(msg, msgs, total_tools, last_batch, explore_count, acted)
       else if finish == "tool_calls" or length(unwrap_or(get(msg, "tool_calls"), [])) > 0 then
         handle_tool_round(msg, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted, include_vision)
+      else if not force_text and not acted and looks_like_textual_tool_call(unwrap_or(get(msg, "content"), "")) then
+        handle_textual_tool_call_response(unwrap_or(get(msg, "content"), ""), msgs, total_tools, last_batch, explore_count, acted)
       else if text_length(unwrap_or(get(msg, "content"), "")) == 0 then
         handle_empty_text_response(resp_body, finish, msgs, total_tools, last_batch, force_text, explore_count, acted)
       else
@@ -1711,13 +1762,36 @@ function require_provider_api_key(env_name: text, provider_name: text): text
   unwrap(key_opt)
 end
 
+function qwen_api_key(): an optional text
+  intent: use env_get and is_some to choose DASHSCOPE_API_KEY, ALIBABA_TOKEN_PLAN_API_KEY, or OPENAI_API_KEY for Qwen
+  let dashscope_key: an optional text = env_get("DASHSCOPE_API_KEY")
+  let token_plan_key: an optional text = env_get("ALIBABA_TOKEN_PLAN_API_KEY")
+  if is_some(dashscope_key) then
+    dashscope_key
+  else if is_some(token_plan_key) then
+    token_plan_key
+  else
+    env_get("OPENAI_API_KEY")
+  end
+end
+
+function require_qwen_api_key(): text
+  intent: return a configured Qwen API key or print the supported environment variable names and exit
+  let key_opt: an optional text = qwen_api_key()
+  if is_none(key_opt) then
+    print("Error: no Qwen API key is set. Set OPENAI_API_KEY, DASHSCOPE_API_KEY, ALIBABA_TOKEN_PLAN_API_KEY, or LEGIBLE_CODER_API_KEY.")
+    exit_process(1)
+  end
+  unwrap(key_opt)
+end
+
 function resolve_api_key(base_url: text): text
   intent: return LEGIBLE_CODER_API_KEY if set, then the provider-specific key, or lm-studio for local
   let explicit_key: an optional text = env_get("LEGIBLE_CODER_API_KEY")
   if is_some(explicit_key) then
     unwrap(explicit_key)
   else if is_qwen_url(base_url) then
-    require_provider_api_key("DASHSCOPE_API_KEY", "Qwen")
+    require_qwen_api_key()
   else if is_gemini_url(base_url) then
     require_provider_api_key("GEMINI_API_KEY", "Gemini")
   else if is_orcarouter_url(base_url) then
@@ -1839,7 +1913,7 @@ end
 function build_gemini_provider(key: text, model_override: an optional text): a mapping from text to text
   intent: build a provider mapping for the Gemini API using the free-tier default
   let model: text = unwrap_or(model_override, "gemini-3.7-flash")
-  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "gemini-3.7-flash-lite")
+  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), model)
   let expert_model: text = unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "")
   {"name": "Gemini", "key": key, "url": gemini_base_url(), "full": model, "fast": fast_model, "expert": expert_model}
 end
@@ -1900,7 +1974,7 @@ function build_provider_list(): a list of a mapping from text to text
   if is_some(custom_url_opt) then
     [build_custom_provider(unwrap(custom_url_opt), model_override)]
   else
-    build_default_provider_list(model_override, env_get("DASHSCOPE_API_KEY"), env_get("GEMINI_API_KEY"), env_get("ORCAROUTER_API_KEY"), env_get("NVIDIA_API_KEY"), env_get("OPENROUTER_API_KEY"), env_get("GROQ_API_KEY"))
+    build_default_provider_list(model_override, qwen_api_key(), env_get("GEMINI_API_KEY"), env_get("ORCAROUTER_API_KEY"), env_get("NVIDIA_API_KEY"), env_get("OPENROUTER_API_KEY"), env_get("GROQ_API_KEY"))
   end
 end
 

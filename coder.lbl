@@ -763,6 +763,12 @@ record InnerLoopResult
   used_model: boolean
 end
 
+record ProviderLimits
+  max_output_tokens: integer
+  context_budget: integer
+  keep_messages: integer
+end
+
 record ManualToolRequest
   valid: boolean
   final: boolean
@@ -803,9 +809,15 @@ end
 
 -- ─── Inner API loop ───────────────────────────────────────────────────────────
 
+function tool_call_arguments_valid(tc: a mapping from text to text): boolean
+  intent: get function arguments and use json_valid and starts_with to check for a JSON object
+  let arguments: text = get(get(tc, "function"), "arguments")
+  json_valid(arguments) and starts_with(trim(arguments), "\{")
+end
+
 function filter_valid_calls(all_calls: a list of a mapping from text to text): a list of a mapping from text to text
   intent: keep only tool calls with known names and valid JSON object arguments
-  filter(all_calls, fn(tc: a mapping from text to text): boolean => is_known_tool(get(get(tc, "function"), "name")) and json_valid(get(get(tc, "function"), "arguments")) and starts_with(trim(get(get(tc, "function"), "arguments")), "\{"))
+  filter(all_calls, fn(tc: a mapping from text to text): boolean => is_known_tool(get(get(tc, "function"), "name")) and tool_call_arguments_valid(tc))
 end
 
 function call_fingerprint(tc: a mapping from text to text): text
@@ -1460,10 +1472,16 @@ function handle_tool_round(msg: a mapping from text to text, msgs: a list of a m
   end
 end
 
+function handle_incomplete_tool_calls(msgs: a list of a mapping from text to text, total_tools: integer, last_batch: text, explore_count: integer, acted: boolean): LoopStep
+  intent: reject incomplete tool arguments and ask the model to retry with a smaller operation
+  print("  [warn] incomplete tool call was not executed; asking for a smaller edit")
+  prompt_loop_step(msgs, total_tools, last_batch, "Your tool call arguments were incomplete and were not executed. Retry the same operation using one smaller tool call. For a large existing file, use shell_exec to apply a focused patch instead of sending the entire file. Split an intrinsically large operation across multiple calls.", false, explore_count, acted)
+end
+
 function handle_length_finish(msg: a mapping from text to text, msgs: a list of a mapping from text to text, total_tools: integer, last_batch: text, explore_count: integer, acted: boolean): LoopStep
-  intent: handle a length-truncated response by preserving partial content and requesting continuation
+  intent: preserve partial text and request continuation after a length-truncated response
   let content: text = unwrap_or(get(msg, "content"), "")
-  print("  [warn] response truncated by token limit (finish_reason=length)]")
+  print("  [warn] response truncated by token limit (finish_reason=length)")
   if text_length(content) > 0 then
     let with_partial: a list of a mapping from text to text = append(msgs, {"role": "assistant", "content": content})
     LoopStep {
@@ -1620,12 +1638,15 @@ function handle_success_response(resp_body: text, include_tools: boolean, msgs: 
       let choice: a mapping from text to text = get(get(parsed, "choices"), 0)
       let msg: a mapping from text to text = get(choice, "message")
       let finish: text = unwrap_or(get(choice, "finish_reason"), "stop")
+      let returned_calls: a list of a mapping from text to text = unwrap_or(get(msg, "tool_calls"), [])
       if not include_tools then
         handle_local_text_round(msg, msgs, total_tools, max_tools, last_batch, explore_count, acted)
+      else if length(returned_calls) > 0 and length(filter(returned_calls, fn(tc: a mapping from text to text): boolean => tool_call_arguments_valid(tc))) != length(returned_calls) then
+        handle_incomplete_tool_calls(msgs, total_tools, last_batch, explore_count, acted)
+      else if finish == "tool_calls" or length(filter_valid_calls(returned_calls)) > 0 then
+        handle_tool_round(msg, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted, include_vision)
       else if finish == "length" then
         handle_length_finish(msg, msgs, total_tools, last_batch, explore_count, acted)
-      else if finish == "tool_calls" or length(unwrap_or(get(msg, "tool_calls"), [])) > 0 then
-        handle_tool_round(msg, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted, include_vision)
       else if not force_text and not acted and looks_like_textual_tool_call(unwrap_or(get(msg, "content"), "")) then
         handle_textual_tool_call_response(unwrap_or(get(msg, "content"), ""), msgs, total_tools, last_batch, explore_count, acted)
       else if text_length(unwrap_or(get(msg, "content"), "")) == 0 then
@@ -1816,8 +1837,8 @@ end
 
 function resolve_context_budget(tier: text): integer
   intent: read LEGIBLE_CODER_CONTEXT_TOKENS or use a provider-appropriate token budget before compaction
-  -- gemini-3.7-flash has a 1M token context, qwen3.8-max and OrcaRouter Qwen3.8 have 65K, NIM has 131K, local is very limited
-  let default_text: text = if tier == "local" then "6000" else if tier == "gemini" then "700000" else if tier == "qwen" then "60000" else if tier == "orcarouter" then "60000" else if tier == "nims" then "120000" else "90000" end
+  -- gemini-3.7-flash and qwen3.8-max have 1M-token contexts, OrcaRouter Qwen3.8 has 65K, NIM has 131K, local is very limited
+  let default_text: text = if tier == "local" then "6000" else if tier == "gemini" then "700000" else if tier == "qwen" then "850000" else if tier == "orcarouter" then "60000" else if tier == "nims" then "120000" else "90000" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_TOKENS"), default_text)
   max(to_integer(raw), 1000)
 end
@@ -1831,10 +1852,19 @@ end
 
 function resolve_max_output_tokens(tier: text, include_tools: boolean): integer
   intent: read LEGIBLE_CODER_MAX_OUTPUT_TOKENS or pick a default suited to the backend
-  -- gemini-3.7-flash supports up to 65K output, glm-5.2 supports up to 131K, groq up to ~16K, local is small
-  let default_text: text = if tier == "local" and include_tools then "4096" else if tier == "local" then "750" else if tier == "gemini" then "32768" else if tier == "nims" then "32768" else "16384" end
+  -- qwen3.8-max supports up to 131K output, gemini-3.7-flash up to 65K, NIM up to 131K, local is small
+  let default_text: text = if tier == "local" and include_tools then "4096" else if tier == "local" then "750" else if tier == "qwen" then "131072" else if tier == "gemini" then "32768" else if tier == "nims" then "32768" else "16384" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_MAX_OUTPUT_TOKENS"), default_text)
   max(to_integer(raw), 128)
+end
+
+function resolve_provider_limits(tier: text, include_tools: boolean): ProviderLimits
+  intent: combine the output and context limits resolved for one provider tier
+  ProviderLimits {
+    max_output_tokens: resolve_max_output_tokens(tier, include_tools),
+    context_budget: resolve_context_budget(tier),
+    keep_messages: resolve_context_keep_messages(tier)
+  }
 end
 
 function env_truthy(name: text): boolean
@@ -1991,8 +2021,8 @@ function print_turn_model_banner(provider_idx: integer, switched: boolean, prov:
   end
 end
 
-function run_turn_with_fallback(messages: a list of a mapping from text to text, user_input: text, start: integer, providers: a list of a mapping from text to text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer, include_vision: boolean): a list of a mapping from text to text
-  intent: cycle providers until the turn succeeds or every provider fails consecutively since the last successful model usage
+function run_turn_with_fallback(messages: a list of a mapping from text to text, user_input: text, start: integer, providers: a list of a mapping from text to text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, include_vision: boolean): a list of a mapping from text to text
+  intent: cycle providers with provider-specific limits until the turn succeeds or every provider fails consecutively
   mutable msgs: a list of a mapping from text to text = messages
   mutable provider_idx: integer = 0
   mutable consecutive_failures: integer = 0
@@ -2004,9 +2034,11 @@ function run_turn_with_fallback(messages: a list of a mapping from text to text,
     let p_fast: text = get(prov, "fast")
     let p_expert: text = get(prov, "expert")
     let turn_model: text = pick_model(user_input, p_full, p_fast, p_expert)
+    let turn_tier: text = provider_tier(get(prov, "url"))
+    let limits: ProviderLimits = resolve_provider_limits(turn_tier, include_tools)
     print_turn_model_banner(provider_idx, attempts > 0, prov, turn_model, p_full, p_fast, p_expert)
     if provider_is_reachable(get(prov, "url")) then
-      let inner: InnerLoopResult = run_inner_loop(msgs, start, get(prov, "key"), get(prov, "url"), turn_model, max_tools, include_tools, include_dir_tools, max_output_tokens, context_budget, preserve_recent_messages, include_vision)
+      let inner: InnerLoopResult = run_inner_loop(msgs, start, get(prov, "key"), get(prov, "url"), turn_model, max_tools, include_tools, include_dir_tools, limits.max_output_tokens, limits.context_budget, limits.keep_messages, include_vision)
       set msgs = inner.messages
       if inner.used_model then
         set consecutive_failures = 0
@@ -2032,7 +2064,7 @@ function run_turn_with_fallback(messages: a list of a mapping from text to text,
   msgs
 end
 
-function run_repl(init_messages: a list of a mapping from text to text, providers: a list of a mapping from text to text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer, include_vision: boolean): nothing
+function run_repl(init_messages: a list of a mapping from text to text, providers: a list of a mapping from text to text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, include_vision: boolean): nothing
   intent: run the interactive read-eval-print loop, dispatching each user turn through the provider fallback chain
   mutable messages: a list of a mapping from text to text = init_messages
   mutable running: boolean = true
@@ -2047,7 +2079,7 @@ function run_repl(init_messages: a list of a mapping from text to text, provider
     else
       set messages = append(messages, {"role": "user", "content": user_input})
       let start: integer = length(messages)
-      set messages = run_turn_with_fallback(messages, user_input, start, providers, max_tools, include_tools, include_dir_tools, max_output_tokens, context_budget, preserve_recent_messages, include_vision)
+      set messages = run_turn_with_fallback(messages, user_input, start, providers, max_tools, include_tools, include_dir_tools, include_vision)
     end
   end
 end
@@ -2078,9 +2110,6 @@ function main(): nothing
   let include_tools: boolean = not is_local or resolve_local_native_tools(primary_model)
   let include_dir_tools: boolean = include_tools
   let max_tools: integer = resolve_max_tools(tier)
-  let max_output_tokens: integer = resolve_max_output_tokens(tier, include_tools)
-  let context_budget: integer = resolve_context_budget(tier)
-  let preserve_recent_messages: integer = resolve_context_keep_messages(tier)
   let include_vision: boolean = include_tools and resolve_include_vision(primary_model)
   print_banner(primary_model, primary_url)
   if length(providers) > 1 then
@@ -2089,5 +2118,5 @@ function main(): nothing
   print_local_tool_mode(is_local, include_tools)
   let sys_prompt: text = if is_local and not include_tools then local_system_prompt() else system_prompt(include_tools, include_dir_tools, include_vision) end
   let messages: a list of a mapping from text to text = initial_messages(is_local, sys_prompt)
-  run_repl(messages, providers, max_tools, include_tools, include_dir_tools, max_output_tokens, context_budget, preserve_recent_messages, include_vision)
+  run_repl(messages, providers, max_tools, include_tools, include_dir_tools, include_vision)
 end

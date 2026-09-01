@@ -169,6 +169,6 @@ legible-coder/
 | `LEGIBLE_CODER_LOCAL_TOOLS` | No | `1` forces native tools for local models, `0` forces manual local protocol. Gemma 4 names auto-enable native tools |
 | `LEGIBLE_CODER_MAX_TOOLS` | No | Maximum tool calls per user turn. Defaults: `60` local, `30` remote |
 | `LEGIBLE_CODER_MAX_EXPLORE` | No | Local manual-mode exploration budget before requiring an action. Default: `8` |
-| `LEGIBLE_CODER_MAX_OUTPUT_TOKENS` | No | Response cap. Defaults: `750` local manual, `4096` local native tools, `16384` remote |
-| `LEGIBLE_CODER_CONTEXT_TOKENS` | No | Rough transcript compaction budget. Defaults: `16000` local, `90000` remote |
+| `LEGIBLE_CODER_MAX_OUTPUT_TOKENS` | No | Response cap. Defaults: `750` local manual, `4096` local native tools, `131072` Qwen, `32768` Gemini/NIM, `16384` other remote providers |
+| `LEGIBLE_CODER_CONTEXT_TOKENS` | No | Rough transcript compaction budget. Defaults: `6000` local, `850000` Qwen, `700000` Gemini, and provider-specific limits for other remotes |
 | `LEGIBLE_CODER_CONTEXT_KEEP_MESSAGES` | No | Recent messages preserved verbatim during compaction. Defaults: `8` local, `12` remote |

@@ -1,6 +1,6 @@
 # legible-coder
 
-An interactive CLI coding assistant written in the Legible programming language. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is Gemini, with OrcaRouter, NVIDIA NIM, OpenRouter, and Groq as remote fallbacks in that order.
+An interactive CLI coding assistant written in the Legible programming language. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is Qwen (DashScope) with `qwen3.8-max`, with Gemini, OrcaRouter, NVIDIA NIM, OpenRouter, and Groq as remote fallbacks in that order.
 
 ## Architecture
 
@@ -53,6 +53,7 @@ whose OpenAI-compatible tool support is incomplete.
 ## Running
 
 ```bash
+export DASHSCOPE_API_KEY="your-dashscope-key-here"
 export GEMINI_API_KEY="your-gemini-key-here"
 export ORCAROUTER_API_KEY="your-orcarouter-key-here"
 export NVIDIA_API_KEY="your-nvidia-nim-key-here"
@@ -64,11 +65,13 @@ legible run /path/to/legible-coder/coder.lbl
 ## Requirements
 
 - The Legible interpreter built with HTTP client and process builtins
-- A valid Gemini API key in the `GEMINI_API_KEY` environment variable
-- Optionally, an OrcaRouter API key in `ORCAROUTER_API_KEY` for the first remote fallback (`qwen/qwen3.8-27b-free`)
-- Optionally, an NVIDIA NIM API key in `NVIDIA_API_KEY` for the second remote fallback
-- Optionally, an OpenRouter API key in `OPENROUTER_API_KEY` for the third remote fallback
-- Network access to Gemini, OrcaRouter, NIM, OpenRouter, Groq, or an OpenAI-compatible local server via
+- A valid Qwen API key in the `DASHSCOPE_API_KEY` environment variable (used with the DashScope
+  OpenAI-compatible endpoint `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`)
+- Optionally, a Gemini API key in `GEMINI_API_KEY` for the first remote fallback
+- Optionally, an OrcaRouter API key in `ORCAROUTER_API_KEY` for the second remote fallback (`qwen/qwen3.8-27b-free`)
+- Optionally, an NVIDIA NIM API key in `NVIDIA_API_KEY` for the third remote fallback
+- Optionally, an OpenRouter API key in `OPENROUTER_API_KEY` for the fourth remote fallback
+- Network access to Qwen, Gemini, OrcaRouter, NIM, OpenRouter, Groq, or an OpenAI-compatible local server via
   `LEGIBLE_CODER_BASE_URL`
 
 ## Legible language quick reference

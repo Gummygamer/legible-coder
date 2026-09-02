@@ -23,7 +23,11 @@ crosses `LEGIBLE_CODER_CONTEXT_TOKENS`, older non-system messages are compacted
 into a synthetic system summary and the most recent messages are preserved
 verbatim. The compaction boundary walks backward over `tool` messages so native
 OpenAI-compatible tool results are not orphaned from their assistant tool-call
-message.
+message. All compression (old tool-result masking, old vision-image stripping,
+and summary compaction) is skipped while the transcript is below
+`LEGIBLE_CODER_CONTEXT_COMPACT_AFTER`; that floor defaults to `100000`
+estimated tokens for the Qwen tier (qwen3.8-max has a 1M-token window) and `0`
+for every other provider, and is clamped to the context budget.
 
 ### Tool system
 

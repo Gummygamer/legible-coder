@@ -767,6 +767,7 @@ record ProviderLimits
   max_output_tokens: integer
   context_budget: integer
   keep_messages: integer
+  compact_after: integer
 end
 
 record ManualToolRequest
@@ -1666,17 +1667,21 @@ function handle_success_response(resp_body: text, include_tools: boolean, msgs: 
   end
 end
 
-function compact_loop_messages(msgs: a list of a mapping from text to text, context_budget: integer, preserve_recent_messages: integer): a list of a mapping from text to text
-  intent: mask old tool results, strip old vision images, then compact when tokens exceed the context budget
+function compact_loop_messages(msgs: a list of a mapping from text to text, context_budget: integer, preserve_recent_messages: integer, compact_after: integer): a list of a mapping from text to text
+  intent: leave the transcript untouched below the compact_after floor, then mask old tool results, strip old vision images, and compact when tokens exceed the context budget
   let tokens_before: integer = estimate_messages_tokens(msgs)
-  let stripped: a list of a mapping from text to text = strip_old_vision_images(msgs, 2)
-  let masked: a list of a mapping from text to text = mask_old_tool_results(stripped, preserve_recent_messages * 2)
-  let compacted: a list of a mapping from text to text = compact_context_if_needed(masked, context_budget, preserve_recent_messages)
-  let tokens_after: integer = estimate_messages_tokens(compacted)
-  if tokens_after < tokens_before then
-    print("  [context] compacted transcript " ++ to_text(tokens_before) ++ " -> " ++ to_text(tokens_after) ++ " estimated tokens")
+  if tokens_before < compact_after then
+    msgs
+  else
+    let stripped: a list of a mapping from text to text = strip_old_vision_images(msgs, 2)
+    let masked: a list of a mapping from text to text = mask_old_tool_results(stripped, preserve_recent_messages * 2)
+    let compacted: a list of a mapping from text to text = compact_context_if_needed(masked, context_budget, preserve_recent_messages)
+    let tokens_after: integer = estimate_messages_tokens(compacted)
+    if tokens_after < tokens_before then
+      print("  [context] compacted transcript " ++ to_text(tokens_before) ++ " -> " ++ to_text(tokens_after) ++ " estimated tokens")
+    end
+    compacted
   end
-  compacted
 end
 
 function finish_inner_loop(msgs: a list of a mapping from text to text, messages_start: integer, last_is_assistant_text: boolean): a list of a mapping from text to text
@@ -1699,7 +1704,7 @@ function last_message_is_assistant_text(msgs: a list of a mapping from text to t
   end
 end
 
-function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer, include_vision: boolean): InnerLoopResult
+function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer, compact_after: integer, include_vision: boolean): InnerLoopResult
   intent: call the API in a loop executing tool calls and return messages plus whether the model was used successfully
   mutable msgs: a list of a mapping from text to text = init_messages
   mutable waiting: boolean = true
@@ -1715,7 +1720,7 @@ function run_inner_loop(init_messages: a list of a mapping from text to text, me
     set round = round + 1
     let force_text: boolean = if include_tools then must_force_text or round > max_tools / 2 else false end
     set must_force_text = false
-    set msgs = compact_loop_messages(msgs, context_budget, preserve_recent_messages)
+    set msgs = compact_loop_messages(msgs, context_budget, preserve_recent_messages, compact_after)
     let resp: a mapping from text to text = call_api(key, base_url, build_request(model, msgs, force_text, include_tools, include_dir_tools, max_output_tokens, include_vision))
     let status: text = get(resp, "status")
     print("  [" ++ to_text(round) ++ "] status=" ++ status)
@@ -1843,6 +1848,14 @@ function resolve_context_budget(tier: text): integer
   max(to_integer(raw), 1000)
 end
 
+function resolve_context_compact_after(tier: text): integer
+  intent: read LEGIBLE_CODER_CONTEXT_COMPACT_AFTER or default by tier to 100000 for qwen else 0 as the minimum estimated transcript size before compression
+  -- qwen3.8-max has a 1M-token window, so the transcript stays untouched until it is around 100K estimated tokens
+  let default_text: text = if tier == "qwen" then "100000" else "0" end
+  let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_COMPACT_AFTER"), default_text)
+  max(to_integer(raw), 0)
+end
+
 function resolve_context_keep_messages(tier: text): integer
   intent: read LEGIBLE_CODER_CONTEXT_KEEP_MESSAGES or use a provider-appropriate recent-message default
   let default_text: text = if tier == "local" then "8" else if tier == "gemini" then "24" else "12" end
@@ -1860,10 +1873,12 @@ end
 
 function resolve_provider_limits(tier: text, include_tools: boolean): ProviderLimits
   intent: combine the output and context limits resolved for one provider tier
+  let budget: integer = resolve_context_budget(tier)
   ProviderLimits {
     max_output_tokens: resolve_max_output_tokens(tier, include_tools),
-    context_budget: resolve_context_budget(tier),
-    keep_messages: resolve_context_keep_messages(tier)
+    context_budget: budget,
+    keep_messages: resolve_context_keep_messages(tier),
+    compact_after: min(resolve_context_compact_after(tier), budget)
   }
 end
 
@@ -2038,7 +2053,7 @@ function run_turn_with_fallback(messages: a list of a mapping from text to text,
     let limits: ProviderLimits = resolve_provider_limits(turn_tier, include_tools)
     print_turn_model_banner(provider_idx, attempts > 0, prov, turn_model, p_full, p_fast, p_expert)
     if provider_is_reachable(get(prov, "url")) then
-      let inner: InnerLoopResult = run_inner_loop(msgs, start, get(prov, "key"), get(prov, "url"), turn_model, max_tools, include_tools, include_dir_tools, limits.max_output_tokens, limits.context_budget, limits.keep_messages, include_vision)
+      let inner: InnerLoopResult = run_inner_loop(msgs, start, get(prov, "key"), get(prov, "url"), turn_model, max_tools, include_tools, include_dir_tools, limits.max_output_tokens, limits.context_budget, limits.keep_messages, limits.compact_after, include_vision)
       set msgs = inner.messages
       if inner.used_model then
         set consecutive_failures = 0

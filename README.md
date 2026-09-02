@@ -105,7 +105,11 @@ Conversation history is kept in-memory for the duration of the session. When
 the rough transcript token estimate crosses the configured context budget,
 older messages are compacted into a synthetic summary while recent messages are
 kept verbatim. Native tool-call transcripts are compacted at safe boundaries so
-tool results keep their preceding assistant tool-call message.
+tool results keep their preceding assistant tool-call message. No compression
+of any kind runs while the transcript is below the compact-after floor; for
+Qwen (`qwen3.8-max`, a 1M-token window) that floor is about `100000` estimated
+tokens, so tool results and vision images stay verbatim until the conversation
+is genuinely large.
 
 ### Tools available to the model
 
@@ -172,3 +176,4 @@ legible-coder/
 | `LEGIBLE_CODER_MAX_OUTPUT_TOKENS` | No | Response cap. Defaults: `750` local manual, `4096` local native tools, `131072` Qwen, `32768` Gemini/NIM, `16384` other remote providers |
 | `LEGIBLE_CODER_CONTEXT_TOKENS` | No | Rough transcript compaction budget. Defaults: `6000` local, `850000` Qwen, `700000` Gemini, and provider-specific limits for other remotes |
 | `LEGIBLE_CODER_CONTEXT_KEEP_MESSAGES` | No | Recent messages preserved verbatim during compaction. Defaults: `8` local, `12` remote |
+| `LEGIBLE_CODER_CONTEXT_COMPACT_AFTER` | No | Minimum estimated transcript tokens before any compression (tool-result masking, vision stripping, summary compaction) runs. Defaults: `100000` Qwen, `0` other providers. Clamped to the context budget |

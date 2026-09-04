@@ -59,12 +59,18 @@ function screenshot_tool(): a mapping from text to text
   make_tool("take_screenshot", "Launch a GUI program and capture a screenshot for visual evaluation. Pass the program command in 'command' — it will be started in the background, the screen captured after 'delay' seconds, then the process killed. If the app exits before the delay elapses, the tool returns the captured stdout/stderr so you can diagnose the crash. Do NOT use shell_exec to launch GUI apps separately; use this tool instead so the capture happens while the window is open. Increase 'delay' (e.g. 5) if the window is slow to render.", ["command", "delay"], ["The shell command to launch the GUI app (will be run in background)", "Seconds to wait for the window to appear before capturing (default: 3)"], [])
 end
 
+function web_search_tool(): a mapping from text to text
+  intent: build the web_search tool schema for live web queries
+  make_tool("web_search", "Search the web for current information. Use for docs, library versions, release notes, error messages, or anything outside your training data. Returns a numbered list of results with title, URL, and snippet.", ["query", "max_results"], ["The search query", "Maximum number of results to return (default: 5, capped at 10)"], ["query"])
+end
+
 function tool_definitions(include_dir_tools: boolean, include_vision: boolean): a list of a mapping from text to text
   intent: combine file, search, and optionally vision tools into one list
   let ft: a list of a mapping from text to text = file_tools(include_dir_tools)
   let st: a list of a mapping from text to text = search_tools()
   let combined: a list of a mapping from text to text = reduce(st, ft, fn(acc: a list of a mapping from text to text, t: a mapping from text to text): a list of a mapping from text to text => append(acc, t))
-  if include_vision then append(combined, screenshot_tool()) else combined end
+  let with_search: a list of a mapping from text to text = append(combined, web_search_tool())
+  if include_vision then append(with_search, screenshot_tool()) else with_search end
 end
 
 -- ─── Tool validation ──────────────────────────────────────────────────────────
@@ -84,14 +90,14 @@ function is_known_tool(name: text): boolean
   intent: compare the cleaned name to the supported tool names
   let n: text = clean_tool_name(name)
   n == "read_file" or n == "read_file_lines" or n == "write_file" or n == "shell_exec" or
-  n == "list_dir" or n == "read_dir_recursive" or n == "grep" or n == "take_screenshot"
+  n == "list_dir" or n == "read_dir_recursive" or n == "grep" or n == "take_screenshot" or n == "web_search"
 end
 
 function is_local_known_tool(name: text): boolean
   intent: compare the cleaned name to the local manual-tool names that exclude full-file reads
   let n: text = clean_tool_name(name)
   n == "read_file_lines" or n == "write_file" or n == "shell_exec" or
-  n == "list_dir" or n == "read_dir_recursive" or n == "grep" or n == "take_screenshot"
+  n == "list_dir" or n == "read_dir_recursive" or n == "grep" or n == "take_screenshot" or n == "web_search"
 end
 
 function strip_path_quotes(path: text): text
@@ -179,6 +185,10 @@ function describe_tool_call(name: text, arguments: text): text
     name ++ "  /" ++ pat ++ "/  " ++ path
   else if name == "take_screenshot" then
     name
+  else if name == "web_search" then
+    let q: text = unwrap_or(get(args, "query"), "")
+    let preview: text = if text_length(q) > 60 then substring(q, 0, 60) ++ "..." else q end
+    name ++ "  /" ++ preview ++ "/"
   else
     name
   end
@@ -265,6 +275,83 @@ function exec_grep(args: a mapping from text to text): text
   end
   let stdout: text = get(shell_exec(cmd), "stdout")
   if text_length(stdout) > 0 then stdout else "No matches found." end
+end
+
+function web_search_encode(query: text): text
+  intent: build step1 through step7 with replace over query so the returned query text is url encoded
+  let step1: text = replace(query, "%", "%25")
+  let step2: text = replace(step1, "&", "%26")
+  let step3: text = replace(step2, "#", "%23")
+  let step4: text = replace(step3, "?", "%3F")
+  let step5: text = replace(step4, "=", "%3D")
+  let step6: text = replace(step5, "\"", "%22")
+  let step7: text = replace(step6, "'", "%27")
+  replace(step7, " ", "+")
+end
+
+function xml_entity_decode(s: text): text
+  intent: replace amp entity lt gt quot and apos entities in s with their plain characters and trim the result
+  let s1: text = replace(s, "&amp;", "&")
+  let s2: text = replace(s1, "&lt;", "<")
+  let s3: text = replace(s2, "&gt;", ">")
+  let s4: text = replace(s3, "&quot;", "\"")
+  let s5: text = replace(s4, "&#39;", "'")
+  let s6: text = replace(s5, "&apos;", "'")
+  trim(s6)
+end
+
+function bing_rss_field(item: text, tag: text): text
+  intent: split item on the opening tag then on the closing tag and decode the text between them or return empty text
+  let open_tag: text = "<" ++ tag ++ ">"
+  let close_tag: text = "</" ++ tag ++ ">"
+  let after_open: a list of text = split(item, open_tag)
+  if length(after_open) < 2 then
+    ""
+  else
+    let content: text = unwrap_or(get(after_open, 1), "")
+    let before_close: a list of text = split(content, close_tag)
+    xml_entity_decode(unwrap_or(get(before_close, 0), ""))
+  end
+end
+
+function bing_rss_results(body: text, max_results: integer): text
+  intent: extract up to max_results items from a Bing RSS body and format them as numbered lines
+  let items: a list of text = split(body, "<item>")
+  mutable out: a list of text = []
+  mutable i: integer = 1
+  while i < length(items) and length(out) < max_results do
+    let item: text = unwrap_or(get(items, i), "")
+    let title: text = bing_rss_field(item, "title")
+    let url: text = bing_rss_field(item, "link")
+    let snippet: text = bing_rss_field(item, "description")
+    if text_length(title) > 0 and text_length(url) > 0 then
+      set out = append(out, to_text(length(out) + 1) ++ ". " ++ title ++ "\n   URL: " ++ url ++ "\n   " ++ snippet)
+    else
+      skip()
+    end
+    set i = i + 1
+  end
+  if length(out) == 0 then "" else join(out, "\n\n") end
+end
+
+function exec_web_search(args: a mapping from text to text): text
+  intent: query Bing RSS over http_client_get with the encoded query and return numbered results
+  let query: text = trim(unwrap_or(get(args, "query"), ""))
+  if text_length(query) == 0 then
+    "Error: web_search needs a non-empty query."
+  else
+    let max_results: integer = min(max(to_integer(unwrap_or(get(args, "max_results"), "5")), 1), 10)
+    let url: text = "https://www.bing.com/search?q=" ++ web_search_encode(query) ++ "&format=rss"
+    let headers: a mapping from text to text = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
+    let response: a mapping from text to text = http_client_get(url, headers)
+    let status: text = unwrap_or(get(response, "status"), "")
+    if not starts_with(status, "2") then
+      "Error: web search request failed with status " ++ status
+    else
+      let results: text = bing_rss_results(unwrap_or(get(response, "body"), ""), max_results)
+      if text_length(results) > 0 then results else "No results found." end
+    end
+  end
 end
 
 function exec_read_file_lines(args: a mapping from text to text): text
@@ -363,6 +450,8 @@ function execute_tool(name: text, arguments: text): text
     exec_grep(args)
   else if name == "take_screenshot" then
     exec_take_screenshot(args)
+  else if name == "web_search" then
+    exec_web_search(args)
   else
     "Error: unknown tool: " ++ name
   end
@@ -498,13 +587,13 @@ function tool_names_text(include_tools: boolean, include_dir_tools: boolean, inc
   if not include_tools then
     "none"
   else if include_dir_tools and include_vision then
-    "read_file, read_file_lines, write_file, shell_exec, list_dir, read_dir_recursive, grep, take_screenshot"
+    "read_file, read_file_lines, write_file, shell_exec, list_dir, read_dir_recursive, grep, web_search, take_screenshot"
   else if include_dir_tools then
-    "read_file, read_file_lines, write_file, shell_exec, list_dir, read_dir_recursive, grep"
+    "read_file, read_file_lines, write_file, shell_exec, list_dir, read_dir_recursive, grep, web_search"
   else if include_vision then
-    "read_file, read_file_lines, write_file, shell_exec, grep, take_screenshot"
+    "read_file, read_file_lines, write_file, shell_exec, grep, web_search, take_screenshot"
   else
-    "read_file, read_file_lines, write_file, shell_exec, grep"
+    "read_file, read_file_lines, write_file, shell_exec, grep, web_search"
   end
 end
 
@@ -525,7 +614,8 @@ function local_examples(): text
   "TOOL list_dir \{\"path\":\"../legible\"\}\n" ++
   "TOOL write_file \{\"path\":\"main.lbl\",\"content\":\"...updated content...\"\}\n" ++
   "TOOL shell_exec \{\"command\":\"legible check main.lbl\"\}\n" ++
-  "TOOL grep \{\"pattern\":\"TODO\",\"path\":\".\",\"glob\":\"*.lbl\"\}\n\n"
+  "TOOL grep \{\"pattern\":\"TODO\",\"path\":\".\",\"glob\":\"*.lbl\"\}\n" ++
+  "TOOL web_search \{\"query\":\"legible interpreter releases\"\}\n\n"
 end
 
 function local_system_prompt(): text
@@ -534,7 +624,7 @@ function local_system_prompt(): text
   "For this local-model session, native OpenAI tool calling is unavailable.\n" ++
   "If you need to use a tool, reply with exactly one line in this format:\n" ++
   "TOOL tool_name JSON_arguments\n" ++
-  "Valid tools: read_file_lines, write_file, list_dir, read_dir_recursive, grep, shell_exec.\n" ++
+  "Valid tools: read_file_lines, write_file, list_dir, read_dir_recursive, grep, shell_exec, web_search.\n" ++
   "After tool results are returned, either request one more tool the same way or reply with:\n" ++
   "FINAL: your answer\n\n" ++
   "Do not emit multiple TOOL lines in one response. Do not explain the tool choice before or after the TOOL line.\n" ++
@@ -647,7 +737,7 @@ end
 
 function qwen_base_url(): text
   intent: return the DashScope international OpenAI-compatible base URL
-  "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+  "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
 end
 
 function openrouter_base_url(): text
@@ -1205,7 +1295,7 @@ function local_manual_retry(msgs: a list of a mapping from text to text, content
     local_action_retry_step(msgs, total_tools, last_batch, explore_count, acted)
   else
     LoopStep {
-      messages: prune_local_messages(append(msgs, {"role": "user", "content": "Your last reply did not follow the required format. Reply in exactly one of these formats only:\nTOOL tool_name JSON_arguments\nFINAL: your answer\nValid local tools: read_file_lines, write_file, list_dir, read_dir_recursive, grep, shell_exec." ++ disallow_full_read})),
+      messages: prune_local_messages(append(msgs, {"role": "user", "content": "Your last reply did not follow the required format. Reply in exactly one of these formats only:\nTOOL tool_name JSON_arguments\nFINAL: your answer\nValid local tools: read_file_lines, write_file, list_dir, read_dir_recursive, grep, shell_exec, web_search." ++ disallow_full_read})),
       count: total_tools,
       last_batch: last_batch,
       waiting: true,

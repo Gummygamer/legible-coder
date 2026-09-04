@@ -39,6 +39,7 @@ The model has access to these tools:
 - `list_dir` — list directory contents
 - `read_dir_recursive` — recursively list files (via `find`)
 - `grep` — search for patterns in files
+- `web_search` — search the web for current information (docs, versions, error messages); uses Bing RSS (`format=rss`) via `http_client_get` and returns numbered title/URL/snippet results
 
 `write_file` strips a wrapping markdown code fence from the content (some
 models, notably on NIM, wrap file content in ``` fences) and runs

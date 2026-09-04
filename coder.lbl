@@ -1,7 +1,10 @@
 -- legible-coder: an interactive CLI coding assistant for the Legible language
 -- Default backend: Qwen (OPENAI_API_KEY, DASHSCOPE_API_KEY, or ALIBABA_TOKEN_PLAN_API_KEY), falls back to Gemini (GEMINI_API_KEY), OrcaRouter (ORCAROUTER_API_KEY), NIM (NVIDIA_API_KEY), OpenRouter (OPENROUTER_API_KEY), Groq (GROQ_API_KEY), then LM Studio
 -- Override with LEGIBLE_CODER_MODEL and LEGIBLE_CODER_BASE_URL env vars
--- Default model: deepseek-v4-pro via Qwen
+-- Default model: qwen3.8-max via Qwen
+
+
+use kv_cache
 
 -- ─── Tool schema helpers ──────────────────────────────────────────────────────
 
@@ -976,7 +979,7 @@ function strip_old_vision_images(msgs: a list of a mapping from text to text, ke
   mutable i: integer = 0
   while i < total do
     let msg: a mapping from text to text = get(msgs, i)
-    let is_vision: boolean = get(msg, "role") == "user" and contains_text(msg_content_text(msg), "image_url")
+    let is_vision: boolean = get(msg, "role") == "user" and contains_text(kv_cache.msg_content_text(msg), "image_url")
     if i < mask_before and is_vision then
       set result = append(result, put(msg, "content", "[screenshot evaluated — image removed from context]"))
     else
@@ -987,198 +990,23 @@ function strip_old_vision_images(msgs: a list of a mapping from text to text, ke
   result
 end
 
-function compact_summary_marker(): text
-  intent: return compacted session summary marker
-  "COMPACTED SESSION SUMMARY:"
-end
-
-function msg_content_text(msg: a mapping from text to text): text
-  intent: safely extract msg content as text even when the content is a multimodal list
-  to_text(unwrap_or(get(msg, "content"), ""))
-end
-
-function message_text(msg: a mapping from text to text): text
-  intent: return content tool_calls text
-  let content: text = msg_content_text(msg)
-  let calls: text = if has_key(msg, "tool_calls") then to_text(get(msg, "tool_calls")) else "" end
-  trim(content ++ "\n" ++ calls)
-end
-
-function estimate_message_tokens(msg: a mapping from text to text): integer
-  intent: return max text_length message_text divided four
-  max(text_length(message_text(msg)) / 4, 1)
-end
-
-function estimate_messages_tokens(msgs: a list of a mapping from text to text): integer
-  intent: sum rough token estimates for every message in msgs
-  mutable total: integer = 0
-  for msg in msgs do
-    set total = total + estimate_message_tokens(msg)
-  end
-  total
-end
-
-function is_compact_summary_message(msg: a mapping from text to text): boolean
-  intent: return true when msg is a synthetic compacted context summary
-  get(msg, "role") == "system" and starts_with(msg_content_text(msg), compact_summary_marker())
-end
-
-function leading_system_count(msgs: a list of a mapping from text to text): integer
-  intent: count leading system role messages
-  mutable i: integer = 0
-  mutable scanning: boolean = true
-  while i < length(msgs) and scanning do
-    let msg: a mapping from text to text = get(msgs, i)
-    if get(msg, "role") == "system" then
-      set i = i + 1
-    else
-      set scanning = false
-    end
-  end
-  i
-end
-
-function base_system_messages(msgs: a list of a mapping from text to text): a list of a mapping from text to text
-  intent: append leading system role messages not compact summary
-  mutable result: a list of a mapping from text to text = []
-  mutable i: integer = 0
-  mutable scanning: boolean = true
-  while i < length(msgs) and scanning do
-    let msg: a mapping from text to text = get(msgs, i)
-    if get(msg, "role") == "system" then
-      if not is_compact_summary_message(msg) then
-        set result = append(result, msg)
-      end
-      set i = i + 1
-    else
-      set scanning = false
-    end
-  end
-  result
-end
-
-function existing_compact_summary(msgs: a list of a mapping from text to text): text
-  intent: return the existing compact summary text if present
-  let found: an optional a mapping from text to text = find(msgs, fn(msg: a mapping from text to text): boolean => is_compact_summary_message(msg))
-  if is_some(found) then
-    unwrap_or(get(unwrap(found), "content"), "")
-  else
-    ""
-  end
-end
-
-function one_line_snippet(text_value: text, max_chars: integer): text
-  intent: replace newline tab trim substring text_value
-  let cleaned: text = replace(replace(trim(text_value), "\n", " "), "\t", " ")
-  if text_length(cleaned) > max_chars then
-    substring(cleaned, 0, max_chars) ++ "..."
-  else
-    cleaned
-  end
-end
-
-function summarize_message_for_context(msg: a mapping from text to text): text
-  intent: format one chat message as a short role-prefixed summary line
-  let role: text = unwrap_or(get(msg, "role"), "message")
-  "- " ++ role ++ ": " ++ one_line_snippet(message_text(msg), 180)
-end
-
-function recent_user_request_summary(msgs: a list of a mapping from text to text): text
-  intent: append user role snippets and drop older requests
-  mutable requests: a list of text = []
-  for msg in msgs do
-    if get(msg, "role") == "user" then
-      set requests = append(requests, "  - " ++ one_line_snippet(message_text(msg), 180))
-      if length(requests) > 3 then
-        set requests = drop(requests, 1)
-      end
-    end
-  end
-  if length(requests) > 0 then
-    "- Recent user requests:\n" ++ join(requests, "\n") ++ "\n"
-  else
-    ""
-  end
-end
-
-function recent_timeline_summary(msgs: a list of a mapping from text to text): text
-  intent: summarize the last few compacted messages as a lightweight timeline
-  let start: integer = max(length(msgs) - 8, 0)
-  let recent: a list of a mapping from text to text = drop(msgs, start)
-  let lines: a list of text = map(recent, fn(msg: a mapping from text to text): text => "  " ++ summarize_message_for_context(msg))
-  if length(lines) > 0 then
-    "- Recent compacted timeline:\n" ++ join(lines, "\n") ++ "\n"
-  else
-    ""
-  end
-end
-
-function compact_transcript_summary(removed: a list of a mapping from text to text, prior_summary: text): text
-  intent: build a synthetic summary for removed conversation messages while preserving actionable context
-  let prior: text = if text_length(prior_summary) > 0 then "- Previously compacted context:\n  - " ++ one_line_snippet(prior_summary, 700) ++ "\n" else "" end
-  compact_summary_marker() ++ "\n" ++
-  "This synthetic message preserves older conversation context that was compacted to keep the model inside its context budget.\n" ++
-  prior ++
-  "- Scope: " ++ to_text(length(removed)) ++ " older messages compacted from the live transcript.\n" ++
-  recent_user_request_summary(removed) ++
-  recent_timeline_summary(removed) ++
-  "Recent messages after this summary are preserved verbatim. Continue directly from the preserved context without asking the user to repeat it."
-end
-
-function safe_context_keep_from(msgs: a list of a mapping from text to text, raw_keep_from: integer, min_keep_from: integer): integer
-  intent: decrement keep_from while first_preserved role is tool
-  mutable keep_from: integer = max(raw_keep_from, min_keep_from)
-  mutable scanning: boolean = true
-  while keep_from > min_keep_from and scanning do
-    let first_preserved: a mapping from text to text = get(msgs, keep_from)
-    if get(first_preserved, "role") == "tool" then
-      set keep_from = keep_from - 1
-    else
-      set scanning = false
-    end
-  end
-  keep_from
-end
-
-function compact_context_if_needed(msgs: a list of a mapping from text to text, max_estimated_tokens: integer, preserve_recent_messages: integer): a list of a mapping from text to text
-  intent: compact older transcript messages into one summary when estimated tokens exceed the configured budget
-  let estimated: integer = estimate_messages_tokens(msgs)
-  let prefix_count: integer = leading_system_count(msgs)
-  if max_estimated_tokens <= 0 or estimated < max_estimated_tokens or length(msgs) <= prefix_count + preserve_recent_messages then
-    msgs
-  else
-    let raw_keep_from: integer = max(length(msgs) - preserve_recent_messages, prefix_count)
-    let keep_from: integer = safe_context_keep_from(msgs, raw_keep_from, prefix_count)
-    if keep_from <= prefix_count then
-      msgs
-    else
-      let removed: a list of a mapping from text to text = take(drop(msgs, prefix_count), keep_from - prefix_count)
-      let preserved: a list of a mapping from text to text = drop(msgs, keep_from)
-      let summary: text = compact_transcript_summary(removed, existing_compact_summary(msgs))
-      let compact_msg: a mapping from text to text = {"role": "system", "content": summary}
-      let with_summary: a list of a mapping from text to text = append(base_system_messages(msgs), compact_msg)
-      reduce(preserved, with_summary, fn(acc: a list of a mapping from text to text, msg: a mapping from text to text): a list of a mapping from text to text => append(acc, msg))
-    end
-  end
-end
-
 function prune_local_messages(msgs: a list of a mapping from text to text): a list of a mapping from text to text
   intent: strip old vision images, mask old tool results, then compact context for local mode
   let keep: integer = resolve_context_keep_messages("local")
   let stripped: a list of a mapping from text to text = strip_old_vision_images(msgs, 2)
   let masked: a list of a mapping from text to text = mask_old_tool_results(stripped, keep * 2)
-  compact_context_if_needed(masked, resolve_context_budget("local"), keep)
+  kv_cache.enhanced_compact_context(masked, resolve_context_budget("local"), keep)
 end
 
 function seen_tool_for_path(msgs: a list of a mapping from text to text, tool_name: text, path: text): boolean
   intent: return true when prior local messages already contain a tool result line for tool_name and path
-  is_some(find(msgs, fn(msg: a mapping from text to text): boolean => contains_text(msg_content_text(msg), "Tool result for " ++ tool_name) and contains_text(msg_content_text(msg), "\"path\":\"" ++ path ++ "\"")))
+  is_some(find(msgs, fn(msg: a mapping from text to text): boolean => contains_text(kv_cache.msg_content_text(msg), "Tool result for " ++ tool_name) and contains_text(kv_cache.msg_content_text(msg), "\"path\":\"" ++ path ++ "\"")))
 end
 
 function seen_manual_tool_request(msgs: a list of a mapping from text to text, name: text, arguments: text): boolean
   intent: return true when prior local messages already contain the same tool name and exact arguments
   let marker: text = "Tool result for " ++ to_text(name) ++ " " ++ to_text(arguments) ++ ":"
-  is_some(find(msgs, fn(msg: a mapping from text to text): boolean => contains_text(msg_content_text(msg), marker)))
+  is_some(find(msgs, fn(msg: a mapping from text to text): boolean => contains_text(kv_cache.msg_content_text(msg), marker)))
 end
 
 function json_escape_text(content: text): text
@@ -1759,17 +1587,15 @@ end
 
 function compact_loop_messages(msgs: a list of a mapping from text to text, context_budget: integer, preserve_recent_messages: integer, compact_after: integer): a list of a mapping from text to text
   intent: leave the transcript untouched below the compact_after floor, then mask old tool results, strip old vision images, and compact when tokens exceed the context budget
-  let tokens_before: integer = estimate_messages_tokens(msgs)
+  let tokens_before: integer = kv_cache.estimate_messages_tokens(msgs)
   if tokens_before < compact_after then
     msgs
   else
     let stripped: a list of a mapping from text to text = strip_old_vision_images(msgs, 2)
     let masked: a list of a mapping from text to text = mask_old_tool_results(stripped, preserve_recent_messages * 2)
-    let compacted: a list of a mapping from text to text = compact_context_if_needed(masked, context_budget, preserve_recent_messages)
-    let tokens_after: integer = estimate_messages_tokens(compacted)
-    if tokens_after < tokens_before then
-      print("  [context] compacted transcript " ++ to_text(tokens_before) ++ " -> " ++ to_text(tokens_after) ++ " estimated tokens")
-    end
+    let compacted: a list of a mapping from text to text = kv_cache.enhanced_compact_context(masked, context_budget, preserve_recent_messages)
+    let tokens_after: integer = kv_cache.estimate_messages_tokens(compacted)
+    kv_cache.print_compaction_diagnostics(tokens_before, tokens_after, context_budget)
     compacted
   end
 end
@@ -1932,7 +1758,7 @@ end
 
 function resolve_context_budget(tier: text): integer
   intent: read LEGIBLE_CODER_CONTEXT_TOKENS or use a provider-appropriate token budget before compaction
-  -- gemini-3.7-flash and deepseek-v4-pro have 1M-token contexts, OrcaRouter Qwen3.8 has 65K, NIM has 131K, local is very limited
+  -- gemini-3.7-flash and qwen3.8-max have 1M-token contexts, OrcaRouter Qwen3.8 has 65K, NIM has 131K, local is very limited
   let default_text: text = if tier == "local" then "6000" else if tier == "gemini" then "700000" else if tier == "qwen" then "850000" else if tier == "orcarouter" then "60000" else if tier == "nims" then "120000" else "90000" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_TOKENS"), default_text)
   max(to_integer(raw), 1000)
@@ -1940,7 +1766,7 @@ end
 
 function resolve_context_compact_after(tier: text): integer
   intent: read LEGIBLE_CODER_CONTEXT_COMPACT_AFTER or default by tier to 100000 for qwen else 0 as the minimum estimated transcript size before compression
-  -- deepseek-v4-pro has a 1M-token window, so the transcript stays untouched until it is around 100K estimated tokens
+  -- qwen3.8-max has a 1M-token window, so the transcript stays untouched until it is around 100K estimated tokens
   let default_text: text = if tier == "qwen" then "100000" else "0" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_COMPACT_AFTER"), default_text)
   max(to_integer(raw), 0)
@@ -1955,7 +1781,7 @@ end
 
 function resolve_max_output_tokens(tier: text, include_tools: boolean): integer
   intent: read LEGIBLE_CODER_MAX_OUTPUT_TOKENS or pick a default suited to the backend
-  -- deepseek-v4-pro supports up to 131K output, gemini-3.7-flash up to 65K, NIM up to 131K, local is small
+  -- qwen3.8-max supports up to 131K output, gemini-3.7-flash up to 65K, NIM up to 131K, local is small
   let default_text: text = if tier == "local" and include_tools then "4096" else if tier == "local" then "750" else if tier == "qwen" then "131072" else if tier == "gemini" then "32768" else if tier == "nims" then "32768" else "16384" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_MAX_OUTPUT_TOKENS"), default_text)
   max(to_integer(raw), 128)
@@ -2029,7 +1855,7 @@ end
 function build_custom_provider(url: text, model_override: an optional text): a mapping from text to text
   intent: call resolve_api_key and env_get to build a provider mapping for an explicitly configured url with model and fast_model
   let key: text = resolve_api_key(url)
-  let default_model: text = if is_qwen_url(url) then "deepseek-v4-pro" else if is_gemini_url(url) then "gemini-3.7-flash" else if is_orcarouter_url(url) then "qwen/qwen3.8-27b-free" else if is_nims_url(url) then "deepseek-ai/deepseek-v4-flash-0731" else if is_openrouter_url(url) then "openrouter/free" else if is_groq_url(url) then "openai/gpt-oss-120b" else "google/gemma-4-26b-a4b" end
+  let default_model: text = if is_qwen_url(url) then "qwen3.8-max" else if is_gemini_url(url) then "gemini-3.7-flash" else if is_orcarouter_url(url) then "qwen/qwen3.8-27b-free" else if is_nims_url(url) then "deepseek-ai/deepseek-v4-flash-0731" else if is_openrouter_url(url) then "openrouter/free" else if is_groq_url(url) then "openai/gpt-oss-120b" else "google/gemma-4-26b-a4b" end
   let model: text = unwrap_or(model_override, default_model)
   let url_is_local: boolean = contains_text(url, "localhost") or contains_text(url, "127.0.0.1")
   let fast_model: text = if url_is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), model) end
@@ -2038,9 +1864,9 @@ function build_custom_provider(url: text, model_override: an optional text): a m
 end
 
 function build_qwen_provider(key: text, model_override: an optional text): a mapping from text to text
-  intent: build a provider mapping for the Qwen DashScope API using the deepseek-v4-pro default
-  let model: text = unwrap_or(model_override, "deepseek-v4-pro")
-  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "deepseek-v4-pro")
+  intent: build a provider mapping for the Qwen DashScope API using the qwen3.8-max default
+  let model: text = unwrap_or(model_override, "qwen3.8-max")
+  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "qwen3.8-max")
   let expert_model: text = unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "")
   {"name": "Qwen", "key": key, "url": qwen_base_url(), "full": model, "fast": fast_model, "expert": expert_model}
 end

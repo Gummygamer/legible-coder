@@ -1,0 +1,533 @@
+-- kv_cache.lbl: KV-cache optimization algorithms for legible-coder
+-- Implements techniques from StreamingLLM, H2O, SnapKV, and token budget research
+-- Provides importance-based eviction, attention sink preservation, and token usage tracking
+-- Compaction strategy: eviction first (importance-based), summary fallback second
+
+-- ─── Transcript helpers (shared with coder.lbl via public exports) ────────────
+
+public function compact_summary_marker(): text
+  intent: return compacted session summary marker
+  "COMPACTED SESSION SUMMARY:"
+end
+
+public function msg_content_text(msg: a mapping from text to text): text
+  intent: safely extract msg content as text even when the content is a multimodal list
+  to_text(unwrap_or(get(msg, "content"), ""))
+end
+
+public function message_text(msg: a mapping from text to text): text
+  intent: return content tool_calls text
+  let content: text = msg_content_text(msg)
+  let calls: text = if has_key(msg, "tool_calls") then to_text(get(msg, "tool_calls")) else "" end
+  trim(content ++ "\n" ++ calls)
+end
+
+public function estimate_message_tokens(msg: a mapping from text to text): integer
+  intent: return max text_length message_text divided four
+  max(text_length(message_text(msg)) / 4, 1)
+end
+
+public function estimate_messages_tokens(msgs: a list of a mapping from text to text): integer
+  intent: sum rough token estimates for every message in msgs
+  mutable total: integer = 0
+  for msg in msgs do
+    set total = total + estimate_message_tokens(msg)
+  end
+  total
+end
+
+public function is_compact_summary_message(msg: a mapping from text to text): boolean
+  intent: return true when msg is a synthetic compacted context summary
+  get(msg, "role") == "system" and starts_with(msg_content_text(msg), compact_summary_marker())
+end
+
+public function leading_system_count(msgs: a list of a mapping from text to text): integer
+  intent: count leading system role messages
+  mutable i: integer = 0
+  mutable scanning: boolean = true
+  while i < length(msgs) and scanning do
+    let msg: a mapping from text to text = get(msgs, i)
+    if get(msg, "role") == "system" then
+      set i = i + 1
+    else
+      set scanning = false
+    end
+  end
+  i
+end
+
+public function base_system_messages(msgs: a list of a mapping from text to text): a list of a mapping from text to text
+  intent: append leading system role messages not compact summary
+  mutable result: a list of a mapping from text to text = []
+  mutable i: integer = 0
+  mutable scanning: boolean = true
+  while i < length(msgs) and scanning do
+    let msg: a mapping from text to text = get(msgs, i)
+    if get(msg, "role") == "system" then
+      if not is_compact_summary_message(msg) then
+        set result = append(result, msg)
+      end
+      set i = i + 1
+    else
+      set scanning = false
+    end
+  end
+  result
+end
+
+public function existing_compact_summary(msgs: a list of a mapping from text to text): text
+  intent: return the existing compact summary text if present
+  let found: an optional a mapping from text to text = find(msgs, fn(msg: a mapping from text to text): boolean => is_compact_summary_message(msg))
+  if is_some(found) then
+    unwrap_or(get(unwrap(found), "content"), "")
+  else
+    ""
+  end
+end
+
+function one_line_snippet(text_value: text, max_chars: integer): text
+  intent: replace newline tab trim substring text_value
+  let cleaned: text = replace(replace(trim(text_value), "\n", " "), "\t", " ")
+  if text_length(cleaned) > max_chars then
+    substring(cleaned, 0, max_chars) ++ "..."
+  else
+    cleaned
+  end
+end
+
+function summarize_message_for_context(msg: a mapping from text to text): text
+  intent: format one chat message as a short role-prefixed summary line
+  let role: text = unwrap_or(get(msg, "role"), "message")
+  "- " ++ role ++ ": " ++ one_line_snippet(message_text(msg), 180)
+end
+
+function recent_user_request_summary(msgs: a list of a mapping from text to text): text
+  intent: append user role snippets and drop older requests
+  mutable requests: a list of text = []
+  for msg in msgs do
+    if get(msg, "role") == "user" then
+      set requests = append(requests, "  - " ++ one_line_snippet(message_text(msg), 180))
+      if length(requests) > 3 then
+        set requests = drop(requests, 1)
+      end
+    end
+  end
+  if length(requests) > 0 then
+    "- Recent user requests:\n" ++ join(requests, "\n") ++ "\n"
+  else
+    ""
+  end
+end
+
+function recent_timeline_summary(msgs: a list of a mapping from text to text): text
+  intent: summarize the last few compacted messages as a lightweight timeline
+  let start: integer = max(length(msgs) - 8, 0)
+  let recent: a list of a mapping from text to text = drop(msgs, start)
+  let lines: a list of text = map(recent, fn(msg: a mapping from text to text): text => "  " ++ summarize_message_for_context(msg))
+  if length(lines) > 0 then
+    "- Recent compacted timeline:\n" ++ join(lines, "\n") ++ "\n"
+  else
+    ""
+  end
+end
+
+public function compact_transcript_summary(removed: a list of a mapping from text to text, prior_summary: text): text
+  intent: build a synthetic summary for removed conversation messages while preserving actionable context
+  let prior: text = if text_length(prior_summary) > 0 then "- Previously compacted context:\n  - " ++ one_line_snippet(prior_summary, 700) ++ "\n" else "" end
+  compact_summary_marker() ++ "\n" ++
+  "This synthetic message preserves older conversation context that was compacted to keep the model inside its context budget.\n" ++
+  prior ++
+  "- Scope: " ++ to_text(length(removed)) ++ " older messages compacted from the live transcript.\n" ++
+  recent_user_request_summary(removed) ++
+  recent_timeline_summary(removed) ++
+  "Recent messages after this summary are preserved verbatim. Continue directly from the preserved context without asking the user to repeat it."
+end
+
+public function safe_context_keep_from(msgs: a list of a mapping from text to text, raw_keep_from: integer, min_keep_from: integer): integer
+  intent: decrement keep_from while first_preserved role is tool
+  mutable keep_from: integer = max(raw_keep_from, min_keep_from)
+  mutable scanning: boolean = true
+  while keep_from > min_keep_from and scanning do
+    let first_preserved: a mapping from text to text = get(msgs, keep_from)
+    if get(first_preserved, "role") == "tool" then
+      set keep_from = keep_from - 1
+    else
+      set scanning = false
+    end
+  end
+  keep_from
+end
+
+-- ─── Records ─────────────────────────────────────────────────────────────────
+
+record MessageScore
+  index: integer
+  score: decimal
+end
+
+record TokenUsage
+  prompt_tokens: integer
+  completion_tokens: integer
+  total_tokens: integer
+  messages_count: integer
+  compacted_from: integer
+  budget_remaining: integer
+end
+
+-- ─── Attention Sink Preservation (StreamingLLM) ───────────────────────────────
+
+-- StreamingLLM (Xiao et al., 2023) shows that keeping initial tokens
+-- (attention sinks) prevents catastrophic degradation in streaming contexts.
+-- For a coding assistant, the system prompt and initial context are attention sinks.
+
+function attention_sink_count(): integer
+  intent: return 4 as the number of initial messages after system prompts to always preserve
+  -- StreamingLLM uses 4 initial tokens; use the first 4 messages after system prompts
+  4
+end
+
+public function is_attention_sink(msg: a mapping from text to text, idx: integer, prefix_count: integer): boolean
+  intent: return true when msg is a system message or an early attention sink
+  get(msg, "role") == "system" or idx < prefix_count + attention_sink_count()
+end
+
+-- ─── H2O-style Importance Scoring (Heavy-Hitter Oracle) ───────────────────────
+
+-- H2O (Zhang et al., 2023) scores tokens by cumulative attention received.
+-- We adapt this to message-level scoring: messages with tool calls, error content,
+-- and user requests are heavy hitters that should be preserved.
+
+function h2o_role_score(role: text, has_tool_calls: boolean): decimal
+  intent: score a message by its role for H2O importance (system=10, user=5, assistant-with-tools=4, tool=1)
+  if role == "system" then
+    10.0
+  else if role == "user" then
+    5.0
+  else if role == "assistant" and has_tool_calls then
+    4.0
+  else if role == "tool" then
+    1.0
+  else
+    2.0
+  end
+end
+
+function h2o_content_boost(lower: text): decimal
+  intent: score a message by its content keywords for H2O importance (errors, writes, commits, tests)
+  mutable boost: decimal = 0.0
+  if contains_text(lower, "error") then set boost = boost + 3.0 end
+  if contains_text(lower, "write_file") then set boost = boost + 2.5 end
+  if contains_text(lower, "shell_exec") then set boost = boost + 2.0 end
+  if contains_text(lower, "tool result") and not contains_text(lower, "[tool result removed]") then
+    set boost = boost + 0.5
+  end
+  if contains_text(lower, "commit") or contains_text(lower, "push") then
+    set boost = boost + 1.5
+  end
+  if contains_text(lower, "test") and contains_text(lower, "fail") then
+    set boost = boost + 2.0
+  end
+  boost
+end
+
+function h2o_content_penalty(lower: text): decimal
+  intent: return a negative adjustment for masked tool results and stripped screenshots in H2O importance
+  mutable penalty: decimal = 0.0
+  if contains_text(lower, "[tool result removed]") then set penalty = penalty - 10.0 end
+  if contains_text(lower, "[screenshot evaluated") then set penalty = penalty - 8.0 end
+  penalty
+end
+
+public function h2o_message_score(msg: a mapping from text to text, recency: integer, total: integer): decimal
+  intent: compute a message importance score from role, content keywords, recency, and low-value penalties
+  let role: text = unwrap_or(get(msg, "role"), "")
+  let content: text = msg_content_text(msg)
+  let lower: text = lowercase(content)
+  let role_score: decimal = h2o_role_score(role, has_key(msg, "tool_calls"))
+  let content_boost: decimal = h2o_content_boost(lower)
+  let content_penalty: decimal = h2o_content_penalty(lower)
+  let recency_bonus: decimal = to_decimal(recency) / to_decimal(max(total, 1)) * 3.0
+  role_score + content_boost + content_penalty + recency_bonus
+end
+
+-- ─── SnapKV-style Observation Window ──────────────────────────────────────────
+
+-- SnapKV (Li et al., 2024) uses the last N queries as an observation window
+-- to compute KV importance. We adapt this: messages that share keywords with
+-- the most recent user request or tool output get importance boosts.
+
+function observation_window_size(): integer
+  intent: return 6 as the number of most recent messages to use as the observation window
+  6
+end
+
+function extract_keywords(text_value: text): a list of text
+  intent: split text into lowercase words and return unique keywords longer than 3 characters
+  let lower: text = lowercase(text_value)
+  let words: a list of text = split(lower, " ")
+  mutable seen: a mapping from text to boolean = {}
+  mutable result: a list of text = []
+  for word in words do
+    let cleaned: text = trim(word)
+    if text_length(cleaned) > 3 and not has_key(seen, cleaned) then
+      set seen = put(seen, cleaned, true)
+      set result = append(result, cleaned)
+    end
+  end
+  result
+end
+
+function snapkv_boost(msg: a mapping from text to text, observation_keywords: a list of text): decimal
+  intent: boost a message score when it shares keywords with the observation window
+  let content: text = lowercase(msg_content_text(msg))
+  mutable matches: integer = 0
+  for keyword in observation_keywords do
+    if contains_text(content, keyword) then
+      set matches = matches + 1
+    end
+  end
+  if matches > 0 then
+    to_decimal(matches) * 0.5
+  else
+    0.0
+  end
+end
+
+-- ─── Token Budget with Dynamic Headroom (Token Budget Research) ───────────────
+
+-- Reserve headroom for the model response and tool outputs, so the model
+-- never runs out of context mid-response. (PyramidKV allocates per-layer
+-- budgets; the conversation-level analogue is this dynamic headroom.)
+
+function resolve_token_headroom(): integer
+  intent: read LEGIBLE_CODER_TOKEN_HEADROOM or default to 8192 tokens reserved for model output
+  let raw: text = unwrap_or(env_get("LEGIBLE_CODER_TOKEN_HEADROOM"), "8192")
+  max(to_integer(raw), 1024)
+end
+
+public function effective_context_budget(base_budget: integer): integer
+  intent: subtract headroom from the base budget to leave room for the model response
+  let headroom: integer = resolve_token_headroom()
+  let effective: integer = base_budget - headroom
+  if effective < 1000 then base_budget / 2 else effective end
+end
+
+public function build_token_usage(compact_before: integer, compact_after: integer, msg_count: integer, budget: integer): TokenUsage
+  intent: build a TokenUsage record from compaction metrics
+  TokenUsage {
+    prompt_tokens: compact_after,
+    completion_tokens: 0,
+    total_tokens: compact_after,
+    messages_count: msg_count,
+    compacted_from: compact_before,
+    budget_remaining: max(budget - compact_after, 0)
+  }
+end
+
+public function format_token_usage(usage: TokenUsage): text
+  intent: format a compact token usage line for display
+  "[" ++ to_text(usage.prompt_tokens) ++ " est. tokens, " ++
+  to_text(usage.messages_count) ++ " msgs, " ++
+  to_text(usage.budget_remaining) ++ " remaining]"
+end
+
+-- ─── Importance-Based Eviction (H2O + SnapKV) ─────────────────────────────────
+
+-- The core algorithm: score all messages, then evict the lowest-scoring ones
+-- while preserving attention sinks and the observation window.
+
+function score_all_messages(msgs: a list of a mapping from text to text, prefix_count: integer, observation_keywords: a list of text): a list of MessageScore
+  intent: score every message using H2O heuristics boosted by SnapKV observation window overlap
+  let total: integer = length(msgs)
+  mutable scores: a list of MessageScore = []
+  mutable i: integer = 0
+  while i < total do
+    let msg: a mapping from text to text = get(msgs, i)
+    let h2o: decimal = h2o_message_score(msg, i, total)
+    let snap: decimal = snapkv_boost(msg, observation_keywords)
+    let final_score: decimal = h2o + snap
+    set scores = append(scores, MessageScore { index: i, score: final_score })
+    set i = i + 1
+  end
+  scores
+end
+
+function sort_scores_ascending(scores: a list of MessageScore): a list of MessageScore
+  intent: sort scores by score ascending using sort_by so lowest scores come first
+  sort_by(scores, fn(a: MessageScore, b: MessageScore): boolean => a.score < b.score)
+end
+
+function build_observation_keywords(msgs: a list of a mapping from text to text): a list of text
+  intent: extract keywords from the most recent messages as the SnapKV observation window
+  let total: integer = length(msgs)
+  let window_start: integer = max(total - observation_window_size(), 0)
+  mutable keywords: a list of text = []
+  mutable i: integer = window_start
+  while i < total do
+    let msg: a mapping from text to text = get(msgs, i)
+    let role: text = unwrap_or(get(msg, "role"), "")
+    if role == "user" or role == "tool" then
+      let words: a list of text = extract_keywords(msg_content_text(msg))
+      set keywords = reduce(words, keywords, fn(acc: a list of text, w: text): a list of text => append(acc, w))
+    end
+    set i = i + 1
+  end
+  keywords
+end
+
+function is_evictable(score: MessageScore, prefix_count: integer, total: integer, observation_count: integer): boolean
+  intent: return true when the scored message is neither an attention sink nor in the observation window
+  let observation_start: integer = total - observation_count
+  score.index >= prefix_count + attention_sink_count() and score.index < observation_start
+end
+
+function eviction_candidates(scores: a list of MessageScore, prefix_count: integer, total: integer, observation_count: integer): a list of MessageScore
+  intent: filter scores to only include evictable messages (not attention sinks, not observation window)
+  filter(scores, fn(s: MessageScore): boolean => is_evictable(s, prefix_count, total, observation_count))
+end
+
+public function evict_by_importance(msgs: a list of a mapping from text to text, max_tokens: integer, prefix_count: integer, preserve_recent: integer): a list of a mapping from text to text
+  intent: evict the lowest-scoring messages until the estimated token count is at or under the budget
+  let total: integer = length(msgs)
+  let estimated: integer = estimate_messages_tokens(msgs)
+  if estimated <= max_tokens or total <= prefix_count + preserve_recent then
+    msgs
+  else
+    let observation_keywords: a list of text = build_observation_keywords(msgs)
+    let all_scores: a list of MessageScore = score_all_messages(msgs, prefix_count, observation_keywords)
+    let candidates: a list of MessageScore = eviction_candidates(all_scores, prefix_count, total, preserve_recent)
+    let sorted: a list of MessageScore = sort_scores_ascending(candidates)
+    let tokens_to_free: integer = estimated - max_tokens
+    mutable freed: integer = 0
+    mutable evict_indices: a mapping from text to boolean = {}
+    for candidate in sorted do
+      if freed >= tokens_to_free then
+        skip()
+      else
+        let msg: a mapping from text to text = get(msgs, candidate.index)
+        set freed = freed + estimate_message_tokens(msg)
+        set evict_indices = put(evict_indices, to_text(candidate.index), true)
+      end
+    end
+    -- Rebuild the message list without evicted messages
+    mutable result: a list of a mapping from text to text = []
+    mutable i: integer = 0
+    while i < total do
+      if has_key(evict_indices, to_text(i)) then
+        skip()
+      else
+        set result = append(result, get(msgs, i))
+      end
+      set i = i + 1
+    end
+    result
+  end
+end
+
+-- ─── Enhanced Compaction ──────────────────────────────────────────────────────
+
+-- Combines the existing summarization approach with importance-based eviction.
+-- First, evict low-importance messages. If still over budget, fall back to
+-- the summary-based compaction.
+
+public function enhanced_compact_context(msgs: a list of a mapping from text to text, max_estimated_tokens: integer, preserve_recent_messages: integer): a list of a mapping from text to text
+  intent: first evict low-importance messages, then compact into summary if still over budget
+  let prefix_count: integer = leading_system_count(msgs)
+  let estimated: integer = estimate_messages_tokens(msgs)
+  if max_estimated_tokens <= 0 or estimated <= max_estimated_tokens or length(msgs) <= prefix_count + preserve_recent_messages then
+    msgs
+  else
+    -- Step 1: importance-based eviction
+    let evicted: a list of a mapping from text to text = evict_by_importance(msgs, max_estimated_tokens, prefix_count, preserve_recent_messages)
+    let after_eviction: integer = estimate_messages_tokens(evicted)
+    if after_eviction <= max_estimated_tokens then
+      evicted
+    else
+      -- Step 2: fall back to summary-based compaction for remaining overflow
+      let raw_keep_from: integer = max(length(evicted) - preserve_recent_messages, prefix_count)
+      let keep_from: integer = safe_context_keep_from(evicted, raw_keep_from, prefix_count)
+      if keep_from <= prefix_count then
+        evicted
+      else
+        let removed: a list of a mapping from text to text = take(drop(evicted, prefix_count), keep_from - prefix_count)
+        let preserved: a list of a mapping from text to text = drop(evicted, keep_from)
+        let summary: text = compact_transcript_summary(removed, existing_compact_summary(evicted))
+        let compact_msg: a mapping from text to text = {"role": "system", "content": summary}
+        let with_summary: a list of a mapping from text to text = append(base_system_messages(evicted), compact_msg)
+        reduce(preserved, with_summary, fn(acc: a list of a mapping from text to text, msg: a mapping from text to text): a list of a mapping from text to text => append(acc, msg))
+      end
+    end
+  end
+end
+
+-- ─── Token Usage Tracking ─────────────────────────────────────────────────────
+
+-- Track token usage across turns and report metrics to the user.
+-- This helps users understand their context budget and optimize their prompts.
+
+public function merge_token_usage(a: TokenUsage, b: TokenUsage): TokenUsage
+  intent: combine two TokenUsage records by summing token counts and keeping the latest message count
+  TokenUsage {
+    prompt_tokens: a.prompt_tokens + b.prompt_tokens,
+    completion_tokens: a.completion_tokens + b.completion_tokens,
+    total_tokens: a.total_tokens + b.total_tokens,
+    messages_count: max(a.messages_count, b.messages_count),
+    compacted_from: a.compacted_from + b.compacted_from,
+    budget_remaining: min(a.budget_remaining, b.budget_remaining)
+  }
+end
+
+public function estimate_tokens_after_compaction(msgs: a list of a mapping from text to text, context_budget: integer, preserve_recent: integer, compact_after: integer): TokenUsage
+  intent: compute the estimated token usage after compaction and return a TokenUsage record
+  let tokens_before: integer = estimate_messages_tokens(msgs)
+  if tokens_before < compact_after then
+    TokenUsage {
+      prompt_tokens: tokens_before,
+      completion_tokens: 0,
+      total_tokens: tokens_before,
+      messages_count: length(msgs),
+      compacted_from: 0,
+      budget_remaining: max(context_budget - tokens_before, 0)
+    }
+  else
+    let effective_budget: integer = effective_context_budget(context_budget)
+    let compacted: a list of a mapping from text to text = enhanced_compact_context(msgs, effective_budget, preserve_recent)
+    let tokens_after: integer = estimate_messages_tokens(compacted)
+    TokenUsage {
+      prompt_tokens: tokens_after,
+      completion_tokens: 0,
+      total_tokens: tokens_after,
+      messages_count: length(compacted),
+      compacted_from: tokens_before,
+      budget_remaining: max(effective_budget - tokens_after, 0)
+    }
+  end
+end
+
+-- ─── Diagnostics ──────────────────────────────────────────────────────────────
+
+public function print_compaction_diagnostics(before: integer, after: integer, budget: integer): nothing
+  intent: print a one-line compaction diagnostic showing token reduction and savings percentage
+  if before > after then
+    let saved: integer = before - after
+    let pct: integer = saved * 100 / before
+    print("  [context] compacted " ++ to_text(before) ++ " -> " ++ to_text(after) ++
+      " est. tokens (" ++ to_text(pct) ++ "% reduction, budget: " ++ to_text(budget) ++ ")")
+  end
+end
+
+public function score_distribution(msgs: a list of a mapping from text to text, prefix_count: integer): text
+  intent: compute and return a text summary of the H2O score distribution for diagnostics
+  let total: integer = length(msgs)
+  let observation_keywords: a list of text = build_observation_keywords(msgs)
+  let all_scores: a list of MessageScore = score_all_messages(msgs, prefix_count, observation_keywords)
+  if length(all_scores) == 0 then
+    "no messages"
+  else
+    let sorted: a list of MessageScore = sort_scores_ascending(all_scores)
+    let lowest: decimal = get(sorted, 0).score
+    let highest: decimal = get(sorted, length(sorted) - 1).score
+    let mid: decimal = get(sorted, length(sorted) / 2).score
+    "range [min=" ++ to_text(lowest) ++ " med=" ++ to_text(mid) ++ " max=" ++ to_text(highest) ++ "]"
+  end
+end

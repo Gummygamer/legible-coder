@@ -1,11 +1,11 @@
 # legible-coder
 
-An interactive CLI coding assistant for the [Legible programming language](../legible/), styled after Claude Code. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is Qwen with `qwen3.8-max`, followed by Gemini, OrcaRouter, NVIDIA NIM, OpenRouter, Groq, and local LM Studio.
+An interactive CLI coding assistant for the [Legible programming language](../legible/), styled after Claude Code. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is Qwen with `deepseek-v4-pro`, followed by Gemini, OrcaRouter, NVIDIA NIM, OpenRouter, Groq, and local LM Studio.
 
 ```
   legible-coder
   Interactive Legible coding assistant
-  Model: qwen3.8-max via Qwen
+  Model: deepseek-v4-pro via Qwen
   ────────────────────────────────────────────
   cwd: /your/project
   Type your request, or 'quit' to exit.
@@ -107,7 +107,7 @@ older messages are compacted into a synthetic summary while recent messages are
 kept verbatim. Native tool-call transcripts are compacted at safe boundaries so
 tool results keep their preceding assistant tool-call message. No compression
 of any kind runs while the transcript is below the compact-after floor; for
-Qwen (`qwen3.8-max`, a 1M-token window) that floor is about `100000` estimated
+Qwen (`deepseek-v4-pro`, a 1M-token window) that floor is about `100000` estimated
 tokens, so tool results and vision images stay verbatim until the conversation
 is genuinely large.
 
@@ -157,7 +157,7 @@ legible-coder/
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `OPENAI_API_KEY` | For Qwen | Qwen API key for the default primary provider. Uses `qwen3.8-max` by default |
+| `OPENAI_API_KEY` | For Qwen | Qwen API key for the default primary provider. Uses `deepseek-v4-pro` by default |
 | `DASHSCOPE_API_KEY` | For Qwen | Provider-specific alternative to `OPENAI_API_KEY` (takes precedence when both are set) |
 | `ALIBABA_TOKEN_PLAN_API_KEY` | For Qwen | Provider-specific alternative to `OPENAI_API_KEY` (used after `DASHSCOPE_API_KEY`) |
 | `GEMINI_API_KEY` | For Gemini | Gemini API key for the first fallback |
@@ -167,7 +167,7 @@ legible-coder/
 | `GROQ_API_KEY` | For Groq | Groq API key for the fifth fallback |
 | `LEGIBLE_CODER_API_KEY` | No | Explicit API key override. Local endpoints default to `lm-studio` |
 | `LEGIBLE_CODER_BASE_URL` | No | OpenAI-compatible base URL. Auto-detects Qwen, Gemini, OrcaRouter, NIM, OpenRouter, Groq, then local LM Studio when unset |
-| `LEGIBLE_CODER_MODEL` | No | Primary model. Defaults include `qwen3.8-max` for Qwen, `gemini-3.7-flash` for Gemini, and provider-specific models for other backends |
+| `LEGIBLE_CODER_MODEL` | No | Primary model. Defaults include `deepseek-v4-pro` for Qwen, `gemini-3.7-flash` for Gemini, and provider-specific models for other backends |
 | `LEGIBLE_CODER_FAST_MODEL` | No | Remote fast model for simple turns. Defaults to the provider's fast or primary model |
 | `LEGIBLE_CODER_EXPERT_MODEL` | No | Optional remote expert model for architecture/refactor/design turns |
 | `LEGIBLE_CODER_LOCAL_TOOLS` | No | `1` forces native tools for local models, `0` forces manual local protocol. Gemma 4 names auto-enable native tools |

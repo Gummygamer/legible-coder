@@ -1,6 +1,6 @@
 # legible-coder
 
-An interactive CLI coding assistant written in the Legible programming language. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is Qwen (DashScope) with `qwen3.8-max`, with Gemini, OrcaRouter, NVIDIA NIM, OpenRouter, and Groq as remote fallbacks in that order.
+An interactive CLI coding assistant written in the Legible programming language. It writes Legible code and performs tasks by running Legible scripts through an OpenAI-compatible chat completions API. The default backend is Qwen (DashScope) with `deepseek-v4-pro`, with Gemini, OrcaRouter, NVIDIA NIM, OpenRouter, and Groq as remote fallbacks in that order.
 
 ## Architecture
 
@@ -26,7 +26,7 @@ OpenAI-compatible tool results are not orphaned from their assistant tool-call
 message. All compression (old tool-result masking, old vision-image stripping,
 and summary compaction) is skipped while the transcript is below
 `LEGIBLE_CODER_CONTEXT_COMPACT_AFTER`; that floor defaults to `100000`
-estimated tokens for the Qwen tier (qwen3.8-max has a 1M-token window) and `0`
+estimated tokens for the Qwen tier (deepseek-v4-pro has a 1M-token window) and `0`
 for every other provider, and is clamped to the context budget.
 
 ### Tool system

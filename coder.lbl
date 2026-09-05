@@ -5,6 +5,7 @@
 
 
 use kv_cache
+use turn_budget
 
 -- ─── Tool schema helpers ──────────────────────────────────────────────────────
 
@@ -959,16 +960,18 @@ function web_turn_pid_is_live(content: text): boolean
 end
 
 function web_turn_is_locked(ws_id: text, conv_id: text): boolean
-  intent: return false when web_turn_lock_content is empty else use web_turn_pending_age_ms or web_turn_pid_is_live
+  intent: return false when web_turn_lock_content is empty else report a fresh pending stamp or a live worker pid and release the lock when it went stale
   let content: text = web_turn_lock_content(ws_id, conv_id)
   if text_length(content) == 0 then
     false
   else
     let pending_age: integer = web_turn_pending_age_ms(content)
-    if pending_age >= 0 then
-      pending_age < 60000
+    let live: boolean = if pending_age >= 0 then pending_age < 60000 else web_turn_pid_is_live(content) end
+    if live then
+      true
     else
-      web_turn_pid_is_live(content)
+      web_turn_lock_release(ws_id, conv_id)
+      false
     end
   end
 end
@@ -989,28 +992,6 @@ function web_turn_lock_acquire(ws_id: text, conv_id: text): nothing
   intent: create the locks dir then write a pending stamp that the spawn command replaces with the worker pid
   create_dir(web_base_dir() ++ "/locks")
   write_file(web_turn_lock_path(ws_id, conv_id), "pending:" ++ to_text(current_time_ms()))
-end
-
-function web_worker_lock_release(): nothing
-  intent: release the turn lock named by the worker environment so a failing background turn does not stay locked
-  let ws_id: text = trim(unwrap_or(env_get("LEGIBLE_CODER_WS_ID"), ""))
-  let conv_id: text = trim(unwrap_or(env_get("LEGIBLE_CODER_CONV_ID"), ""))
-  if text_length(ws_id) == 0 or text_length(conv_id) == 0 then
-    skip()
-  else
-    web_turn_lock_release(ws_id, conv_id)
-  end
-end
-
-function web_worker_stamp_own_pid(): nothing
-  intent: write the parent pid of this worker into the web_turn_lock_path named by env_get
-  let ws_id: text = trim(unwrap_or(env_get("LEGIBLE_CODER_WS_ID"), ""))
-  let conv_id: text = trim(unwrap_or(env_get("LEGIBLE_CODER_CONV_ID"), ""))
-  if text_length(ws_id) == 0 or text_length(conv_id) == 0 then
-    skip()
-  else
-    shell_exec("printf '%s' $PPID > " ++ shell_quote(web_turn_lock_path(ws_id, conv_id)))
-  end
 end
 
 function web_turn_lock_release(ws_id: text, conv_id: text): nothing
@@ -1529,7 +1510,7 @@ function handle_tool_round(msg: a mapping from text to text, msgs: a list of a m
     print("  [round " ++ to_text(round) ++ " - forcing text response]")
     prompt_loop_step(msgs, total_tools, last_batch, "STOP calling tools. Provide your answer as plain text NOW.", false, explore_count, acted)
   else
-    let valid_calls: a list of a mapping from text to text = dedupe_tool_calls(filter_valid_calls(unwrap_or(get(msg, "tool_calls"), [])))
+    let valid_calls: a list of a mapping from text to text = take(dedupe_tool_calls(filter_valid_calls(unwrap_or(get(msg, "tool_calls"), []))), max(max_tools - total_tools, 0))
     let current_batch: text = batch_fingerprint(valid_calls)
     if length(valid_calls) > 0 and current_batch != last_batch then
       let batch: BatchResult = run_tool_batch(msgs, valid_calls, total_tools, max_tools, include_vision)
@@ -1537,8 +1518,8 @@ function handle_tool_round(msg: a mapping from text to text, msgs: a list of a m
         messages: batch.messages,
         count: batch.count,
         last_batch: current_batch,
-        waiting: not batch.stop,
-        must_force_text: false,
+        waiting: true,
+        must_force_text: batch.stop,
         explore_count: explore_count,
         acted: true
       }
@@ -1829,7 +1810,61 @@ function usage_field_number(parsed: a mapping from text to text, field: text): i
   end
 end
 
-function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer, compact_after: integer, include_vision: boolean, track_usage: boolean): InnerLoopResult
+record TurnBudgetPlan
+  state: MutsState
+  cap: integer
+  ceiling: integer
+end
+
+record BudgetRound
+  state: MutsState
+  messages: a list of a mapping from text to text
+  must_force_text: boolean
+  stop: boolean
+end
+
+function plan_turn_budget(init_messages: a list of a mapping from text to text, turn_quality: decimal, context_budget: integer, max_tools: integer, include_tools: boolean): TurnBudgetPlan
+  intent: derive the per-turn budget state cap and ceiling from the difficulty prior and starting context size
+  -- Use the full estimated budget; a fractional reserve prematurely forced
+  -- text after only 1/3/5 rounds for easy/complex/expert tasks.
+  let ceiling: integer = if include_tools then max_tools else 999999 end
+  let base_context: integer = kv_cache.estimate_messages_tokens(init_messages)
+  let budget: MutsState = turn_budget.initial_state(turn_quality, base_context, context_budget)
+  let cap: integer = min(turn_budget.explore_cap(budget, ceiling), ceiling)
+  TurnBudgetPlan {state: budget, cap: cap, ceiling: ceiling}
+end
+
+function announce_turn_budget(plan: TurnBudgetPlan, include_tools: boolean): nothing
+  intent: print the derived cap and starting budget state once per turn when tools are enabled
+  if include_tools then
+    print(turn_budget.format_diagnostics(plan.state, plan.cap))
+  end
+end
+
+function observe_turn_budget(state: MutsState, outcome: ApiRoundOutcome, prior_tools: integer, round: integer, plan: TurnBudgetPlan, include_tools: boolean): BudgetRound
+  intent: fold the round into the budget state, print diagnostics, request a final answer at the budget limit and allow bounded text retries
+  -- A round is productive exactly when it executed at least one new tool. A
+  -- repeated batch, an invalid call, or an incomplete argument block leaves the
+  -- tool count unchanged, the saturation signal that drives lambda toward its
+  -- floor inside observe_round.
+  let productive: boolean = outcome.total_tools > prior_tools
+  let measured: integer = kv_cache.estimate_messages_tokens(outcome.messages)
+  let next_state: MutsState = turn_budget.observe_round(state, measured, productive)
+  if include_tools and next_state.diagnostics then
+    print(turn_budget.format_diagnostics(next_state, plan.cap))
+  end
+  if round >= plan.ceiling + 2 then
+    print("  [warn] reached " ++ to_text(plan.ceiling) ++ " response rounds this turn, stopping]")
+    BudgetRound {state: next_state, messages: outcome.messages, must_force_text: outcome.must_force_text, stop: true}
+  else if include_tools and outcome.waiting and (outcome.total_tools >= plan.ceiling or not turn_budget.should_continue(next_state, plan.cap)) then
+    print("  [budget] tool-round budget reached at round " ++ to_text(round) ++ "; asking for the final answer")
+    BudgetRound {state: next_state, messages: append(outcome.messages, {"role": "user", "content": "The tool budget for this turn has been reached. Stop calling tools and summarize what you completed, including any work that remains unfinished."}), must_force_text: true, stop: false}
+  else
+    BudgetRound {state: next_state, messages: outcome.messages, must_force_text: outcome.must_force_text, stop: false}
+  end
+end
+
+function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer, compact_after: integer, include_vision: boolean, track_usage: boolean, turn_quality: decimal): InnerLoopResult
   intent: call the API in a loop executing tool calls and return messages plus whether the model was used successfully and token usage when track_usage is set
   mutable msgs: a list of a mapping from text to text = init_messages
   mutable waiting: boolean = true
@@ -1842,28 +1877,28 @@ function run_inner_loop(init_messages: a list of a mapping from text to text, me
   mutable acted: boolean = false
   mutable session_prompt: integer = 0
   mutable session_completion: integer = 0
-  let round_cap: integer = if include_tools then max_tools else 999999 end
+  let plan: TurnBudgetPlan = plan_turn_budget(init_messages, turn_quality, context_budget, max_tools, include_tools)
+  mutable state: MutsState = plan.state
+  announce_turn_budget(plan, include_tools)
   while waiting do
     set round = round + 1
-    let force_text: boolean = if include_tools then must_force_text or round > max_tools / 2 else false end
+    let force_text: boolean = if include_tools then must_force_text or not turn_budget.should_continue(state, plan.cap) or total_tools >= max_tools else false end
     set must_force_text = false
     set msgs = compact_loop_messages(msgs, context_budget, preserve_recent_messages, compact_after)
     let resp: a mapping from text to text = call_api(key, base_url, build_request(model, msgs, force_text, include_tools, include_dir_tools, max_output_tokens, include_vision))
     let outcome: ApiRoundOutcome = process_api_round(resp, msgs, messages_start, round, include_tools, total_tools, max_tools, last_batch, force_text, explore_count, acted, include_vision, track_usage)
-    set msgs = outcome.messages
+    let budget: BudgetRound = observe_turn_budget(state, outcome, total_tools, round, plan, include_tools)
+    set state = budget.state
+    set msgs = budget.messages
+    set must_force_text = budget.must_force_text
     set used_model = outcome.used_model
     set total_tools = outcome.total_tools
     set last_batch = outcome.last_batch
-    set waiting = outcome.waiting
-    set must_force_text = outcome.must_force_text
+    set waiting = outcome.waiting and not budget.stop
     set explore_count = outcome.explore_count
     set acted = outcome.acted
     set session_prompt = session_prompt + outcome.prompt_tokens
     set session_completion = session_completion + outcome.completion_tokens
-    if round >= round_cap then
-      print("  [warn] reached " ++ to_text(round_cap) ++ " response rounds this turn, stopping]")
-      set waiting = false
-    end
   end
   InnerLoopResult {messages: finish_inner_loop(msgs, messages_start, last_message_is_assistant_text(msgs)), used_model: used_model, context_budget: context_budget, prompt_tokens: session_prompt, completion_tokens: session_completion}
 end
@@ -2178,10 +2213,9 @@ function print_turn_model_banner(provider_idx: integer, switched: boolean, prov:
 end
 
 function fail_turn_no_provider(): nothing
-  intent: print the no provider available error emit an error event release the worker lock and exit the process
+  intent: print the no provider available error emit an error event and exit the process
   print("Error: no model is available.")
   web_event_emit({"type": "error", "text": "Error: no model provider is reachable. Check your API keys and network connection, then try again."})
-  web_worker_lock_release()
   exit_process(1)
 end
 
@@ -2202,7 +2236,8 @@ function run_turn_with_fallback(messages: a list of a mapping from text to text,
     let limits: ProviderLimits = resolve_provider_limits(provider_tier(get(prov, "url")), include_tools)
     print_turn_model_banner(provider_idx, attempts > 0, prov, turn_model, p_full, p_fast, p_expert)
     if provider_is_reachable(get(prov, "url")) then
-      let inner: InnerLoopResult = run_inner_loop(msgs, start, get(prov, "key"), get(prov, "url"), turn_model, max_tools, include_tools, include_dir_tools, limits.max_output_tokens, limits.context_budget, limits.keep_messages, limits.compact_after, include_vision, track_usage)
+      let turn_quality: decimal = turn_budget.difficulty_prior(is_expert_task(user_input), is_complex_task(user_input))
+      let inner: InnerLoopResult = run_inner_loop(msgs, start, get(prov, "key"), get(prov, "url"), turn_model, max_tools, include_tools, include_dir_tools, limits.max_output_tokens, limits.context_budget, limits.keep_messages, limits.compact_after, include_vision, track_usage, turn_quality)
       set msgs = inner.messages
       set last_inner = inner
       if inner.used_model then
@@ -2666,15 +2701,15 @@ function web_start_turn(ws_id: text, conv_id: text, user_text: text, root_dir: t
   let prefix: text = web_worker_launch_prefix()
   if text_length(prefix) == 0 then
     web_turn_lock_release(ws_id, conv_id)
-    {"ok": false, "error": "cannot determine the interpreter and script path of the running server"}
+    {"ok": "false", "error": "cannot determine the interpreter and script path of the running server"}
   else
     let events_path: text = web_events_path(ws_id, conv_id)
     let spawned: a mapping from text to text = shell_exec(web_worker_spawn_cmd(prefix, ws_id, conv_id, user_text, root_dir, events_path))
     if to_text(get(spawned, "exit_code")) == "0" then
-      {"ok": true, "started": true, "events_path": events_path}
+      {"ok": "true", "started": "true", "events_path": events_path}
     else
       web_turn_lock_release(ws_id, conv_id)
-      {"ok": false, "error": "failed to start the turn worker: " ++ to_text(get(spawned, "stderr"))}
+      {"ok": "false", "error": "failed to start the turn worker: " ++ to_text(get(spawned, "stderr")) ++ " " ++ to_text(get(spawned, "stdout"))}
     end
   end
 end
@@ -2710,6 +2745,7 @@ function web_handle_send(body: text, init_messages: a list of a mapping from tex
         if unwrap_or(get(started, "ok"), "false") == "true" then
           web_respond_json(200, json_encode({"ok": true, "started": true, "ws": ws_id, "conv": conv_id, "messages": web_display_messages(saved)}))
         else
+          web_save_session(ws_id, conv_id, msgs)
           web_respond_json(500, web_json_error(unwrap_or(get(started, "error"), "failed to start turn")))
         end
       end
@@ -2958,7 +2994,7 @@ function web_js_chunk_3(): text
   "  const s = await api('/api/files');\n" ++
   "  const list = document.getElementById('file-list');\n" ++
   "  list.innerHTML = '';\n" ++
-  "  (s.files || []).forEach(f => @OB@ const d = document.createElement('div'); d.textContent = f; d.title = f; list.appendChild(d); @CB@);\n"
+  "  (s.files || []).forEach(f => @OB@ const d = document.createElement('div'); d.textContent = f; d.title = f; list.appendChild(d); @CB@);\n@CB@\n"
 end
 
 function web_js_live(): text
@@ -2977,7 +3013,7 @@ function web_js_live(): text
   "function prettyArgs(a) @OB@ try @OB@ return JSON.stringify(JSON.parse(a), null, 1); @CB@ catch (e) @OB@ return String(a || ''); @CB@ @CB@\n" ++
   "function stopLive() @OB@\n" ++
   "  if (evTimer) @OB@ clearInterval(evTimer); evTimer = null; @CB@\n" ++
-  "  evBusy = false; evDone = false; evErrors = 0;\n" ++
+  "  evBusy = false; evErrors = 0;\n" ++
   "  if (liveBox && liveBox.parentNode) @OB@ liveBox.parentNode.removeChild(liveBox); @CB@\n" ++
   "  liveBox = null; liveStatus = null; liveChips = @OB@@CB@;\n" ++
   "@CB@\n" ++
@@ -3098,7 +3134,6 @@ end
 
 function web_js_chunk_4(): text
   intent: return the js text with toggleFiles send startPolling and the input keydown listener
-  "@CB@\n" ++
   "function toggleFiles() @OB@\n" ++
   "  const p = document.getElementById('filepanel');\n" ++
   "  p.classList.toggle('open');\n" ++
@@ -3110,13 +3145,14 @@ function web_js_chunk_4(): text
   "  const text = input.value.trim();\n" ++
   "  if (text.length === 0) return;\n" ++
   "  busy = true;\n" ++
+  "  evDone = false;\n" ++
   "  input.value = '';\n" ++
   "  const btn = document.getElementById('sendbtn');\n" ++
   "  btn.disabled = true;\n" ++
   "  btn.innerHTML = '<span class=spinner></span>';\n" ++
   "  try @OB@\n" ++
   "    const res = await api('/api/send', @OB@method:'POST', headers:@OB@'content-type':'application/json'@CB@, body: JSON.stringify(@OB@text: text@CB@)@CB@);\n" ++
-  "    if (res.error) @OB@ await finishTurn(res.error); return; @CB@\n" ++
+  "    if (res.error) @OB@ input.value = text; await finishTurn(res.error); return; @CB@\n" ++
   "    liveWs = res.ws || '';\n" ++
   "    liveConv = res.conv || '';\n" ++
   "    renderMessages(res.messages || []);\n" ++
@@ -3124,6 +3160,7 @@ function web_js_chunk_4(): text
   "    startLive();\n" ++
   "    startPolling();\n" ++
   "  @CB@ catch (e) @OB@\n" ++
+  "    input.value = text;\n" ++
   "    await finishTurn('Request failed: ' + e);\n" ++
   "  @CB@\n" ++
   "@CB@\n" ++
@@ -3218,7 +3255,8 @@ function route_web_request(request: Request, init_messages: a list of a mapping 
 end
 
 function run_web_server(init_messages: a list of a mapping from text to text, providers: a list of a mapping from text to text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, include_vision: boolean): nothing
-  intent: start the HTTP server chdir into the active workspace and serve the web GUI until interrupted
+  intent: capture the launch state then start the HTTP server chdir into the active workspace and serve the web GUI until interrupted
+  web_capture_launch_state()
   let reg: a mapping from text to text = web_ensure_registry()
   let ws: a mapping from text to text = web_active_workspace(reg)
   let root_dir: text = unwrap_or(get(ws, "root_dir"), get_cwd())
@@ -3242,30 +3280,51 @@ end
 -- --- Background turn worker (lets the serial web server stream tool calls) ---
 
 function web_absolute_script(script: text): text
-  intent: return script when starts_with slash else readlink the shell_quote cwd path
+  intent: return script when starts_with slash else resolve it against get_cwd before the server switches workspaces
   if starts_with(script, "/") then
     script
   else
-    let server_cwd: text = trim(get(shell_exec("readlink -f /proc/$PPID/cwd"), "stdout"))
+    let server_cwd: text = get_cwd()
     let resolved: text = trim(get(shell_exec("readlink -f " ++ shell_quote(server_cwd ++ "/" ++ script)), "stdout"))
     if text_length(resolved) > 0 then resolved else server_cwd ++ "/" ++ script end
   end
 end
 
+function web_worker_interpreter(): text
+  intent: readlink the absolute executable of the running interpreter through the parent pid of the spawned shell
+  trim(get(shell_exec("readlink -f /proc/$PPID/exe"), "stdout"))
+end
+
+function web_launch_state_path(): text
+  intent: return web_base_dir plus the server-launch.json filename holding the captured interpreter and script
+  web_base_dir() ++ "/server-launch.json"
+end
+
+function web_capture_launch_state(): nothing
+  intent: record this interpreter and its absolute script path while the launch cwd can still resolve a relative script argument
+  create_dir(web_base_dir())
+  let args: a list of text = get_args()
+  let script: text = if length(args) > 0 then web_absolute_script(get(args, 0)) else "" end
+  web_write_json_atomic(web_launch_state_path(), json_encode({"interpreter": web_worker_interpreter(), "script": script}))
+end
+
 function web_worker_launcher(): a list of text
-  intent: return the interpreter and the absolute lbl script path of the running server read from the parent process command line
-  let raw: text = trim(get(shell_exec("tr '\\0' ' ' < /proc/$PPID/cmdline"), "stdout"))
-  let parts: a list of text = filter(split(raw, " "), fn(p: text): boolean => text_length(p) > 0)
-  let scripts: a list of text = filter(parts, fn(p: text): boolean => ends_with(p, ".lbl"))
-  if length(parts) >= 1 and length(scripts) > 0 then
-    [get(parts, 0), web_absolute_script(get(scripts, 0))]
+  intent: return the interpreter and absolute script path from the launch state when both files exist
+  let state_path: text = web_launch_state_path()
+  let raw: text = if file_exists(state_path) then read_file(state_path) else "" end
+  let empty_state: a mapping from text to text = {"interpreter": "", "script": ""}
+  let state: a mapping from text to text = if json_valid(raw) then json_parse(raw) else empty_state end
+  let interpreter: text = trim(unwrap_or(get(state, "interpreter"), ""))
+  let script: text = trim(unwrap_or(get(state, "script"), ""))
+  if file_exists(interpreter) and file_exists(script) then
+    [interpreter, script]
   else
     []
   end
 end
 
 function web_worker_launch_prefix(): text
-  intent: return shell_quote of the web_worker_launcher parts joined with run when length allows
+  intent: return shell_quote of the web_worker_launcher parts joined with run when both parts exist
   let parts: a list of text = web_worker_launcher()
   if length(parts) < 2 then
     ""
@@ -3275,14 +3334,28 @@ function web_worker_launch_prefix(): text
 end
 
 function web_worker_spawn_cmd(prefix: text, ws_id: text, conv_id: text, user_text: text, work_dir: text, events_path: text): text
-  intent: build a detached setsid nohup command exporting the turn context with no stdin and its own log file
+  intent: build a detached setsid nohup supervisor command exporting the turn context after checking the work directory and log file
+  let supervisor: text = web_worker_supervisor_cmd(prefix, web_turn_lock_path(ws_id, conv_id), events_path)
   "cd " ++ shell_quote(work_dir) ++ " && " ++
+  "command -v setsid >/dev/null && command -v nohup >/dev/null && " ++
+  ": > " ++ shell_quote(web_worker_log_path(ws_id, conv_id)) ++ " && ( " ++
   "LEGIBLE_CODER_WS_ID=" ++ shell_quote(ws_id) ++ " " ++
   "LEGIBLE_CODER_CONV_ID=" ++ shell_quote(conv_id) ++ " " ++
   "LEGIBLE_CODER_USER_TEXT=" ++ shell_quote(user_text) ++ " " ++
   "LEGIBLE_CODER_WORKDIR=" ++ shell_quote(work_dir) ++ " " ++
   "LEGIBLE_CODER_EVENTS_PATH=" ++ shell_quote(events_path) ++ " " ++
-  "setsid nohup " ++ prefix ++ " --turn </dev/null > " ++ shell_quote(web_worker_log_path(ws_id, conv_id)) ++ " 2>&1 &"
+  "setsid nohup sh -c " ++ shell_quote(supervisor) ++ " </dev/null >> " ++ shell_quote(web_worker_log_path(ws_id, conv_id)) ++ " 2>&1 & )"
+end
+
+function web_worker_supervisor_cmd(prefix: text, lock_path: text, events_path: text): text
+  intent: stamp the supervisor pid run the worker then append an error on failure release the lock and append done even if the interpreter exits early
+  let failure: text = json_encode({"type": "error", "text": "The turn worker failed before completing the response. Please try again."})
+  let done: text = json_encode({"type": "done"})
+  "printf '%s' $$ > " ++ shell_quote(lock_path) ++ "; " ++
+  prefix ++ " --turn; turn_status=$?; " ++
+  "if [ \"$turn_status\" -ne 0 ]; then printf '%s\\n' " ++ shell_quote(failure) ++ " >> " ++ shell_quote(events_path) ++ "; fi; " ++
+  "printf '%s\\n' " ++ shell_quote(done) ++ " >> " ++ shell_quote(events_path) ++ "; " ++
+  "rm -f " ++ shell_quote(lock_path) ++ "; exit \"$turn_status\""
 end
 
 function web_title_conversation(ws_id: text, conv_id: text, user_text: text): nothing
@@ -3309,7 +3382,7 @@ function web_title_conversation(ws_id: text, conv_id: text, user_text: text): no
 end
 
 function run_web_turn(ws_id: text, conv_id: text, user_text: text, work_dir: text): nothing
-  intent: run one turn on the already saved transcript then persist it with its title usage and done event
+  intent: run one turn on the already saved transcript then persist it with its title and usage
   if is_dir(work_dir) then
     chdir(work_dir)
   else
@@ -3339,15 +3412,11 @@ function run_web_turn(ws_id: text, conv_id: text, user_text: text, work_dir: tex
   end
   web_save_session(ws_id, conv_id, msgs)
   web_title_conversation(ws_id, conv_id, user_text)
-  web_turn_lock_release(ws_id, conv_id)
-  web_event_emit({"type": "done"})
 end
 
 function run_worker_turn(): nothing
-  intent: stamp the lock with this pid then run the env named turn and release the lock when it ends
-  web_worker_stamp_own_pid()
+  intent: run_web_turn with the workspace conversation user text and workdir from env_get
   run_web_turn(unwrap_or(env_get("LEGIBLE_CODER_WS_ID"), ""), unwrap_or(env_get("LEGIBLE_CODER_CONV_ID"), ""), unwrap_or(env_get("LEGIBLE_CODER_USER_TEXT"), ""), unwrap_or(env_get("LEGIBLE_CODER_WORKDIR"), get_cwd()))
-  web_worker_lock_release()
 end
 
 function main(): nothing

@@ -1,0 +1,49 @@
+-- test_turn_budget: drives MutsState through synthetic context-growth curves
+-- and prints the derived cap for each difficulty tier.
+-- Run with: legible run test_turn_budget.lbl
+
+use turn_budget
+
+function scenario(name: text, quality: decimal, base_context: integer, window: integer, growth_per_round: integer, rounds: integer): nothing
+  intent: print the name then initial state diagnostics then walk rounds of observe_round and print the derived cap
+  print("")
+  print("=== " ++ name ++ " ===")
+  let start: MutsState = turn_budget.initial_state(quality, base_context, window)
+  let start_cap: integer = turn_budget.explore_cap(start, 60)
+  print(turn_budget.format_diagnostics(start, start_cap))
+  mutable s: MutsState = start
+  mutable ctx: integer = base_context
+  mutable i: integer = 0
+  while i < rounds do
+    set ctx = ctx + growth_per_round
+    set s = turn_budget.observe_round(s, ctx, true)
+    set i = i + 1
+    let cap: integer = turn_budget.explore_cap(s, 60)
+    print("  rd" ++ to_text(i) ++ " continue=" ++ to_text(turn_budget.should_continue(s, cap)) ++ "  " ++ turn_budget.format_diagnostics(s, cap))
+  end
+end
+
+function stalled_scenario(name: text, quality: decimal, base_context: integer, window: integer): nothing
+  intent: print the name then walk four unproductive observe_round calls showing decay falling toward the floor
+  print("")
+  print("=== " ++ name ++ " ===")
+  mutable s: MutsState = turn_budget.initial_state(quality, base_context, window)
+  mutable ctx: integer = base_context
+  mutable i: integer = 0
+  while i < 4 do
+    set ctx = ctx + 400
+    set s = turn_budget.observe_round(s, ctx, false)
+    set i = i + 1
+    let cap: integer = turn_budget.explore_cap(s, 60)
+    print("  stall" ++ to_text(i) ++ " continue=" ++ to_text(turn_budget.should_continue(s, cap)) ++ "  " ++ turn_budget.format_diagnostics(s, cap))
+  end
+end
+
+function main(): nothing
+  intent: run the easy complex expert tiny-window and stalled scenarios 
+  scenario("easy question (Q=0.4) small trace", turn_budget.difficulty_prior(false, false), 4000, 120000, 300, 4)
+  scenario("complex task (Q=0.65) 850K window", turn_budget.difficulty_prior(false, true), 25000, 850000, 2500, 5)
+  scenario("expert task (Q=0.9) 850K window", turn_budget.difficulty_prior(true, false), 25000, 850000, 2500, 6)
+  scenario("expert task (Q=0.9) small 6K local window", turn_budget.difficulty_prior(true, false), 2000, 6000, 900, 5)
+  stalled_scenario("stalling complex task, unproductive rounds", turn_budget.difficulty_prior(false, true), 25000, 850000)
+end

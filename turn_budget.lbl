@@ -1,0 +1,221 @@
+-- Adaptive turn budget: a heuristic for diminishing returns as a tool trace grows.
+-- ratio = (quality / quality_ref) * decay^rounds * context_penalty
+--         * (base_context / next_round_cost).
+-- These priors are tuning choices, not measured task quality or an optimal
+-- stopping theorem. Allow a useful minimum workflow before applying the ratio;
+-- callers still enforce the configured hard limit and repeated-call guards.
+
+record MutsState
+  quality: decimal
+  quality_ref: decimal
+  decay: decimal
+  decay_floor: decimal
+  decay_ceiling: decimal
+  ewma: decimal
+  window: integer
+  base_context: integer
+  last_context: integer
+  growth: integer
+  rounds: integer
+  min_rounds: integer
+  diagnostics: boolean
+end
+
+function env_decimal(name: text, fallback: decimal): decimal
+  intent: read env name and parse it with to_decimal returning fallback when unset or unparsable
+  unwrap_or(to_decimal(trim(unwrap_or(env_get(name), ""))), fallback)
+end
+
+function env_integer(name: text, fallback: integer): integer
+  intent: read env name and parse it with to_integer returning fallback when unset or unparsable
+  unwrap_or(to_integer(trim(unwrap_or(env_get(name), ""))), fallback)
+end
+
+function env_flag(name: text, fallback: boolean): boolean
+  intent: read env name as text then return fallback when empty else raw is not zero
+  let raw: text = trim(unwrap_or(env_get(name), ""))
+  if text_length(raw) == 0 then
+    fallback
+  else
+    raw != "0"
+  end
+end
+
+function resolve_quality_ref(): decimal
+  intent: read LEGIBLE_CODER_TURN_QUALITY_REF or default to 0.3 as the exchange rate anchor
+  -- Scale easy, complex and expert priors to about 1.3, 2.2 and 3.0.
+  env_decimal("LEGIBLE_CODER_TURN_QUALITY_REF", 0.3)
+end
+
+function resolve_decay_default(): decimal
+  intent: read LEGIBLE_CODER_TURN_DECAY or default to 0.92 as the starting information gain decay
+  env_decimal("LEGIBLE_CODER_TURN_DECAY", 0.92)
+end
+
+function resolve_decay_floor(): decimal
+  intent: read LEGIBLE_CODER_TURN_DECAY_MIN or default to 0.55 as the lowest adapted decay
+  env_decimal("LEGIBLE_CODER_TURN_DECAY_MIN", 0.55)
+end
+
+function resolve_decay_ceiling(): decimal
+  intent: read LEGIBLE_CODER_TURN_DECAY_MAX or default to 0.97 as the highest adapted decay
+  env_decimal("LEGIBLE_CODER_TURN_DECAY_MAX", 0.97)
+end
+
+function resolve_ewma(): decimal
+  intent: read LEGIBLE_CODER_TURN_EWMA or default to 0.3 as the growth smoothing factor
+  env_decimal("LEGIBLE_CODER_TURN_EWMA", 0.3)
+end
+
+function resolve_min_rounds(): integer
+  intent: read LEGIBLE_CODER_TURN_MIN_ROUNDS or default to 8 rounds before the ratio may stop the turn
+  max(env_integer("LEGIBLE_CODER_TURN_MIN_ROUNDS", 8), 1)
+end
+
+function diagnostics_enabled(): boolean
+  intent: read LEGIBLE_CODER_TURN_DIAGNOSTICS defaulting to true when unset
+  env_flag("LEGIBLE_CODER_TURN_DIAGNOSTICS", true)
+end
+
+public function difficulty_prior(expert: boolean, complex: boolean): decimal
+  intent: return 0.9 when expert else 0.65 when complex else 0.4 as the quality prior
+  if expert then
+    0.9
+  else if complex then
+    0.65
+  else
+    0.4
+  end
+end
+
+function clamp_decay(v: decimal, lo: decimal, hi: decimal): decimal
+  intent: return v bounded below by lo and above by hi
+  min(hi, max(lo, v))
+end
+
+public function initial_state(quality: decimal, base_context: integer, window: integer): MutsState
+  intent: build a MutsState from quality base_context and window with resolved decay ewma and min_rounds values
+  MutsState {
+    quality: quality,
+    quality_ref: resolve_quality_ref(),
+    decay: clamp_decay(resolve_decay_default(), resolve_decay_floor(), resolve_decay_ceiling()),
+    decay_floor: resolve_decay_floor(),
+    decay_ceiling: resolve_decay_ceiling(),
+    ewma: resolve_ewma(),
+    window: max(window, 1),
+    base_context: max(base_context, 1),
+    last_context: max(base_context, 1),
+    growth: 0,
+    rounds: 0,
+    min_rounds: resolve_min_rounds(),
+    diagnostics: diagnostics_enabled()
+  }
+end
+
+public function observe_round(state: MutsState, measured_context: integer, productive: boolean): MutsState
+  intent: fold measured_context into the growth EWMA adapt decay by productive and increment rounds
+  -- Roberts (1959) smoothing on measured per-round growth so one enormous tool
+  -- result does not permanently distort next_round_cost.
+  let ctx_now: integer = max(measured_context, 1)
+  let delta: integer = max(ctx_now - state.last_context, 0)
+  let smoothed: decimal = state.ewma * to_decimal(delta) + (1.0 - state.ewma) * to_decimal(state.growth)
+  let next_growth: integer = max(to_integer(smoothed), 1)
+  -- lambda is adapted from observed behaviour rather than assumed. The
+  -- adaptation is deliberately ONE-SIDED: an unproductive round (a repeated
+  -- tool batch, or nothing executed) is strong evidence the trace has saturated
+  -- and drives lambda toward the floor, while a productive round leaves lambda
+  -- alone. Rewarding productive rounds would let lambda rise, which breaks the
+  -- monotonicity that makes the crossing point in explore_cap unique. Saturation
+  -- is a property of the task, not of whether the last call happened to be new.
+  let next_decay: decimal = if productive then state.decay else max(state.decay_floor, state.decay * 0.72) end
+  MutsState {
+    quality: state.quality,
+    quality_ref: state.quality_ref,
+    decay: next_decay,
+    decay_floor: state.decay_floor,
+    decay_ceiling: state.decay_ceiling,
+    ewma: state.ewma,
+    window: state.window,
+    base_context: state.base_context,
+    last_context: ctx_now,
+    growth: next_growth,
+    rounds: state.rounds + 1,
+    min_rounds: state.min_rounds,
+    diagnostics: state.diagnostics
+  }
+end
+
+function decay_power(decay: decimal, k: integer): decimal
+  intent: multiply 1.0 by decay k times and return the geometric decay factor
+  mutable out: decimal = 1.0
+  mutable i: integer = 0
+  while i < k do
+    set out = out * decay
+    set i = i + 1
+  end
+  out
+end
+
+public function context_penalty(state: MutsState): decimal
+  intent: return the relative degradation from base_context to last_context normalised by window
+  -- 2402.14848 and 2307.03172 both show accuracy falling as the prompt
+  -- lengthens well before the nominal window is full. The ratio is normalised
+  -- to 1.0 at turn start so it measures drift, not the absolute size of the
+  -- system prompt.
+  let w: decimal = to_decimal(state.window)
+  (1.0 + to_decimal(state.base_context) / w) / (1.0 + to_decimal(state.last_context) / w)
+end
+
+public function next_round_cost(state: MutsState): decimal
+  intent: return last_context plus growth as the tokens the next round will re-bill
+  -- ReAct 2210.03629 traces grow every round because each observation is
+  -- appended and the whole trace is re-sent.
+  to_decimal(state.last_context + state.growth)
+end
+
+public function marginal_ratio(state: MutsState): decimal
+  intent: return quality scaled by decay_power context_penalty and base_context over next_round_cost
+  let scale: decimal = state.quality / max(state.quality_ref, 0.000001)
+  scale * decay_power(state.decay, state.rounds) * context_penalty(state) * (to_decimal(state.base_context) / max(next_round_cost(state), 1.0))
+end
+
+public function should_continue(state: MutsState, ceiling: integer): boolean
+  intent: return false at ceiling otherwise allow min_rounds before checking marginal_ratio
+  if state.rounds >= ceiling then
+    false
+  else if state.rounds < state.min_rounds then
+    true
+  else
+    marginal_ratio(state) >= 1.0
+  end
+end
+
+public function explore_cap(state: MutsState, ceiling: integer): integer
+  intent: walk rounds upward recomputing marginal_ratio until it drops below 1.0 then return that count bounded by ceiling
+  -- Forecast an absolute round cap from the current cost estimate.
+  mutable k: integer = 0
+  mutable ratio: decimal = marginal_ratio(state with {rounds: 0})
+  mutable keep_going: boolean = ratio >= 1.0
+  while keep_going and k < ceiling do
+    set k = k + 1
+    set ratio = marginal_ratio(state with {rounds: k})
+    set keep_going = ratio >= 1.0
+  end
+  min(max(k, state.min_rounds), max(ceiling, 0))
+end
+
+function fixed3(v: decimal): text
+  intent: round v to three decimals using to_integer truncation and return it as text
+  let scaled: decimal = v * 1000.0 + 0.5
+  to_decimal(to_integer(scaled)) / 1000.0 |> to_text
+end
+
+public function format_diagnostics(state: MutsState, cap: integer): text
+  intent: format quality decay penalty ratio context growth and the derived cap as one status line
+  "  [budget] Q=" ++ fixed3(state.quality) ++
+    " lambda=" ++ fixed3(state.decay) ++
+    " penalty=" ++ fixed3(context_penalty(state)) ++
+    " ratio=" ++ fixed3(marginal_ratio(state)) ++
+    " | ctx " ++ to_text(state.base_context) ++ "->" ++ to_text(state.last_context) ++
+    " (+" ++ to_text(state.growth) ++ "/rd) | cap " ++ to_text(cap)
+end

@@ -854,6 +854,14 @@ end
 record InnerLoopResult
   messages: a list of a mapping from text to text
   used_model: boolean
+  context_budget: integer
+  prompt_tokens: integer
+  completion_tokens: integer
+end
+
+record TurnResult
+  messages: a list of a mapping from text to text
+  inner: InnerLoopResult
 end
 
 record ProviderLimits
@@ -1620,8 +1628,55 @@ function last_message_is_assistant_text(msgs: a list of a mapping from text to t
   end
 end
 
-function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer, compact_after: integer, include_vision: boolean): InnerLoopResult
-  intent: call the API in a loop executing tool calls and return messages plus whether the model was used successfully
+record ApiRoundOutcome
+  messages: a list of a mapping from text to text
+  used_model: boolean
+  total_tools: integer
+  last_batch: text
+  waiting: boolean
+  must_force_text: boolean
+  explore_count: integer
+  acted: boolean
+  prompt_tokens: integer
+  completion_tokens: integer
+end
+
+function response_usage_counts(body: text, track_usage: boolean): a list of integer
+  intent: return prompt and completion token counts parsed from body when track_usage is set else zeros
+  if not track_usage or not json_valid(body) then
+    [0, 0]
+  else
+    let parsed: a mapping from text to text = json_parse(body)
+    [usage_field_number(parsed, "prompt_tokens"), usage_field_number(parsed, "completion_tokens")]
+  end
+end
+
+function process_api_round(resp: a mapping from text to text, msgs: a list of a mapping from text to text, messages_start: integer, round: integer, include_tools: boolean, total_tools: integer, max_tools: integer, last_batch: text, force_text: boolean, explore_count: integer, acted: boolean, include_vision: boolean, track_usage: boolean): ApiRoundOutcome
+  intent: print the round status then return an ApiRoundOutcome taking messages on error else via response_usage_counts and handle_success_response
+  let status: text = get(resp, "status")
+  print("  [" ++ to_text(round) ++ "] status=" ++ status)
+  if status != "200" then
+    print("  API error: " ++ extract_error_message(get(resp, "body")))
+    ApiRoundOutcome {messages: take(msgs, messages_start), used_model: false, total_tools: total_tools, last_batch: last_batch, waiting: false, must_force_text: false, explore_count: explore_count, acted: acted, prompt_tokens: 0, completion_tokens: 0}
+  else
+    let counts: a list of integer = response_usage_counts(get(resp, "body"), track_usage)
+    let step: LoopStep = handle_success_response(get(resp, "body"), include_tools, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted, include_vision)
+    ApiRoundOutcome {messages: step.messages, used_model: true, total_tools: step.count, last_batch: step.last_batch, waiting: step.waiting, must_force_text: step.must_force_text, explore_count: step.explore_count, acted: step.acted, prompt_tokens: get(counts, 0), completion_tokens: get(counts, 1)}
+  end
+end
+
+function usage_field_number(parsed: a mapping from text to text, field: text): integer
+  intent: read a numeric usage field from the parsed api response defaulting to zero
+  let usage: a mapping from text to text = unwrap_or(get(parsed, "usage"), {})
+  if has_key(usage, field) then
+    unwrap_or(to_integer(trim(to_text(get(usage, field)))), 0)
+  else
+    0
+  end
+end
+
+function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer, compact_after: integer, include_vision: boolean, track_usage: boolean): InnerLoopResult
+  intent: call the API in a loop executing tool calls and return messages plus whether the model was used successfully and token usage when track_usage is set
   mutable msgs: a list of a mapping from text to text = init_messages
   mutable waiting: boolean = true
   mutable used_model: boolean = false
@@ -1631,6 +1686,8 @@ function run_inner_loop(init_messages: a list of a mapping from text to text, me
   mutable must_force_text: boolean = false
   mutable explore_count: integer = 0
   mutable acted: boolean = false
+  mutable session_prompt: integer = 0
+  mutable session_completion: integer = 0
   let round_cap: integer = if include_tools then max_tools else 999999 end
   while waiting do
     set round = round + 1
@@ -1638,29 +1695,43 @@ function run_inner_loop(init_messages: a list of a mapping from text to text, me
     set must_force_text = false
     set msgs = compact_loop_messages(msgs, context_budget, preserve_recent_messages, compact_after)
     let resp: a mapping from text to text = call_api(key, base_url, build_request(model, msgs, force_text, include_tools, include_dir_tools, max_output_tokens, include_vision))
-    let status: text = get(resp, "status")
-    print("  [" ++ to_text(round) ++ "] status=" ++ status)
-    if status != "200" then
-      print("  API error: " ++ extract_error_message(get(resp, "body")))
-      set msgs = take(msgs, messages_start)
-      set waiting = false
-    else
-      set used_model = true
-      let step: LoopStep = handle_success_response(get(resp, "body"), include_tools, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted, include_vision)
-      set msgs = step.messages
-      set total_tools = step.count
-      set last_batch = step.last_batch
-      set waiting = step.waiting
-      set must_force_text = step.must_force_text
-      set explore_count = step.explore_count
-      set acted = step.acted
-    end
+    let outcome: ApiRoundOutcome = process_api_round(resp, msgs, messages_start, round, include_tools, total_tools, max_tools, last_batch, force_text, explore_count, acted, include_vision, track_usage)
+    set msgs = outcome.messages
+    set used_model = outcome.used_model
+    set total_tools = outcome.total_tools
+    set last_batch = outcome.last_batch
+    set waiting = outcome.waiting
+    set must_force_text = outcome.must_force_text
+    set explore_count = outcome.explore_count
+    set acted = outcome.acted
+    set session_prompt = session_prompt + outcome.prompt_tokens
+    set session_completion = session_completion + outcome.completion_tokens
     if round >= round_cap then
       print("  [warn] reached " ++ to_text(round_cap) ++ " response rounds this turn, stopping]")
       set waiting = false
     end
   end
-  InnerLoopResult {messages: finish_inner_loop(msgs, messages_start, last_message_is_assistant_text(msgs)), used_model: used_model}
+  InnerLoopResult {messages: finish_inner_loop(msgs, messages_start, last_message_is_assistant_text(msgs)), used_model: used_model, context_budget: context_budget, prompt_tokens: session_prompt, completion_tokens: session_completion}
+end
+
+-- ─── Graphical token usage display (CLI) ────────────────────────────────────
+
+function usage_sparkline(values: a list of integer, budget: integer): text
+  intent: map each v in values to one of eight unicode block characters using index min v * 8 / max budget 1 7 and concatenate them
+  let blocks: a list of text = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+  mutable out: text = ""
+  for v in values do
+    set out = out ++ get(blocks, min(v * 8 / max(budget, 1), 7))
+  end
+  out
+end
+
+function print_cli_token_tracker(msgs: a list of a mapping from text to text, inner: InnerLoopResult): nothing
+  intent: print a graphical token usage line with a sparkline, context fill, and turn totals after a CLI turn
+  let estimated: integer = kv_cache.estimate_messages_tokens(msgs)
+  let history: a list of integer = unwrap_or(get(web_load_usage(), "history"), [])
+  let recent: a list of integer = drop(history, max(length(history) - 32, 0))
+  print("  [tokens] " ++ usage_sparkline(recent, inner.context_budget) ++ "  ctx " ++ to_text(estimated) ++ "/" ++ to_text(inner.context_budget) ++ "  |  turn in " ++ to_text(inner.prompt_tokens) ++ " out " ++ to_text(inner.completion_tokens))
 end
 
 -- ─── Model selection ─────────────────────────────────────────────────────────
@@ -1952,25 +2023,26 @@ function print_turn_model_banner(provider_idx: integer, switched: boolean, prov:
   end
 end
 
-function run_turn_with_fallback(messages: a list of a mapping from text to text, user_input: text, start: integer, providers: a list of a mapping from text to text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, include_vision: boolean): a list of a mapping from text to text
-  intent: cycle providers with provider-specific limits until the turn succeeds or every provider fails consecutively
+function run_turn_with_fallback(messages: a list of a mapping from text to text, user_input: text, start: integer, providers: a list of a mapping from text to text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, include_vision: boolean, track_usage: boolean): TurnResult
+  intent: cycle providers with provider-specific limits until the turn succeeds or every provider fails consecutively and carry the final token usage
   mutable msgs: a list of a mapping from text to text = messages
   mutable provider_idx: integer = 0
   mutable consecutive_failures: integer = 0
   mutable attempts: integer = 0
   mutable turn_done: boolean = false
+  mutable last_inner: InnerLoopResult = InnerLoopResult {messages: [], used_model: false, context_budget: 0, prompt_tokens: 0, completion_tokens: 0}
   while not turn_done do
     let prov: a mapping from text to text = get(providers, provider_idx)
     let p_full: text = get(prov, "full")
     let p_fast: text = get(prov, "fast")
     let p_expert: text = get(prov, "expert")
     let turn_model: text = pick_model(user_input, p_full, p_fast, p_expert)
-    let turn_tier: text = provider_tier(get(prov, "url"))
-    let limits: ProviderLimits = resolve_provider_limits(turn_tier, include_tools)
+    let limits: ProviderLimits = resolve_provider_limits(provider_tier(get(prov, "url")), include_tools)
     print_turn_model_banner(provider_idx, attempts > 0, prov, turn_model, p_full, p_fast, p_expert)
     if provider_is_reachable(get(prov, "url")) then
-      let inner: InnerLoopResult = run_inner_loop(msgs, start, get(prov, "key"), get(prov, "url"), turn_model, max_tools, include_tools, include_dir_tools, limits.max_output_tokens, limits.context_budget, limits.keep_messages, limits.compact_after, include_vision)
+      let inner: InnerLoopResult = run_inner_loop(msgs, start, get(prov, "key"), get(prov, "url"), turn_model, max_tools, include_tools, include_dir_tools, limits.max_output_tokens, limits.context_budget, limits.keep_messages, limits.compact_after, include_vision, track_usage)
       set msgs = inner.messages
+      set last_inner = inner
       if inner.used_model then
         set consecutive_failures = 0
       end
@@ -1992,7 +2064,7 @@ function run_turn_with_fallback(messages: a list of a mapping from text to text,
       end
     end
   end
-  msgs
+  TurnResult {messages: msgs, inner: last_inner}
 end
 
 function run_repl(init_messages: a list of a mapping from text to text, providers: a list of a mapping from text to text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, include_vision: boolean): nothing
@@ -2010,7 +2082,10 @@ function run_repl(init_messages: a list of a mapping from text to text, provider
     else
       set messages = append(messages, {"role": "user", "content": user_input})
       let start: integer = length(messages)
-      set messages = run_turn_with_fallback(messages, user_input, start, providers, max_tools, include_tools, include_dir_tools, include_vision)
+      let turn: TurnResult = run_turn_with_fallback(messages, user_input, start, providers, max_tools, include_tools, include_dir_tools, include_vision, true)
+      set messages = turn.messages
+      web_add_usage(turn.inner.prompt_tokens, turn.inner.completion_tokens, turn.inner.context_budget)
+      print_cli_token_tracker(messages, turn.inner)
     end
   end
 end
@@ -2064,6 +2139,51 @@ end
 function web_session_path(ws_id: text): text
   intent: return the base workspaces dir path plus ws_id as the session json filename
   web_base_dir() ++ "/workspaces/" ++ ws_id ++ ".json"
+end
+
+function web_usage_path(): text
+  intent: return the path of the persisted web token usage totals json file
+  web_base_dir() ++ "/token-usage.json"
+end
+
+function web_load_usage(): a mapping from text to text
+  intent: read persisted web token usage totals and history defaulting to zero totals
+  let path: text = web_usage_path()
+  if not file_exists(path) then
+    {"prompt": 0, "completion": 0, "history": [], "budget": 0}
+  else
+    let raw: text = read_file(path)
+    if json_valid(raw) then json_parse(raw) else {"prompt": 0, "completion": 0, "history": [], "budget": 0} end
+  end
+end
+
+function web_usage_int(usage: a mapping from text to text, field: text): integer
+  intent: read an integer field from the persisted usage record defaulting to zero
+  if has_key(usage, field) then
+    unwrap_or(to_integer(trim(to_text(get(usage, field)))), 0)
+  else
+    0
+  end
+end
+
+function web_add_usage(prompt: integer, completion: integer, budget: integer): nothing
+  intent: create_dir then web_load_usage append prompt and completion into history drop to cap it and write_file json_encode totals at web_usage_path
+  create_dir(web_base_dir())
+  let cur: a mapping from text to text = web_load_usage()
+  let history: a list of integer = append(unwrap_or(get(cur, "history"), []), prompt + completion)
+  let capped: a list of integer = if length(history) > 48 then drop(history, length(history) - 48) else history end
+  write_file(web_usage_path(), json_encode({
+    "prompt": web_usage_int(cur, "prompt") + prompt,
+    "completion": web_usage_int(cur, "completion") + completion,
+    "history": capped,
+    "budget": budget
+  }))
+end
+
+function web_usage_payload(msgs: a list of a mapping from text to text): a mapping from text to text
+  intent: build the usage payload with persisted totals the current context estimate and the budget
+  let cur: a mapping from text to text = web_load_usage()
+  put(put(cur, "estimated", kv_cache.estimate_messages_tokens(msgs)), "budget", web_usage_int(cur, "budget"))
 end
 
 function web_workspace_id(): text
@@ -2172,20 +2292,24 @@ function web_json_error(message: text): text
   json_encode({"error": message})
 end
 
-function web_state_payload(reg: a mapping from text to text, model: text, base_url: text): text
-  intent: build the state JSON with workspaces active id model backend and cwd
+function web_state_payload(reg: a mapping from text to text, model: text, base_url: text, usage: a mapping from text to text): text
+  intent: build the state JSON with workspaces active id model backend cwd and token usage
   json_encode({
     "workspaces": web_registry_workspaces(reg),
     "active": unwrap_or(get(reg, "active"), ""),
     "model": model,
     "backend": backend_name(base_url),
-    "cwd": get_cwd()
+    "cwd": get_cwd(),
+    "usage": usage
   })
 end
 
 function web_handle_state(model: text, base_url: text): nothing
-  intent: respond with web_state_payload built from web_ensure_registry model and base_url as json
-  web_respond_json(200, web_state_payload(web_ensure_registry(), model, base_url))
+  intent: respond with workspace state plus the persisted token usage tracker payload
+  let reg: a mapping from text to text = web_ensure_registry()
+  let ws: a mapping from text to text = web_active_workspace(reg)
+  let ws_msgs: a list of a mapping from text to text = web_load_session(unwrap_or(get(ws, "id"), ""), [])
+  web_respond_json(200, web_state_payload(reg, model, base_url, web_usage_payload(ws_msgs)))
 end
 
 function web_handle_messages(init_messages: a list of a mapping from text to text): nothing
@@ -2283,12 +2407,14 @@ function web_handle_send(body: text, init_messages: a list of a mapping from tex
       set msgs = append(msgs, {"role": "user", "content": user_text})
       let start: integer = length(msgs)
       if any_provider_reachable(providers) then
-        set msgs = run_turn_with_fallback(msgs, user_text, start, providers, max_tools, include_tools, include_dir_tools, include_vision)
+        let turn: TurnResult = run_turn_with_fallback(msgs, user_text, start, providers, max_tools, include_tools, include_dir_tools, include_vision, true)
+        set msgs = turn.messages
+        web_add_usage(turn.inner.prompt_tokens, turn.inner.completion_tokens, turn.inner.context_budget)
       else
         set msgs = append(msgs, {"role": "assistant", "content": "Error: no model provider is reachable. Check your API keys and network connection, then try again."})
       end
       web_save_session(ws_id, msgs)
-      web_respond_json(200, json_encode({"ok": true, "messages": web_display_messages(msgs)}))
+      web_respond_json(200, json_encode({"ok": true, "messages": web_display_messages(msgs), "usage": web_usage_payload(msgs)}))
     end
   end
 end
@@ -2337,9 +2463,35 @@ function web_css(): text
   ".empty @OB@ color:var(--dim); text-align:center; margin-top:60px; @CB@\n"
 end
 
-function web_js_chunk_1(): text
-  intent: return part 1 of the frontend script text covering busy fetch loadState renderMessages state and workspace chat
+function web_css_tracker(): text
+  intent: return the css text for the graphical token usage tracker gauge sparkline and label
+  "#tokenbar @OB@ display:flex; align-items:center; gap:10px; margin-left:auto; @CB@\n" ++
+  "#tokengauge @OB@ width:150px; height:10px; border-radius:5px; background:var(--panel2); border:1px solid var(--border); overflow:hidden; @CB@\n" ++
+  "#tokenfill @OB@ height:100%; width:0%; background:linear-gradient(90deg,#2ecc71,#f1c40f,#e74c3c); transition:width .4s ease; @CB@\n" ++
+  "#tokenspark @OB@ display:flex; align-items:flex-end; gap:1px; height:16px; @CB@\n" ++
+  "#tokenspark div @OB@ width:3px; min-height:1px; background:var(--accent); border-radius:1px 1px 0 0; opacity:.85; @CB@\n" ++
+  "#tokentext @OB@ font-size:11px; color:var(--dim); white-space:nowrap; @CB@\n"
+end
+
+function web_js_chunk_0(): text
+  intent: return part 0 of the frontend script text rendering the graphical token usage tracker widget
   "let busy = false;\n" ++
+  "function renderTokenUsage(u) @OB@\n" ++
+  "  const fill = document.getElementById('tokenfill');\n" ++
+  "  if (!u || !fill) return;\n" ++
+  "  const budget = u.budget || 1;\n" ++
+  "  const est = u.estimated || 0;\n" ++
+  "  fill.style.width = Math.min(100, Math.round(est * 100 / budget)) + '%';\n" ++
+  "  document.getElementById('tokentext').textContent = est + ' / ' + budget + ' ctx  |  in ' + (u.prompt || 0) + '  out ' + (u.completion || 0);\n" ++
+  "  const spark = document.getElementById('tokenspark');\n" ++
+  "  spark.innerHTML = '';\n" ++
+  "  (u.history || []).slice(-24).forEach(v => @OB@ const d = document.createElement('div'); d.style.height = Math.max(1, Math.min(16, Math.round(v * 16 / budget))) + 'px'; spark.appendChild(d); @CB@);\n" ++
+  "@CB@\n"
+end
+
+function web_js_chunk_1(): text
+  intent: return part 1 of the frontend script text covering fetch loadState renderMessages state and workspace chat
+
   "async function api(path, opts) @OB@ const r = await fetch(path, opts); return await r.json(); @CB@\n" ++
   "async function loadState() @OB@\n" ++
   "  const s = await api('/api/state');\n" ++
@@ -2357,7 +2509,8 @@ function web_js_chunk_1(): text
   "  const aw = (s.workspaces || []).find(w => w.id === s.active);\n" ++
   "  document.getElementById('ws-title').textContent = aw ? aw.name : 'legible-coder';\n" ++
   "  document.getElementById('ws-meta').textContent = (aw ? aw.root_dir + '  |  ' : '') + s.model + ' @ ' + s.backend;\n" ++
-  "@CB@\n" ++
+"  renderTokenUsage(s.usage);\n" ++
+"@CB@\n" ++
   "function contentText(c) @OB@\n" ++
   "  if (typeof c === 'string') return c;\n" ++
   "  if (Array.isArray(c)) return c.filter(p => p && p.type === 'text').map(p => p.text).join('\\n');\n" ++
@@ -2466,6 +2619,7 @@ function web_js_chunk_4(): text
   "  try @OB@\n" ++
   "    const res = await api('/api/send', @OB@method:'POST', headers:@OB@'content-type':'application/json'@CB@, body: JSON.stringify(@OB@text: text@CB@)@CB@);\n" ++
   "    renderMessages(res.messages || []);\n" ++
+    "    renderTokenUsage(res.usage);\n" ++
   "  @CB@ catch (e) @OB@\n" ++
   "    pending.querySelector('.bubble').textContent = 'Request failed: ' + e;\n" ++
   "  @CB@\n" ++
@@ -2484,7 +2638,8 @@ function web_js_chunk_5(): text
 end
 
 function web_js(): text
-  intent: concatenate the five web_js chunk parts into the full frontend script
+  intent: concatenate the six web_js chunk parts into the full frontend script
+  web_js_chunk_0() ++
   web_js_chunk_1() ++
   web_js_chunk_2() ++
   web_js_chunk_3() ++
@@ -2513,6 +2668,7 @@ function web_index_html(): text
   "<div id='topbar'>\n" ++
   "<div class='title' id='ws-title'>legible-coder</div>\n" ++
   "<div class='meta' id='ws-meta'></div>\n" ++
+   "<div id='tokenbar'><div id='tokenspark'></div><div id='tokengauge'><div id='tokenfill'></div></div><span id='tokentext'></span></div>\n" ++
   "<button class='secondary' style='width:auto' onclick='toggleFiles()'>Files</button>\n" ++
   "</div>\n" ++
   "<div id='chat'><div class='empty'>Loading...</div></div>\n" ++

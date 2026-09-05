@@ -48,8 +48,8 @@ function resolve_quality_ref(): decimal
 end
 
 function resolve_decay_default(): decimal
-  intent: read LEGIBLE_CODER_TURN_DECAY or default to 0.92 as the starting information gain decay
-  env_decimal("LEGIBLE_CODER_TURN_DECAY", 0.92)
+  intent: read LEGIBLE_CODER_TURN_DECAY or default to 0.9605 as the starting information gain decay
+  env_decimal("LEGIBLE_CODER_TURN_DECAY", 0.9605)
 end
 
 function resolve_decay_floor(): decimal
@@ -68,8 +68,21 @@ function resolve_ewma(): decimal
 end
 
 function resolve_min_rounds(): integer
-  intent: read LEGIBLE_CODER_TURN_MIN_ROUNDS or default to 8 rounds before the ratio may stop the turn
-  max(env_integer("LEGIBLE_CODER_TURN_MIN_ROUNDS", 8), 1)
+  intent: read LEGIBLE_CODER_TURN_MIN_ROUNDS or default to 16 rounds before the ratio may stop the turn
+  max(env_integer("LEGIBLE_CODER_TURN_MIN_ROUNDS", 16), 1)
+end
+
+function resolve_max_rounds(): integer
+  intent: read LEGIBLE_CODER_TURN_MAX_ROUNDS or default to 64 as the hard round ceiling for one turn
+  max(env_integer("LEGIBLE_CODER_TURN_MAX_ROUNDS", 64), 1)
+end
+
+public function round_ceiling(): integer
+  intent: return the resolved hard ceiling on tool rounds which is independent of the tool call allowance
+  -- max_tools counts individual tool calls while this counts response rounds, so
+  -- a batched turn consumes several calls per round. The two units must not be
+  -- compared directly or a call allowance silently truncates the round budget.
+  resolve_max_rounds()
 end
 
 function diagnostics_enabled(): boolean

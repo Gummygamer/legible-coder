@@ -184,8 +184,9 @@ legible-coder/
 | `LEGIBLE_CODER_FAST_MODEL` | No | Remote fast model for simple turns. Defaults to the provider's fast or primary model |
 | `LEGIBLE_CODER_EXPERT_MODEL` | No | Optional remote expert model for architecture/refactor/design turns |
 | `LEGIBLE_CODER_LOCAL_TOOLS` | No | `1` forces native tools for local models, `0` forces manual local protocol. Gemma 4 names auto-enable native tools |
-| `LEGIBLE_CODER_MAX_TOOLS` | No | Maximum tool calls per user turn. Defaults: `60` local, `30` remote |
-| `LEGIBLE_CODER_TURN_MIN_ROUNDS` | No | Native-tool rounds allowed before the adaptive cost heuristic may force a final response. Default: `8`, bounded by `LEGIBLE_CODER_MAX_TOOLS`. The model may finish sooner; repeated/invalid-call guards still apply |
+| `LEGIBLE_CODER_MAX_TOOLS` | No | Maximum tool **calls** per user turn, counted separately from rounds. Defaults: `120` local, `60` remote. Models batch up to two calls per round, so the expert cap of 28 rounds needs about 56 calls |
+| `LEGIBLE_CODER_TURN_MAX_ROUNDS` | No | Hard ceiling on tool **rounds** per user turn, independent of the call allowance above. Default: `64` |
+| `LEGIBLE_CODER_TURN_MIN_ROUNDS` | No | Native-tool rounds allowed before the adaptive cost heuristic may force a final response. Default: `16`, bounded by `LEGIBLE_CODER_TURN_MAX_ROUNDS`. The model may finish sooner; repeated/invalid-call guards still apply |
 | `LEGIBLE_CODER_TURN_DIAGNOSTICS` | No | Print adaptive turn budget diagnostics. Default: `1`; set `0` to hide |
 | `LEGIBLE_CODER_MAX_EXPLORE` | No | Local manual-mode exploration budget before requiring an action. Default: `8` |
 | `LEGIBLE_CODER_MAX_OUTPUT_TOKENS` | No | Response cap. Defaults: `750` local manual, `4096` local native tools, `131072` Qwen, `32768` Gemini/NIM, `16384` other remote providers |

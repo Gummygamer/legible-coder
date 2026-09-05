@@ -1814,6 +1814,7 @@ record TurnBudgetPlan
   state: MutsState
   cap: integer
   ceiling: integer
+  call_ceiling: integer
 end
 
 record BudgetRound
@@ -1824,14 +1825,18 @@ record BudgetRound
 end
 
 function plan_turn_budget(init_messages: a list of a mapping from text to text, turn_quality: decimal, context_budget: integer, max_tools: integer, include_tools: boolean): TurnBudgetPlan
-  intent: derive the per-turn budget state cap and ceiling from the difficulty prior and starting context size
+  intent: derive the per-turn budget state round ceiling and call ceiling from the difficulty prior and starting context size
   -- Use the full estimated budget; a fractional reserve prematurely forced
   -- text after only 1/3/5 rounds for easy/complex/expert tasks.
-  let ceiling: integer = if include_tools then max_tools else 999999 end
+  -- max_tools counts tool calls while the budget counts rounds, so a batched
+  -- round spends several calls. Bounding explore_cap by max_tools silently
+  -- truncated an expert 28 round cap to about 20 rounds on a 30 call cloud
+  -- allowance. Keep the two ceilings in their own units.
+  let ceiling: integer = if include_tools then turn_budget.round_ceiling() else 999999 end
   let base_context: integer = kv_cache.estimate_messages_tokens(init_messages)
   let budget: MutsState = turn_budget.initial_state(turn_quality, base_context, context_budget)
   let cap: integer = min(turn_budget.explore_cap(budget, ceiling), ceiling)
-  TurnBudgetPlan {state: budget, cap: cap, ceiling: ceiling}
+  TurnBudgetPlan {state: budget, cap: cap, ceiling: ceiling, call_ceiling: max(max_tools, 0)}
 end
 
 function announce_turn_budget(plan: TurnBudgetPlan, include_tools: boolean): nothing
@@ -1853,10 +1858,18 @@ function observe_turn_budget(state: MutsState, outcome: ApiRoundOutcome, prior_t
   if include_tools and next_state.diagnostics then
     print(turn_budget.format_diagnostics(next_state, plan.cap))
   end
-  if round >= plan.ceiling + 2 then
+  let calls_spent: boolean = include_tools and outcome.total_tools >= plan.call_ceiling
+  -- Allow two forced-text retries past whichever limit binds first. Taking the
+  -- minimum keeps the round bound in rounds instead of borrowing the call
+  -- allowance, which would let a 60 call ceiling permit 62 rounds.
+  let retry_bound: integer = if include_tools then min(plan.cap + 2, plan.call_ceiling + 2) else plan.ceiling + 2 end
+  if round >= retry_bound then
     print("  [warn] reached " ++ to_text(round) ++ " response rounds this turn, stopping]")
     BudgetRound {state: next_state, messages: outcome.messages, must_force_text: outcome.must_force_text, stop: true}
-  else if include_tools and outcome.waiting and (outcome.total_tools >= plan.ceiling or not turn_budget.should_continue(next_state, plan.cap)) then
+  else if include_tools and outcome.waiting and calls_spent then
+    print("  [warn] tool call allowance of " ++ to_text(plan.call_ceiling) ++ " spent after " ++ to_text(round) ++ " of " ++ to_text(plan.cap) ++ " budgeted rounds; raise LEGIBLE_CODER_MAX_TOOLS to keep going")
+    BudgetRound {state: next_state, messages: append(outcome.messages, {"role": "user", "content": "The tool call allowance for this turn has been reached. Stop calling tools and summarize what you completed, including any work that remains unfinished."}), must_force_text: true, stop: false}
+  else if include_tools and outcome.waiting and not turn_budget.should_continue(next_state, plan.cap) then
     print("  [budget] tool-round budget reached at round " ++ to_text(round) ++ "; asking for the final answer")
     BudgetRound {state: next_state, messages: append(outcome.messages, {"role": "user", "content": "The tool budget for this turn has been reached. Stop calling tools and summarize what you completed, including any work that remains unfinished."}), must_force_text: true, stop: false}
   else
@@ -2010,8 +2023,10 @@ function resolve_api_key(base_url: text): text
 end
 
 function resolve_max_tools(tier: text): integer
-  intent: read LEGIBLE_CODER_MAX_TOOLS or use default 60 for local and 30 for cloud providers
-  let default_text: text = if tier == "local" then "60" else "30" end
+  intent: read LEGIBLE_CODER_MAX_TOOLS or use default 120 for local and 60 for cloud providers
+  -- Counts individual tool calls, not rounds. Models batch up to two calls per
+  -- round, so the expert round cap of 28 needs about 56 calls to be reachable.
+  let default_text: text = if tier == "local" then "120" else "60" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_MAX_TOOLS"), default_text)
   max(to_integer(raw), 1)
 end

@@ -82,12 +82,31 @@ end
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Budget assertions passed.", result.stdout)
 
-    def test_productive_turns_get_eight_rounds_across_difficulties(self):
+    def test_productive_turns_get_the_round_floor_across_difficulties(self):
+        # The harness seeds only two short messages, so base_context is tiny and
+        # each tool result inflates next_round_cost enough to collapse the ratio.
+        # Every tier therefore lands on the min_rounds floor here; the 16/20/28
+        # tier separation at realistic context sizes is asserted by
+        # check_defaults() in test_turn_budget.lbl.
         for quality in (0.4, 0.65, 0.9):
             with self.subTest(quality=quality):
                 requests = self.run_turn(quality=quality)
-                self.assertEqual([r["tool_choice"] for r in requests], ["auto"] * 8 + ["none"])
-                self.assertEqual(sum(m["role"] == "tool" for m in requests[-1]["messages"]), 8)
+                self.assertEqual([r["tool_choice"] for r in requests], ["auto"] * 16 + ["none"])
+                self.assertEqual(sum(m["role"] == "tool" for m in requests[-1]["messages"]), 16)
+
+    def test_call_allowance_is_measured_in_calls_not_rounds(self):
+        # A batched round spends several calls, so the allowance must count calls.
+        # Two calls per round exhausts an allowance of 10 after five rounds.
+        requests = self.run_turn(quality=0.9, maximum=10, batch_size=2)
+        self.assertEqual([r["tool_choice"] for r in requests], ["auto"] * 5 + ["none"])
+        self.assertEqual(sum(m["role"] == "tool" for m in requests[-1]["messages"]), 10)
+
+    def test_round_ceiling_is_independent_of_the_call_allowance(self):
+        # The expert cap of 28 rounds must survive a 30 call allowance, which is
+        # what silently truncated it to about 20 rounds before the fix.
+        requests = self.run_turn(quality=0.9, maximum=30, batch_size=1)
+        self.assertEqual([r["tool_choice"] for r in requests], ["auto"] * 16 + ["none"])
+        self.assertEqual(sum(m["role"] == "tool" for m in requests[-1]["messages"]), 16)
 
     def test_minimum_override_is_honored(self):
         requests = self.run_turn(minimum=12)

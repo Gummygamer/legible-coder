@@ -29,6 +29,26 @@ function check_limits(): nothing
   print("Budget assertions passed.")
 end
 
+function check_defaults(): nothing
+  intent: check_budget that the resolved defaults double the legacy tiers to 16 20 and 28 rounds
+  let easy: MutsState = turn_budget.initial_state(turn_budget.difficulty_prior(false, false), 25000, 850000)
+  let complex: MutsState = turn_budget.initial_state(turn_budget.difficulty_prior(false, true), 25000, 850000)
+  let expert: MutsState = turn_budget.initial_state(turn_budget.difficulty_prior(true, false), 25000, 850000)
+  check_budget(easy.min_rounds == 16, "resolved min_rounds default is 16")
+  check_budget(turn_budget.explore_cap(easy, 60) == 16, "easy budget defaults to 16 rounds")
+  check_budget(turn_budget.explore_cap(complex, 60) == 20, "complex budget defaults to 20 rounds")
+  check_budget(turn_budget.explore_cap(expert, 60) == 28, "expert budget defaults to 28 rounds")
+  check_budget(turn_budget.explore_cap(expert, 30) == 28, "expert budget still fits a 30 call cloud ceiling")
+  check_budget(turn_budget.explore_cap(easy, 30) == 16, "easy budget still fits a 30 call cloud ceiling")
+  -- The round ceiling is measured in rounds while max_tools is measured in tool
+  -- calls, and a batched round spends several calls. Bounding explore_cap by
+  -- max_tools silently truncated the expert 28 round cap to about 20 rounds.
+  check_budget(turn_budget.round_ceiling() == 64, "resolved round ceiling default is 64 rounds")
+  check_budget(turn_budget.explore_cap(expert, turn_budget.round_ceiling()) == 28, "round ceiling never truncates the expert cap")
+  check_budget(turn_budget.round_ceiling() >= 28, "round ceiling leaves room for the doubled expert cap")
+  print("Default cap assertions passed.")
+end
+
 function scenario(name: text, quality: decimal, base_context: integer, window: integer, growth_per_round: integer, rounds: integer): nothing
   intent: print the name then initial state diagnostics then walk rounds of observe_round and print the derived cap
   print("")
@@ -65,8 +85,9 @@ function stalled_scenario(name: text, quality: decimal, base_context: integer, w
 end
 
 function main(): nothing
-  intent: check_limits then run scenario and stalled_scenario diagnostics
+  intent: check_limits and check_defaults then run scenario and stalled_scenario diagnostics
   check_limits()
+  check_defaults()
   scenario("easy question (Q=0.4) small trace", turn_budget.difficulty_prior(false, false), 4000, 120000, 300, 4)
   scenario("complex task (Q=0.65) 850K window", turn_budget.difficulty_prior(false, true), 25000, 850000, 2500, 5)
   scenario("expert task (Q=0.9) 850K window", turn_budget.difficulty_prior(true, false), 25000, 850000, 2500, 6)

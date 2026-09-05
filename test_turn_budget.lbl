@@ -4,6 +4,31 @@
 
 use turn_budget
 
+function check_budget(condition: boolean, message: text): nothing
+  intent: print message and exit_process with failure when condition is false
+  if not condition then
+    print("FAIL: " ++ message)
+    exit_process(1)
+  end
+end
+
+function check_limits(): nothing
+  intent: check_budget for minimum rounds hard ceilings adaptive stopping and difficulty scaling
+  let initial: MutsState = turn_budget.initial_state(0.9, 25000, 850000)
+  let state: MutsState = initial with {quality_ref: 0.3, decay: 0.92, min_rounds: 8}
+  check_budget(turn_budget.explore_cap(state, 60) == 14, "expert budget uses all 14 rounds")
+  check_budget(turn_budget.explore_cap(state with {quality: 0.65}, 60) == 10, "complex budget is 10 rounds")
+  check_budget(turn_budget.explore_cap(state with {quality: 0.4}, 60) == 8, "easy budget has an 8 round floor")
+  check_budget(turn_budget.should_continue(state with {rounds: 8}, 14), "useful expert work can continue beyond the floor")
+  check_budget(turn_budget.should_continue(state with {rounds: 7, last_context: 100000}, 14), "context growth cannot bypass the floor")
+  check_budget(not turn_budget.should_continue(state with {rounds: 8, last_context: 100000}, 14), "cost heuristic still stops expensive work after the floor")
+  check_budget(turn_budget.explore_cap(state, 1) == 1, "cap is bounded by a smaller hard limit")
+  check_budget(not turn_budget.should_continue(state with {rounds: 1}, 1), "hard limit takes precedence over the floor")
+  check_budget(turn_budget.explore_cap(state, 0) == 0, "zero ceiling allows no rounds")
+  check_budget(not turn_budget.should_continue(state, 0), "zero ceiling prevents continuation")
+  print("Budget assertions passed.")
+end
+
 function scenario(name: text, quality: decimal, base_context: integer, window: integer, growth_per_round: integer, rounds: integer): nothing
   intent: print the name then initial state diagnostics then walk rounds of observe_round and print the derived cap
   print("")
@@ -40,7 +65,8 @@ function stalled_scenario(name: text, quality: decimal, base_context: integer, w
 end
 
 function main(): nothing
-  intent: run the easy complex expert tiny-window and stalled scenarios 
+  intent: check_limits then run scenario and stalled_scenario diagnostics
+  check_limits()
   scenario("easy question (Q=0.4) small trace", turn_budget.difficulty_prior(false, false), 4000, 120000, 300, 4)
   scenario("complex task (Q=0.65) 850K window", turn_budget.difficulty_prior(false, true), 25000, 850000, 2500, 5)
   scenario("expert task (Q=0.9) 850K window", turn_budget.difficulty_prior(true, false), 25000, 850000, 2500, 6)

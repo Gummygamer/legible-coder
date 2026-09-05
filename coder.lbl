@@ -1037,7 +1037,7 @@ function run_tool_batch(messages: a list of a mapping from text to text, valid_c
     set msgs = append(msgs, build_vision_eval_message(screenshot_path))
   end
   let hit_cap: boolean = n >= max_tools
-  if hit_cap then print("  [warn] reached " ++ to_text(max_tools) ++ " tool calls this turn, stopping") end
+  if hit_cap then print("  [warn] reached " ++ to_text(max_tools) ++ " tool calls this turn, requesting a final answer") end
   BatchResult {messages: msgs, count: n, stop: hit_cap}
 end
 
@@ -1836,7 +1836,7 @@ end
 
 function announce_turn_budget(plan: TurnBudgetPlan, include_tools: boolean): nothing
   intent: print the derived cap and starting budget state once per turn when tools are enabled
-  if include_tools then
+  if include_tools and plan.state.diagnostics then
     print(turn_budget.format_diagnostics(plan.state, plan.cap))
   end
 end
@@ -1854,7 +1854,7 @@ function observe_turn_budget(state: MutsState, outcome: ApiRoundOutcome, prior_t
     print(turn_budget.format_diagnostics(next_state, plan.cap))
   end
   if round >= plan.ceiling + 2 then
-    print("  [warn] reached " ++ to_text(plan.ceiling) ++ " response rounds this turn, stopping]")
+    print("  [warn] reached " ++ to_text(round) ++ " response rounds this turn, stopping]")
     BudgetRound {state: next_state, messages: outcome.messages, must_force_text: outcome.must_force_text, stop: true}
   else if include_tools and outcome.waiting and (outcome.total_tools >= plan.ceiling or not turn_budget.should_continue(next_state, plan.cap)) then
     print("  [budget] tool-round budget reached at round " ++ to_text(round) ++ "; asking for the final answer")

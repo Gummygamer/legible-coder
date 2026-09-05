@@ -114,19 +114,15 @@ end
 
 public function observe_round(state: MutsState, measured_context: integer, productive: boolean): MutsState
   intent: fold measured_context into the growth EWMA adapt decay by productive and increment rounds
-  -- Roberts (1959) smoothing on measured per-round growth so one enormous tool
-  -- result does not permanently distort next_round_cost.
+  -- Smooth measured per-round growth so one enormous tool result does not
+  -- permanently distort next_round_cost.
   let ctx_now: integer = max(measured_context, 1)
   let delta: integer = max(ctx_now - state.last_context, 0)
   let smoothed: decimal = state.ewma * to_decimal(delta) + (1.0 - state.ewma) * to_decimal(state.growth)
   let next_growth: integer = max(to_integer(smoothed), 1)
-  -- lambda is adapted from observed behaviour rather than assumed. The
-  -- adaptation is deliberately ONE-SIDED: an unproductive round (a repeated
-  -- tool batch, or nothing executed) is strong evidence the trace has saturated
-  -- and drives lambda toward the floor, while a productive round leaves lambda
-  -- alone. Rewarding productive rounds would let lambda rise, which breaks the
-  -- monotonicity that makes the crossing point in explore_cap unique. Saturation
-  -- is a property of the task, not of whether the last call happened to be new.
+  -- Treat a round without an executed tool as evidence of diminishing returns.
+  -- Productive rounds retain the starting decay; retry guards in the caller
+  -- handle repeated or invalid calls independently of the minimum budget.
   let next_decay: decimal = if productive then state.decay else max(state.decay_floor, state.decay * 0.72) end
   MutsState {
     quality: state.quality,
@@ -158,18 +154,14 @@ end
 
 public function context_penalty(state: MutsState): decimal
   intent: return the relative degradation from base_context to last_context normalised by window
-  -- 2402.14848 and 2307.03172 both show accuracy falling as the prompt
-  -- lengthens well before the nominal window is full. The ratio is normalised
-  -- to 1.0 at turn start so it measures drift, not the absolute size of the
-  -- system prompt.
+  -- Penalize context growth relative to turn start, normalized by the window.
   let w: decimal = to_decimal(state.window)
   (1.0 + to_decimal(state.base_context) / w) / (1.0 + to_decimal(state.last_context) / w)
 end
 
 public function next_round_cost(state: MutsState): decimal
   intent: return last_context plus growth as the tokens the next round will re-bill
-  -- ReAct 2210.03629 traces grow every round because each observation is
-  -- appended and the whole trace is re-sent.
+  -- Each observation is appended and the whole trace is sent again.
   to_decimal(state.last_context + state.growth)
 end
 

@@ -725,11 +725,30 @@ function shell_quote(value: text): text
   "'" ++ replace(value, "'", "'\"'\"'") ++ "'"
 end
 
+function windows_host(): boolean
+  intent: lowercase and trim OS from env_get then compare it with windows_nt
+  lowercase(trim(unwrap_or(env_get("OS"), ""))) == "windows_nt"
+end
+
+function powershell_quote(value: text): text
+  intent: concatenate single quotes around value after replace doubles its single quotes
+  "'" ++ replace(value, "'", "''") ++ "'"
+end
+
+function powershell_command(command: text): text
+  intent: wrap a PowerShell command for execution through shell_exec on Windows
+  replace(unwrap_or(env_get("SystemRoot"), "C:/Windows"), "\\", "/") ++ "/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -NonInteractive -Command \"" ++ replace(command, "$", "\\$") ++ "\""
+end
+
 function provider_is_reachable(base_url: text): boolean
   intent: use curl through shell_exec to check whether the provider endpoint is reachable before calling its model
-  let url: text = shell_quote(base_url ++ "/models")
-  let cmd: text = "if ! command -v curl >/dev/null 2>&1; then exit 0; fi; curl --silent --output /dev/null --connect-timeout 5 --max-time 15 " ++ url
-  to_text(get(shell_exec(cmd), "exit_code")) == "0"
+  if windows_host() then
+    true
+  else
+    let url: text = shell_quote(base_url ++ "/models")
+    let cmd: text = "if ! command -v curl >/dev/null 2>&1; then exit 0; fi; curl --silent --output /dev/null --connect-timeout 5 --max-time 15 " ++ url
+    to_text(get(shell_exec(cmd), "exit_code")) == "0"
+  end
 end
 
 -- ─── Provider helpers ─────────────────────────────────────────────────────────
@@ -899,7 +918,12 @@ function web_event_emit(event: a mapping from text to text): nothing
     skip()
   else
     let line: text = json_encode(event)
-    shell_exec("printf '%s\\n' " ++ shell_quote(line) ++ " >> " ++ shell_quote(path))
+    if windows_host() then
+      let prior: text = if file_exists(path) then read_file(path) else "" end
+      write_file(path, prior ++ line ++ "\n")
+    else
+      shell_exec("printf '%s\\n' " ++ shell_quote(line) ++ " >> " ++ shell_quote(path))
+    end
   end
 end
 
@@ -954,6 +978,9 @@ function web_turn_pid_is_live(content: text): boolean
   let pid: integer = unwrap_or(to_integer(content), 0)
   if pid <= 0 then
     false
+  else if windows_host() then
+    let probe: a mapping from text to text = shell_exec(powershell_command("if (Get-Process -Id " ++ to_text(pid) ++ " -ErrorAction SilentlyContinue) \{ Write-Output live \}"))
+    trim(unwrap_or(get(probe, "stdout"), "")) == "live"
   else
     is_dir("/proc/" ++ to_text(pid))
   end
@@ -978,9 +1005,13 @@ end
 
 function web_write_json_atomic(path: text, body: text): nothing
   intent: write_file body to a tmp sibling of path then mv it over path so a reader never sees a torn file
-  let tmp: text = path ++ ".tmp"
-  write_file(tmp, body)
-  shell_exec("mv -f " ++ shell_quote(tmp) ++ " " ++ shell_quote(path))
+  if windows_host() then
+    write_file(path, body)
+  else
+    let tmp: text = path ++ ".tmp"
+    write_file(tmp, body)
+    shell_exec("mv -f " ++ shell_quote(tmp) ++ " " ++ shell_quote(path))
+  end
 end
 
 function web_worker_log_path(ws_id: text, conv_id: text): text
@@ -996,7 +1027,12 @@ end
 
 function web_turn_lock_release(ws_id: text, conv_id: text): nothing
   intent: remove the turn lock file for this conversation through a shell rm
-  shell_exec("rm -f " ++ shell_quote(web_turn_lock_path(ws_id, conv_id)))
+  let path: text = web_turn_lock_path(ws_id, conv_id)
+  if windows_host() then
+    shell_exec(powershell_command("Remove-Item -LiteralPath " ++ powershell_quote(path) ++ " -Force -ErrorAction SilentlyContinue"))
+  else
+    shell_exec("rm -f " ++ shell_quote(path))
+  end
 end
 
 function web_event_tool_start(n: integer, name: text, arguments: text): nothing
@@ -2340,7 +2376,14 @@ end
 
 function web_base_dir(): text
   intent: return the legible-coder state directory under the user home
-  unwrap_or(env_get("HOME"), "/tmp") ++ "/.legible-coder"
+  let override: text = trim(unwrap_or(env_get("LEGIBLE_CODER_STATE_DIR"), ""))
+  if text_length(override) > 0 then
+    override
+  else if windows_host() then
+    unwrap_or(env_get("USERPROFILE"), unwrap_or(env_get("TEMP"), ".")) ++ "/.legible-coder"
+  else
+    unwrap_or(env_get("HOME"), "/tmp") ++ "/.legible-coder"
+  end
 end
 
 function web_registry_path(): text
@@ -2415,8 +2458,14 @@ end
 
 function dir_basename(path: text): text
   intent: return the final path segment of a directory path via the basename command
-  let out: text = trim(get(shell_exec("basename '" ++ path ++ "'"), "stdout"))
-  if text_length(out) == 0 then path else out end
+  if windows_host() then
+    let normalized: text = strip_trailing_slash(replace(path, "\\", "/"))
+    let parts: a list of text = split(normalized, "/")
+    if length(parts) > 0 then unwrap_or(get(parts, length(parts) - 1), path) else path end
+  else
+    let out: text = trim(get(shell_exec("basename '" ++ path ++ "'"), "stdout"))
+    if text_length(out) == 0 then path else out end
+  end
 end
 
 function web_load_registry(): a mapping from text to text
@@ -2508,7 +2557,13 @@ function web_migrate_workspace(ws: a mapping from text to text): a mapping from 
     let conv: a mapping from text to text = web_make_conversation(web_conversation_id(), "Conversation")
     let conv_id: text = unwrap_or(get(conv, "id"), "")
     if file_exists(legacy_path) then
-      shell_exec("mv '" ++ legacy_path ++ "' '" ++ web_session_path(ws_id, conv_id) ++ "'")
+      let destination: text = web_session_path(ws_id, conv_id)
+      if windows_host() then
+        write_file(destination, read_file(legacy_path))
+        shell_exec(powershell_command("Remove-Item -LiteralPath " ++ powershell_quote(legacy_path) ++ " -Force -ErrorAction SilentlyContinue"))
+      else
+        shell_exec("mv '" ++ legacy_path ++ "' '" ++ destination ++ "'")
+      end
     else
       skip()
     end
@@ -2604,7 +2659,11 @@ end
 
 function web_handle_files(): nothing
   intent: respond with a file listing of the active workspace root directory
-  let cmd: text = "find . -maxdepth 3 -type f 2>/dev/null | grep -v '/.git/' | grep -v '/node_modules/' | grep -v '/target/' | grep -v '/.venv/' | sort | head -400"
+  let cmd: text = if windows_host() then
+    powershell_command("Get-ChildItem -LiteralPath . -File -Recurse -Depth 3 -ErrorAction SilentlyContinue | Where-Object \{ $_.FullName -notmatch '[\\\\/](.git|node_modules|target|.venv)[\\\\/]' \} | Select-Object -First 400 | ForEach-Object \{ Resolve-Path -Relative -LiteralPath $_.FullName \}")
+  else
+    "find . -maxdepth 3 -type f 2>/dev/null | grep -v '/.git/' | grep -v '/node_modules/' | grep -v '/target/' | grep -v '/.venv/' | sort | head -400"
+  end
   let out: text = get(shell_exec(cmd), "stdout")
   let files: a list of text = filter(split(trim(out), "\n"), fn(line: text): boolean => text_length(line) > 0)
   web_respond_json(200, json_encode({"files": files, "root": get_cwd()}))
@@ -2628,7 +2687,7 @@ function web_handle_create(body: text, model: text, base_url: text): nothing
       let reg2: a mapping from text to text = put(reg, "workspaces", append(web_registry_workspaces(reg), ws))
       let reg3: a mapping from text to text = put(reg2, "active", unwrap_or(get(ws, "id"), ""))
       web_save_registry(reg3)
-      chdir(dir)
+      if not windows_host() then chdir(dir) else skip() end
       web_respond_json(200, web_state_payload(reg3, model, base_url, web_usage_payload([])))
     end
   end
@@ -2648,7 +2707,7 @@ function web_handle_select(body: text, model: text, base_url: text): nothing
     else
       let ws: a mapping from text to text = unwrap(found)
       let root_dir: text = unwrap_or(get(ws, "root_dir"), get_cwd())
-      if is_dir(root_dir) then
+      if not windows_host() and is_dir(root_dir) then
         chdir(root_dir)
       else
         skip()
@@ -2745,7 +2804,7 @@ function web_handle_send(body: text, init_messages: a list of a mapping from tex
       let conv: a mapping from text to text = web_active_conversation(ws)
       let conv_id: text = unwrap_or(get(conv, "id"), "")
       let root_dir: text = unwrap_or(get(ws, "root_dir"), get_cwd())
-      if is_dir(root_dir) then
+      if not windows_host() and is_dir(root_dir) then
         chdir(root_dir)
       else
         skip()
@@ -3275,7 +3334,7 @@ function run_web_server(init_messages: a list of a mapping from text to text, pr
   let reg: a mapping from text to text = web_ensure_registry()
   let ws: a mapping from text to text = web_active_workspace(reg)
   let root_dir: text = unwrap_or(get(ws, "root_dir"), get_cwd())
-  if is_dir(root_dir) then
+  if not windows_host() and is_dir(root_dir) and normalize_cd_path(root_dir) != normalize_cd_path(get_cwd()) then
     chdir(root_dir)
   else
     skip()
@@ -3296,8 +3355,11 @@ end
 
 function web_absolute_script(script: text): text
   intent: return script when starts_with slash else resolve it against get_cwd before the server switches workspaces
-  if starts_with(script, "/") then
+  let windows_absolute: boolean = text_length(script) >= 3 and substring(script, 1, 1) == ":"
+  if starts_with(script, "/") or windows_absolute then
     script
+  else if windows_host() then
+    get_cwd() ++ "/" ++ script
   else
     let server_cwd: text = get_cwd()
     let resolved: text = trim(get(shell_exec("readlink -f " ++ shell_quote(server_cwd ++ "/" ++ script)), "stdout"))
@@ -3307,7 +3369,15 @@ end
 
 function web_worker_interpreter(): text
   intent: readlink the absolute executable of the running interpreter through the parent pid of the spawned shell
-  trim(get(shell_exec("readlink -f /proc/$PPID/exe"), "stdout"))
+  let configured: text = trim(unwrap_or(env_get("LEGIBLE_CODER_INTERPRETER"), ""))
+  if text_length(configured) > 0 then
+    configured
+  else if windows_host() then
+    let found: text = trim(get(shell_exec(powershell_command("(Get-Command legible -ErrorAction SilentlyContinue).Source")), "stdout"))
+    if text_length(found) > 0 then found else "legible" end
+  else
+    trim(get(shell_exec("readlink -f /proc/$PPID/exe"), "stdout"))
+  end
 end
 
 function web_launch_state_path(): text
@@ -3331,7 +3401,7 @@ function web_worker_launcher(): a list of text
   let state: a mapping from text to text = if json_valid(raw) then json_parse(raw) else empty_state end
   let interpreter: text = trim(unwrap_or(get(state, "interpreter"), ""))
   let script: text = trim(unwrap_or(get(state, "script"), ""))
-  if file_exists(interpreter) and file_exists(script) then
+  if (file_exists(interpreter) or (windows_host() and text_length(interpreter) > 0)) and file_exists(script) then
     [interpreter, script]
   else
     []
@@ -3350,16 +3420,44 @@ end
 
 function web_worker_spawn_cmd(prefix: text, ws_id: text, conv_id: text, user_text: text, work_dir: text, events_path: text): text
   intent: build a detached setsid nohup supervisor command exporting the turn context after checking the work directory and log file
-  let supervisor: text = web_worker_supervisor_cmd(prefix, web_turn_lock_path(ws_id, conv_id), events_path)
-  "cd " ++ shell_quote(work_dir) ++ " && " ++
-  "command -v setsid >/dev/null && command -v nohup >/dev/null && " ++
-  ": > " ++ shell_quote(web_worker_log_path(ws_id, conv_id)) ++ " && ( " ++
-  "LEGIBLE_CODER_WS_ID=" ++ shell_quote(ws_id) ++ " " ++
-  "LEGIBLE_CODER_CONV_ID=" ++ shell_quote(conv_id) ++ " " ++
-  "LEGIBLE_CODER_USER_TEXT=" ++ shell_quote(user_text) ++ " " ++
-  "LEGIBLE_CODER_WORKDIR=" ++ shell_quote(work_dir) ++ " " ++
-  "LEGIBLE_CODER_EVENTS_PATH=" ++ shell_quote(events_path) ++ " " ++
-  "setsid nohup sh -c " ++ shell_quote(supervisor) ++ " </dev/null >> " ++ shell_quote(web_worker_log_path(ws_id, conv_id)) ++ " 2>&1 & )"
+  if windows_host() then
+    let parts: a list of text = web_worker_launcher()
+    let worker_script: text = web_base_dir() ++ "/worker-" ++ ws_id ++ "--" ++ conv_id ++ ".ps1"
+    let interpreter: text = get(parts, 0)
+    let script: text = get(parts, 1)
+    let lock_path: text = web_turn_lock_path(ws_id, conv_id)
+    let log_path: text = web_worker_log_path(ws_id, conv_id)
+    let failure: text = json_encode({"type": "error", "text": "The turn worker failed before completing the response. Please try again."})
+    let done: text = json_encode({"type": "done"})
+    let worker_body: text = "$ErrorActionPreference = 'Continue'\n" ++
+      "$env:PATH = " ++ powershell_quote(unwrap_or(env_get("PATH"), "")) ++ "\n" ++
+      "$env:LEGIBLE_CODER_WS_ID = " ++ powershell_quote(ws_id) ++ "\n" ++
+      "$env:LEGIBLE_CODER_CONV_ID = " ++ powershell_quote(conv_id) ++ "\n" ++
+      "$env:LEGIBLE_CODER_USER_TEXT = " ++ powershell_quote(user_text) ++ "\n" ++
+      "$env:LEGIBLE_CODER_WORKDIR = " ++ powershell_quote(work_dir) ++ "\n" ++
+      "$env:LEGIBLE_CODER_EVENTS_PATH = " ++ powershell_quote(events_path) ++ "\n" ++
+      "Set-Location -LiteralPath " ++ powershell_quote(work_dir) ++ "\n" ++
+      "Set-Content -LiteralPath " ++ powershell_quote(lock_path) ++ " -Value $PID -NoNewline\n" ++
+      "& " ++ powershell_quote(interpreter) ++ " run " ++ powershell_quote(script) ++ " --turn *> " ++ powershell_quote(log_path) ++ "\n" ++
+      "$turnStatus = $LASTEXITCODE\n" ++
+      "if ($turnStatus -ne 0) \{ Add-Content -LiteralPath " ++ powershell_quote(events_path) ++ " -Value " ++ powershell_quote(failure) ++ " -Encoding UTF8 \}\n" ++
+      "Add-Content -LiteralPath " ++ powershell_quote(events_path) ++ " -Value " ++ powershell_quote(done) ++ " -Encoding UTF8\n" ++
+      "Remove-Item -LiteralPath " ++ powershell_quote(lock_path) ++ " -Force -ErrorAction SilentlyContinue\n" ++
+      "exit $turnStatus\n"
+    write_file(worker_script, worker_body)
+    powershell_command("Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File'," ++ powershell_quote(worker_script) ++ ") -WindowStyle Hidden")
+  else
+    let supervisor: text = web_worker_supervisor_cmd(prefix, web_turn_lock_path(ws_id, conv_id), events_path)
+    "cd " ++ shell_quote(work_dir) ++ " && " ++
+    "command -v setsid >/dev/null && command -v nohup >/dev/null && " ++
+    ": > " ++ shell_quote(web_worker_log_path(ws_id, conv_id)) ++ " && ( " ++
+    "LEGIBLE_CODER_WS_ID=" ++ shell_quote(ws_id) ++ " " ++
+    "LEGIBLE_CODER_CONV_ID=" ++ shell_quote(conv_id) ++ " " ++
+    "LEGIBLE_CODER_USER_TEXT=" ++ shell_quote(user_text) ++ " " ++
+    "LEGIBLE_CODER_WORKDIR=" ++ shell_quote(work_dir) ++ " " ++
+    "LEGIBLE_CODER_EVENTS_PATH=" ++ shell_quote(events_path) ++ " " ++
+    "setsid nohup sh -c " ++ shell_quote(supervisor) ++ " </dev/null >> " ++ shell_quote(web_worker_log_path(ws_id, conv_id)) ++ " 2>&1 & )"
+  end
 end
 
 function web_worker_supervisor_cmd(prefix: text, lock_path: text, events_path: text): text
@@ -3398,7 +3496,7 @@ end
 
 function run_web_turn(ws_id: text, conv_id: text, user_text: text, work_dir: text): nothing
   intent: run one turn on the already saved transcript then persist it with its title and usage
-  if is_dir(work_dir) then
+  if not windows_host() and is_dir(work_dir) then
     chdir(work_dir)
   else
     skip()

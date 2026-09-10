@@ -37,7 +37,55 @@ cp target/release/legible ~/.cargo/bin/   # or anywhere on your PATH
 
 ## Installation
 
-### Quick install (symlink into PATH)
+### Windows (one-command installer)
+
+`installer\install.ps1` sets up everything a fresh Windows machine needs: the VC++
+2015-2022 x64 runtime that `legible.exe` links against, Git for Windows (the
+interpreter runs `shell_exec` through `sh -c`, and `coder.lbl` shells out to
+`grep`/`find`/`head`/`sort`/`diff`/`base64`), the `legible` interpreter itself, and a
+`legible-coder` launcher on your `PATH`. SDL2 is **not** required on Windows: the
+Windows build of `legible.exe` has no SDL2 import.
+
+```powershell
+cd legible-coder\installer
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+Or just double-click `installer\install.cmd`. Files land in
+`%LOCALAPPDATA%\Programs\legible-coder` next to a private copy of `legible.exe`, so the
+install is self-contained. Open a **new** terminal afterwards, then run
+`legible-coder`.
+
+Useful options:
+
+| Option | Effect |
+|--------|--------|
+| `-InstallDir <path>` | Install somewhere other than `%LOCALAPPDATA%\Programs\legible-coder` |
+| `-LegibleExe <path>` | Use an existing `legible.exe` instead of finding or building one |
+| `-Runtime auto\|bundled\|build\|skip` | How to obtain the interpreter (default `auto`) |
+| `-InstallToolchain` | Allow installing rustup + MSVC Build Tools when a source build is needed |
+| `-ApiKey <key>` | Persist `OPENAI_API_KEY` for the current user |
+| `-SkipSmokeTest`, `-NoPath`, `-Force` | Skip verification, skip the PATH change, overwrite an existing install |
+
+Because `legible-lang` publishes no GitHub releases, `-Runtime build` clones
+`https://github.com/Gummygamer/legible-lang` (branch `master`) and runs
+`cargo install --path . --locked`, retrying with `--features sdl2/bundled` if the SDL2
+link step fails. For offline machines, build a package that bundles the interpreter:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File make-package.ps1 -LegibleExe $env:USERPROFILE\.cargo\bin\legible.exe -Zip
+```
+
+Copy the resulting `legible-coder-setup` folder (or zip) to the target machine and run
+`install.cmd` there.
+
+Remove everything with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File uninstall.ps1            # add -RemoveEnvVars to clear API keys
+```
+
+### Linux/macOS quick install (symlink into PATH)
 
 ```bash
 ln -sf "$(pwd)/legible-coder" ~/.local/bin/legible-coder

@@ -1317,8 +1317,8 @@ function normalize_manual_arguments(name: text, raw_args: text): text
   if json_valid(cleaned) and starts_with(cleaned, "\{") then
     cleaned
   else if name == "shell_exec" then
-    recover_single_quoted_argument(cleaned, "arguments")
-    |> fn(result: text): text => if json_valid(result) then result else recover_single_quoted_argument(cleaned, "command") end
+    let from_arguments: text = recover_single_quoted_argument(cleaned, "arguments")
+    if json_valid(from_arguments) then from_arguments else recover_single_quoted_argument(cleaned, "command") end
   else if name == "read_file" or name == "list_dir" or name == "read_dir_recursive" then
     recover_single_quoted_argument(cleaned, "path")
   else
@@ -1780,6 +1780,15 @@ function handle_model_message(resp_body: text, msg: a mapping from text to text,
   end
 end
 
+function response_has_choices(parsed: a mapping from text to text): boolean
+  intent: report whether the parsed response has a choices list with at least one entry without reading a missing key
+  if has_key(parsed, "choices") then
+    length(get(parsed, "choices")) > 0
+  else
+    false
+  end
+end
+
 function handle_success_response(resp_body: text, step: LoopStep, ctx: RoundContext): LoopStep
   intent: process a successful API response and return the next loop state
   if not json_valid(resp_body) or not starts_with(trim(resp_body), "\{") then
@@ -1787,7 +1796,7 @@ function handle_success_response(resp_body: text, step: LoopStep, ctx: RoundCont
     terminal_loop_step(step)
   else
     let parsed: a mapping from text to text = json_parse(resp_body)
-    if not has_key(parsed, "choices") or length(get(parsed, "choices")) == 0 then
+    if not response_has_choices(parsed) then
       print("  API error: no choices in response: " ++ extract_error_message(resp_body))
       terminal_loop_step(step)
     else

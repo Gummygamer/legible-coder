@@ -354,7 +354,7 @@ end
 
 function sort_scores_ascending(scores: a list of MessageScore): a list of MessageScore
   intent: sort scores by score ascending using sort_by so lowest scores come first
-  sort_by(scores, fn(a: MessageScore, b: MessageScore): boolean => a.score < b.score)
+  sort_by(scores, fn(entry: MessageScore): decimal => entry.score)
 end
 
 function build_observation_keywords(msgs: a list of a mapping from text to text): a list of text

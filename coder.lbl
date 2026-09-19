@@ -170,29 +170,43 @@ function normalize_tool_call_arguments(arguments: text): text
   end
 end
 
+function describe_line_slice(name: text, args: a mapping from text to text): text
+  intent: format a read_file_lines call as its path with the start line and line count
+  name ++ "  " ++ unwrap_or(get(args, "path"), "") ++ ":" ++ unwrap_or(get(args, "start_line"), "") ++ "+" ++ unwrap_or(get(args, "line_count"), "")
+end
+
+function describe_shell_call(name: text, args: a mapping from text to text): text
+  intent: format a shell_exec call as its command without a redundant cd truncated to sixty characters
+  let cmd: text = strip_redundant_cd(unwrap_or(get(args, "command"), ""))
+  let preview: text = if text_length(cmd) > 60 then substring(cmd, 0, 60) ++ "…" else cmd end
+  name ++ "  $ " ++ preview
+end
+
+function describe_grep_call(name: text, args: a mapping from text to text): text
+  intent: format a grep call as its slash-delimited pattern followed by the searched path
+  name ++ "  /" ++ unwrap_or(get(args, "pattern"), "") ++ "/  " ++ unwrap_or(get(args, "path"), ".")
+end
+
+function describe_search_call(name: text, args: a mapping from text to text): text
+  intent: format a web_search call as its slash-delimited query truncated to sixty characters
+  let q: text = unwrap_or(get(args, "query"), "")
+  let preview: text = if text_length(q) > 60 then substring(q, 0, 60) ++ "..." else q end
+  name ++ "  /" ++ preview ++ "/"
+end
+
 function describe_tool_call(name: text, arguments: text): text
   intent: format name with its path, command, or pattern argument as a short label
   let args: a mapping from text to text = json_parse(arguments)
-  if name == "read_file" or name == "list_dir" or name == "read_dir_recursive" then
+  if name == "read_file" or name == "list_dir" or name == "read_dir_recursive" or name == "write_file" then
     name ++ "  " ++ unwrap_or(get(args, "path"), "")
   else if name == "read_file_lines" then
-    name ++ "  " ++ unwrap_or(get(args, "path"), "") ++ ":" ++ unwrap_or(get(args, "start_line"), "") ++ "+" ++ unwrap_or(get(args, "line_count"), "")
-  else if name == "write_file" then
-    name ++ "  " ++ unwrap_or(get(args, "path"), "")
+    describe_line_slice(name, args)
   else if name == "shell_exec" then
-    let cmd: text = strip_redundant_cd(unwrap_or(get(args, "command"), ""))
-    let preview: text = if text_length(cmd) > 60 then substring(cmd, 0, 60) ++ "…" else cmd end
-    name ++ "  $ " ++ preview
+    describe_shell_call(name, args)
   else if name == "grep" then
-    let pat: text = unwrap_or(get(args, "pattern"), "")
-    let path: text = unwrap_or(get(args, "path"), ".")
-    name ++ "  /" ++ pat ++ "/  " ++ path
-  else if name == "take_screenshot" then
-    name
+    describe_grep_call(name, args)
   else if name == "web_search" then
-    let q: text = unwrap_or(get(args, "query"), "")
-    let preview: text = if text_length(q) > 60 then substring(q, 0, 60) ++ "..." else q end
-    name ++ "  /" ++ preview ++ "/"
+    describe_search_call(name, args)
   else
     name
   end
@@ -433,12 +447,28 @@ function build_vision_eval_message(screenshot_path: text): a mapping from text t
   }
 end
 
+function exec_read_file(args: a mapping from text to text): text
+  intent: read the file at the path argument or report that it was not found
+  let path: text = get(args, "path")
+  if file_exists(path) then read_file(path) else "Error: file not found: " ++ path end
+end
+
+function exec_list_dir(args: a mapping from text to text): text
+  intent: list the entries of the directory at the path argument or report that it is not a directory
+  let path: text = get(args, "path")
+  if is_dir(path) then join(list_dir(path), "\n") else "Error: not a directory: " ++ path end
+end
+
+function exec_read_dir_recursive(args: a mapping from text to text): text
+  intent: list up to two hundred files under the path argument using find
+  get(shell_exec("find " ++ get(args, "path") ++ " -type f | sort 2>&1 | head -200"), "stdout")
+end
+
 function execute_tool(name: text, arguments: text): text
   intent: parse arguments and dispatch to the supported tool implementations
   let args: a mapping from text to text = json_parse(arguments)
   if name == "read_file" then
-    let path: text = get(args, "path")
-    if file_exists(path) then read_file(path) else "Error: file not found: " ++ path end
+    exec_read_file(args)
   else if name == "read_file_lines" then
     exec_read_file_lines(args)
   else if name == "write_file" then
@@ -446,10 +476,9 @@ function execute_tool(name: text, arguments: text): text
   else if name == "shell_exec" then
     exec_shell(args)
   else if name == "list_dir" then
-    let path: text = get(args, "path")
-    if is_dir(path) then join(list_dir(path), "\n") else "Error: not a directory: " ++ path end
+    exec_list_dir(args)
   else if name == "read_dir_recursive" then
-    get(shell_exec("find " ++ get(args, "path") ++ " -type f | sort 2>&1 | head -200"), "stdout")
+    exec_read_dir_recursive(args)
   else if name == "grep" then
     exec_grep(args)
   else if name == "take_screenshot" then
@@ -891,6 +920,48 @@ record ProviderLimits
   compact_after: integer
 end
 
+record ToolSettings
+  max_tools: integer
+  include_tools: boolean
+  include_dir_tools: boolean
+  include_vision: boolean
+end
+
+record TurnSettings
+  key: text
+  base_url: text
+  model: text
+  max_tools: integer
+  include_tools: boolean
+  include_dir_tools: boolean
+  max_output_tokens: integer
+  context_budget: integer
+  preserve_recent_messages: integer
+  compact_after: integer
+  include_vision: boolean
+  track_usage: boolean
+  turn_quality: decimal
+end
+
+record RoundContext
+  round: integer
+  force_text: boolean
+  include_tools: boolean
+  max_tools: integer
+  include_vision: boolean
+  track_usage: boolean
+  messages_start: integer
+end
+
+record FallbackState
+  messages: a list of a mapping from text to text
+  last_inner: InnerLoopResult
+  provider_idx: integer
+  consecutive_failures: integer
+  attempts: integer
+  done: boolean
+end
+
 record ManualToolRequest
   valid: boolean
   final: boolean
@@ -1045,6 +1116,25 @@ function web_event_tool_end(n: integer, name: text, raw: text): nothing
   web_event_emit({"type": "tool_end", "n": to_text(n), "name": name, "result": truncate_tool_output(raw, 3000)})
 end
 
+record ToolCallOutcome
+  message: a mapping from text to text
+  screenshot_path: text
+end
+
+function run_single_tool_call(tc: a mapping from text to text, n: integer, include_vision: boolean): ToolCallOutcome
+  intent: run one tool call, emit its events, and return the tool message plus any screenshot path to attach
+  let fn_info: a mapping from text to text = get(tc, "function")
+  let fn_name: text = clean_tool_name(get(fn_info, "name"))
+  let fn_args: text = normalize_tool_call_arguments(get(fn_info, "arguments"))
+  print("  [" ++ to_text(n) ++ "] " ++ describe_tool_call(fn_name, fn_args))
+  web_event_tool_start(n, fn_name, fn_args)
+  let raw: text = execute_tool(fn_name, fn_args)
+  web_event_tool_end(n, fn_name, raw)
+  let took_screenshot: boolean = fn_name == "take_screenshot" and include_vision and file_exists(trim(raw))
+  let result: text = if text_length(raw) > 8000 then substring(raw, 0, 8000) ++ "\n... (truncated)" else raw end
+  ToolCallOutcome {message: {"role": "tool", "tool_call_id": unwrap_or(get(tc, "id"), ""), "content": result}, screenshot_path: if took_screenshot then trim(raw) else "" end}
+end
+
 function run_tool_batch(messages: a list of a mapping from text to text, valid_calls: a list of a mapping from text to text, tool_count: integer, max_tools: integer, include_vision: boolean): BatchResult
   intent: execute tool calls, inject vision evaluation message if screenshot was taken, return updated messages
   print("  batch: " ++ to_text(length(valid_calls)) ++ " calls")
@@ -1053,20 +1143,12 @@ function run_tool_batch(messages: a list of a mapping from text to text, valid_c
   mutable n: integer = tool_count
   mutable screenshot_path: text = ""
   for tc in valid_calls do
-    let fn_info: a mapping from text to text = get(tc, "function")
-    let tc_id: text = unwrap_or(get(tc, "id"), "")
-    let fn_name: text = clean_tool_name(get(fn_info, "name"))
-    let fn_args: text = normalize_tool_call_arguments(get(fn_info, "arguments"))
     set n = n + 1
-    print("  [" ++ to_text(n) ++ "] " ++ describe_tool_call(fn_name, fn_args))
-    web_event_tool_start(n, fn_name, fn_args)
-    let raw: text = execute_tool(fn_name, fn_args)
-    web_event_tool_end(n, fn_name, raw)
-    if fn_name == "take_screenshot" and include_vision and file_exists(trim(raw)) then
-      set screenshot_path = trim(raw)
+    let outcome: ToolCallOutcome = run_single_tool_call(tc, n, include_vision)
+    set msgs = append(msgs, outcome.message)
+    if text_length(outcome.screenshot_path) > 0 then
+      set screenshot_path = outcome.screenshot_path
     end
-    let result: text = if text_length(raw) > 8000 then substring(raw, 0, 8000) ++ "\n... (truncated)" else raw end
-    set msgs = append(msgs, {"role": "tool", "tool_call_id": tc_id, "content": result})
   end
   if include_vision and text_length(screenshot_path) > 0 then
     print("  [vision] attaching screenshot for model evaluation]")
@@ -1256,6 +1338,30 @@ function normalize_read_file_lines_arguments(arguments: text): text
   })
 end
 
+function manual_tool_request_from(name: text, raw_args: text): ManualToolRequest
+  intent: normalize the raw arguments for a manual tool name and mark the request valid when the tool and JSON object are acceptable
+  let clean_name: text = clean_tool_name(name)
+  let normalized: text = normalize_manual_arguments(clean_name, raw_args)
+  let arguments: text = if clean_name == "read_file_lines" and json_valid(normalized) then normalize_read_file_lines_arguments(normalized) else normalized end
+  let valid: boolean = is_local_known_tool(name) and json_valid(arguments) and starts_with(arguments, "\{")
+  ManualToolRequest {valid: valid, final: false, name: clean_name, arguments: arguments, final_text: ""}
+end
+
+function parse_manual_tool_line(tool_line: text, trimmed: text): ManualToolRequest
+  intent: split a TOOL line into its name and arguments at the first opening brace or space
+  let line: text = trim(tool_line)
+  let rest: text = trim_manual_tool_blob(trim(substring(line, 5, text_length(line) - 5)))
+  let brace: integer = unwrap_or(index_of(rest, "\{"), -1)
+  let space: integer = unwrap_or(index_of(rest, " "), -1)
+  if brace > 0 then
+    manual_tool_request_from(trim(substring(rest, 0, brace)), substring(rest, brace, text_length(rest) - brace))
+  else if space > 0 then
+    manual_tool_request_from(trim(substring(rest, 0, space)), substring(rest, space + 1, text_length(rest) - space - 1))
+  else
+    ManualToolRequest {valid: false, final: false, name: "", arguments: "", final_text: trimmed}
+  end
+end
+
 function parse_manual_tool_request(content: text): ManualToolRequest
   intent: parse local-model TOOL and FINAL responses from plain text content
   let trimmed: text = trim(content)
@@ -1263,25 +1369,7 @@ function parse_manual_tool_request(content: text): ManualToolRequest
   let tool_line: an optional text = find(lines, fn(line: text): boolean => starts_with(trim(line), "TOOL "))
   let final_line: an optional text = find(lines, fn(line: text): boolean => starts_with(trim(line), "FINAL:"))
   if is_some(tool_line) then
-    let line: text = trim(unwrap(tool_line))
-    let rest: text = trim_manual_tool_blob(trim(substring(line, 5, text_length(line) - 5)))
-    let brace: integer = unwrap_or(index_of(rest, "\{"), -1)
-    let space: integer = unwrap_or(index_of(rest, " "), -1)
-    if brace > 0 then
-      let name: text = trim(substring(rest, 0, brace))
-      let normalized: text = normalize_manual_arguments(clean_tool_name(name), substring(rest, brace, text_length(rest) - brace))
-      let arguments: text = if clean_tool_name(name) == "read_file_lines" and json_valid(normalized) then normalize_read_file_lines_arguments(normalized) else normalized end
-      let valid: boolean = is_local_known_tool(name) and json_valid(arguments) and starts_with(arguments, "\{")
-      ManualToolRequest {valid: valid, final: false, name: clean_tool_name(name), arguments: arguments, final_text: ""}
-    else if space > 0 then
-      let name: text = trim(substring(rest, 0, space))
-      let normalized: text = normalize_manual_arguments(clean_tool_name(name), substring(rest, space + 1, text_length(rest) - space - 1))
-      let arguments: text = if clean_tool_name(name) == "read_file_lines" and json_valid(normalized) then normalize_read_file_lines_arguments(normalized) else normalized end
-      let valid: boolean = is_local_known_tool(name) and json_valid(arguments) and starts_with(arguments, "\{")
-      ManualToolRequest {valid: valid, final: false, name: clean_tool_name(name), arguments: arguments, final_text: ""}
-    else
-      ManualToolRequest {valid: false, final: false, name: "", arguments: "", final_text: trimmed}
-    end
+    parse_manual_tool_line(unwrap(tool_line), trimmed)
   else if is_some(final_line) then
     let line: text = trim(unwrap(final_line))
     ManualToolRequest {valid: false, final: true, name: "", arguments: "", final_text: trim(substring(line, 6, text_length(line) - 6))}
@@ -1485,30 +1573,45 @@ function execute_local_manual_tool(msgs: a list of a mapping from text to text, 
   }
 end
 
+function manual_request_path(req: ManualToolRequest): text
+  intent: return the path argument of a read_file or read_file_lines request, or empty text for any other tool
+  if req.name == "read_file" or req.name == "read_file_lines" then unwrap_or(get(json_parse(req.arguments), "path"), "") else "" end
+end
+
+function is_repeated_manual_request(msgs: a list of a mapping from text to text, req: ManualToolRequest, fingerprint: text, last_batch: text): boolean
+  intent: detect a manual tool request that repeats the previous batch, a full file read already made, or any earlier identical request
+  let req_path: text = manual_request_path(req)
+  let repeated_full_read: boolean = req.name == "read_file" and text_length(req_path) > 0 and seen_tool_for_path(msgs, "read_file", req_path)
+  let repeated_request: boolean = req.name != "read_file_lines" and seen_manual_tool_request(msgs, req.name, req.arguments)
+  fingerprint == last_batch or repeated_full_read or repeated_request
+end
+
+function local_repeat_step(msgs: a list of a mapping from text to text, req: ManualToolRequest, total_tools: integer, last_batch: text, explore_count: integer, acted: boolean): LoopStep
+  intent: reject a repeated manual tool request with a hint and keep the local loop waiting
+  print("  [warn] model repeated the same manual tool request; forcing final answer]")
+  let req_path: text = manual_request_path(req)
+  let has_partial_read: boolean = req.name == "read_file" and text_length(req_path) > 0 and seen_tool_for_path(msgs, "read_file_lines", req_path)
+  LoopStep {
+    messages: append(msgs, {"role": "user", "content": local_repeat_hint(req, has_partial_read)}),
+    count: total_tools,
+    last_batch: last_batch,
+    waiting: true,
+    must_force_text: false,
+    explore_count: explore_count,
+    acted: acted
+  }
+end
+
 function local_manual_tool_step(msgs: a list of a mapping from text to text, content: text, req: ManualToolRequest, total_tools: integer, max_tools: integer, last_batch: text, explore_count: integer, acted: boolean): LoopStep
   intent: execute one manual tool request or reject an immediate repeat
   let adjusted_req: ManualToolRequest = if req.name == "read_file_lines" and seen_manual_tool_request(msgs, req.name, req.arguments) then advance_read_file_lines_request(req) else req end
   let fingerprint: text = manual_tool_fingerprint(adjusted_req.name, adjusted_req.arguments)
-  let req_path: text = if adjusted_req.name == "read_file" or adjusted_req.name == "read_file_lines" then unwrap_or(get(json_parse(adjusted_req.arguments), "path"), "") else "" end
-  let repeated_full_read: boolean = adjusted_req.name == "read_file" and text_length(req_path) > 0 and seen_tool_for_path(msgs, "read_file", req_path)
-  let has_partial_read: boolean = adjusted_req.name == "read_file" and text_length(req_path) > 0 and seen_tool_for_path(msgs, "read_file_lines", req_path)
-  let repeated_request: boolean = adjusted_req.name != "read_file_lines" and seen_manual_tool_request(msgs, adjusted_req.name, adjusted_req.arguments)
   if is_bootstrap_listing(adjusted_req) then
     skip_bootstrap_listing_step(msgs, total_tools, fingerprint, explore_count, acted)
   else if is_exploration_request(adjusted_req) and local_needs_action(explore_count, acted) then
     local_action_retry_step(msgs, total_tools, last_batch, explore_count, acted)
-  else if fingerprint == last_batch or repeated_full_read or repeated_request then
-    print("  [warn] model repeated the same manual tool request; forcing final answer]")
-    let repeat_hint: text = local_repeat_hint(adjusted_req, has_partial_read)
-    LoopStep {
-      messages: append(msgs, {"role": "user", "content": repeat_hint}),
-      count: total_tools,
-      last_batch: last_batch,
-      waiting: true,
-      must_force_text: false,
-      explore_count: explore_count,
-      acted: acted
-    }
+  else if is_repeated_manual_request(msgs, adjusted_req, fingerprint, last_batch) then
+    local_repeat_step(msgs, adjusted_req, total_tools, last_batch, explore_count, acted)
   else
     execute_local_manual_tool(msgs, adjusted_req, adjusted_req.arguments != req.arguments, total_tools, max_tools, fingerprint, explore_count, acted)
   end
@@ -1527,79 +1630,47 @@ function handle_local_text_round(msg: a mapping from text to text, msgs: a list 
   end
 end
 
-function prompt_loop_step(msgs: a list of a mapping from text to text, total_tools: integer, last_batch: text, prompt: text, must_force_text: boolean, explore_count: integer, acted: boolean): LoopStep
+function prompt_loop_step(step: LoopStep, prompt: text, must_force_text: boolean): LoopStep
   intent: append a user follow-up prompt and continue the loop with updated forcing state
-  LoopStep {
-    messages: append(msgs, {"role": "user", "content": prompt}),
-    count: total_tools,
-    last_batch: last_batch,
-    waiting: true,
-    must_force_text: must_force_text,
-    explore_count: explore_count,
-    acted: acted
-  }
+  step with { messages: append(step.messages, {"role": "user", "content": prompt}), waiting: true, must_force_text: must_force_text }
 end
 
-function handle_tool_round(msg: a mapping from text to text, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, round: integer, force_text: boolean, explore_count: integer, acted: boolean, include_vision: boolean): LoopStep
+function handle_tool_round(msg: a mapping from text to text, step: LoopStep, ctx: RoundContext): LoopStep
   intent: process one tool-calling response and decide whether the loop should continue
-  if force_text then
-    print("  [round " ++ to_text(round) ++ " - forcing text response]")
-    prompt_loop_step(msgs, total_tools, last_batch, "STOP calling tools. Provide your answer as plain text NOW.", false, explore_count, acted)
+  if ctx.force_text then
+    print("  [round " ++ to_text(ctx.round) ++ " - forcing text response]")
+    prompt_loop_step(step, "STOP calling tools. Provide your answer as plain text NOW.", false)
   else
-    let valid_calls: a list of a mapping from text to text = take(dedupe_tool_calls(filter_valid_calls(unwrap_or(get(msg, "tool_calls"), []))), max(max_tools - total_tools, 0))
+    let valid_calls: a list of a mapping from text to text = take(dedupe_tool_calls(filter_valid_calls(unwrap_or(get(msg, "tool_calls"), []))), max(ctx.max_tools - step.count, 0))
     let current_batch: text = batch_fingerprint(valid_calls)
-    if length(valid_calls) > 0 and current_batch != last_batch then
-      let batch: BatchResult = run_tool_batch(msgs, valid_calls, total_tools, max_tools, include_vision)
-      LoopStep {
-        messages: batch.messages,
-        count: batch.count,
-        last_batch: current_batch,
-        waiting: true,
-        must_force_text: batch.stop,
-        explore_count: explore_count,
-        acted: true
-      }
+    if length(valid_calls) > 0 and current_batch != step.last_batch then
+      let batch: BatchResult = run_tool_batch(step.messages, valid_calls, step.count, ctx.max_tools, ctx.include_vision)
+      step with { messages: batch.messages, count: batch.count, last_batch: current_batch, waiting: true, must_force_text: batch.stop, acted: true }
     else if length(valid_calls) > 0 then
       print("  [warn] model repeated the same tool batch; forcing text response]")
-      prompt_loop_step(msgs, total_tools, last_batch, "You already called those tools and have their results. Do not call them again. Answer using the existing tool outputs.", true, explore_count, acted)
+      prompt_loop_step(step, "You already called those tools and have their results. Do not call them again. Answer using the existing tool outputs.", true)
     else
       print("  [warn] model returned invalid tool calls; forcing text response]")
-      prompt_loop_step(msgs, total_tools, last_batch, "Your previous tool call was invalid. Do not call tools again. Answer in plain text or fix the tool call format.", true, explore_count, acted)
+      prompt_loop_step(step, "Your previous tool call was invalid. Do not call tools again. Answer in plain text or fix the tool call format.", true)
     end
   end
 end
 
-function handle_incomplete_tool_calls(msgs: a list of a mapping from text to text, total_tools: integer, last_batch: text, explore_count: integer, acted: boolean): LoopStep
+function handle_incomplete_tool_calls(step: LoopStep): LoopStep
   intent: reject incomplete tool arguments and ask the model to retry with a smaller operation
   print("  [warn] incomplete tool call was not executed; asking for a smaller edit")
-  prompt_loop_step(msgs, total_tools, last_batch, "Your tool call arguments were incomplete and were not executed. Retry the same operation using one smaller tool call. For a large existing file, use shell_exec to apply a focused patch instead of sending the entire file. Split an intrinsically large operation across multiple calls.", false, explore_count, acted)
+  prompt_loop_step(step, "Your tool call arguments were incomplete and were not executed. Retry the same operation using one smaller tool call. For a large existing file, use shell_exec to apply a focused patch instead of sending the entire file. Split an intrinsically large operation across multiple calls.", false)
 end
 
-function handle_length_finish(msg: a mapping from text to text, msgs: a list of a mapping from text to text, total_tools: integer, last_batch: text, explore_count: integer, acted: boolean): LoopStep
+function handle_length_finish(msg: a mapping from text to text, step: LoopStep): LoopStep
   intent: preserve partial text and request continuation after a length-truncated response
   let content: text = unwrap_or(get(msg, "content"), "")
   print("  [warn] response truncated by token limit (finish_reason=length)")
   if text_length(content) > 0 then
-    let with_partial: a list of a mapping from text to text = append(msgs, {"role": "assistant", "content": content})
-    LoopStep {
-      messages: append(with_partial, {"role": "user", "content": "Your response was cut off. Please continue from exactly where you stopped."}),
-      count: total_tools,
-      last_batch: last_batch,
-      waiting: true,
-      must_force_text: false,
-      explore_count: explore_count,
-      acted: acted
-    }
+    let with_partial: a list of a mapping from text to text = append(step.messages, {"role": "assistant", "content": content})
+    step with { messages: append(with_partial, {"role": "user", "content": "Your response was cut off. Please continue from exactly where you stopped."}), waiting: true, must_force_text: false }
   else
-    LoopStep {
-      messages: append(msgs, {"role": "user", "content": "Context is full. Please answer concisely in plain text without calling any tools."}),
-      count: total_tools,
-      last_batch: last_batch,
-      waiting: true,
-      must_force_text: true,
-      explore_count: explore_count,
-      acted: acted
-    }
+    prompt_loop_step(step, "Context is full. Please answer concisely in plain text without calling any tools.", true)
   end
 end
 
@@ -1629,19 +1700,11 @@ function empty_response_detail(resp_body: text): text
   end
 end
 
-function handle_empty_text_response(resp_body: text, finish: text, msgs: a list of a mapping from text to text, total_tools: integer, last_batch: text, force_text: boolean, explore_count: integer, acted: boolean): LoopStep
+function handle_empty_text_response(resp_body: text, finish: text, step: LoopStep, force_text: boolean): LoopStep
   intent: ask once for a plain-text answer when the model returns empty content, then report an explicit diagnostic instead of stopping silently
   if not force_text then
     print("  [warn] model returned status 200 with empty text (finish_reason=" ++ finish ++ "); asking once for a plain-text answer]")
-    LoopStep {
-      messages: append(msgs, {"role": "user", "content": "Your last response contained no text at all. Do not call any tools. Write your complete answer as plain text now."}),
-      count: total_tools,
-      last_batch: last_batch,
-      waiting: true,
-      must_force_text: true,
-      explore_count: explore_count,
-      acted: acted
-    }
+    prompt_loop_step(step, "Your last response contained no text at all. Do not call any tools. Write your complete answer as plain text now.", true)
   else
     print("")
     print_separator()
@@ -1649,29 +1712,13 @@ function handle_empty_text_response(resp_body: text, finish: text, msgs: a list 
     print("  response body: " ++ empty_response_detail(resp_body))
     print_separator()
     print("")
-    LoopStep {
-      messages: msgs,
-      count: total_tools,
-      last_batch: last_batch,
-      waiting: false,
-      must_force_text: false,
-      explore_count: explore_count,
-      acted: acted
-    }
+    terminal_loop_step(step)
   end
 end
 
-function terminal_loop_step(msgs: a list of a mapping from text to text, total_tools: integer, last_batch: text, explore_count: integer, acted: boolean): LoopStep
+function terminal_loop_step(step: LoopStep): LoopStep
   intent: return a LoopStep that stops the current response loop
-  LoopStep {
-    messages: msgs,
-    count: total_tools,
-    last_batch: last_batch,
-    waiting: false,
-    must_force_text: false,
-    explore_count: explore_count,
-    acted: acted
-  }
+  step with { waiting: false, must_force_text: false }
 end
 
 function textual_tool_retry_marker(): text
@@ -1694,72 +1741,58 @@ function looks_like_textual_tool_call(content: text): boolean
   is_some(find(split(content, "\n"), fn(line: text): boolean => line_is_textual_tool_call(line)))
 end
 
-function handle_textual_tool_call_response(content: text, msgs: a list of a mapping from text to text, total_tools: integer, last_batch: text, explore_count: integer, acted: boolean): LoopStep
+function handle_textual_tool_call_response(content: text, step: LoopStep): LoopStep
   intent: retry one cloud response that printed a tool call and then force plain text if the retry is also textual
-  let with_response: a list of a mapping from text to text = append(msgs, {"role": "assistant", "content": content})
-  if last_batch == textual_tool_retry_marker() then
+  let with_response: LoopStep = step with { messages: append(step.messages, {"role": "assistant", "content": content}) }
+  if step.last_batch == textual_tool_retry_marker() then
     print("  [warn] model printed a tool invocation again; forcing a plain-text answer]")
-    LoopStep {
-      messages: append(with_response, {"role": "user", "content": "The printed tool invocation was not executed. Do not print or call tools now. Give a concise plain-text answer explaining that the requested action was not completed."}),
-      count: total_tools,
-      last_batch: last_batch,
-      waiting: true,
-      must_force_text: true,
-      explore_count: explore_count,
-      acted: acted
-    }
+    prompt_loop_step(with_response, "The printed tool invocation was not executed. Do not print or call tools now. Give a concise plain-text answer explaining that the requested action was not completed.", true)
   else
     print("  [warn] model printed a tool invocation instead of calling it; retrying once]")
-    LoopStep {
-      messages: append(with_response, {"role": "user", "content": "Your previous response printed a tool invocation as text, so it was not executed. Resend that operation now using the registered native tool schema. Do not include prose or a code fence."}),
-      count: total_tools,
-      last_batch: textual_tool_retry_marker(),
-      waiting: true,
-      must_force_text: false,
-      explore_count: explore_count,
-      acted: acted
-    }
+    let retried: LoopStep = with_response with { last_batch: textual_tool_retry_marker() }
+    prompt_loop_step(retried, "Your previous response printed a tool invocation as text, so it was not executed. Resend that operation now using the registered native tool schema. Do not include prose or a code fence.", false)
   end
 end
 
-function handle_success_response(resp_body: text, include_tools: boolean, msgs: a list of a mapping from text to text, total_tools: integer, max_tools: integer, last_batch: text, round: integer, force_text: boolean, explore_count: integer, acted: boolean, include_vision: boolean): LoopStep
+function has_invalid_tool_arguments(calls: a list of a mapping from text to text): boolean
+  intent: detect a response whose tool calls include at least one with incomplete or non-object arguments
+  length(calls) > 0 and length(filter(calls, fn(tc: a mapping from text to text): boolean => tool_call_arguments_valid(tc))) != length(calls)
+end
+
+function handle_model_message(resp_body: text, msg: a mapping from text to text, finish: text, step: LoopStep, ctx: RoundContext): LoopStep
+  intent: route one assistant message to the local, tool call, truncation, textual tool call, empty, or final text handler
+  let returned_calls: a list of a mapping from text to text = unwrap_or(get(msg, "tool_calls"), [])
+  let content: text = unwrap_or(get(msg, "content"), "")
+  if not ctx.include_tools then
+    handle_local_text_round(msg, step.messages, step.count, ctx.max_tools, step.last_batch, step.explore_count, step.acted)
+  else if has_invalid_tool_arguments(returned_calls) then
+    handle_incomplete_tool_calls(step)
+  else if finish == "tool_calls" or length(filter_valid_calls(returned_calls)) > 0 then
+    handle_tool_round(msg, step, ctx)
+  else if finish == "length" then
+    handle_length_finish(msg, step)
+  else if not ctx.force_text and not step.acted and looks_like_textual_tool_call(content) then
+    handle_textual_tool_call_response(content, step)
+  else if text_length(content) == 0 then
+    handle_empty_text_response(resp_body, finish, step, ctx.force_text)
+  else
+    step with { messages: handle_text_response(msg, step.messages), waiting: false, must_force_text: false }
+  end
+end
+
+function handle_success_response(resp_body: text, step: LoopStep, ctx: RoundContext): LoopStep
   intent: process a successful API response and return the next loop state
   if not json_valid(resp_body) or not starts_with(trim(resp_body), "\{") then
     print("  API error: non-JSON response body")
-    terminal_loop_step(msgs, total_tools, last_batch, explore_count, acted)
+    terminal_loop_step(step)
   else
     let parsed: a mapping from text to text = json_parse(resp_body)
     if not has_key(parsed, "choices") or length(get(parsed, "choices")) == 0 then
       print("  API error: no choices in response: " ++ extract_error_message(resp_body))
-      terminal_loop_step(msgs, total_tools, last_batch, explore_count, acted)
+      terminal_loop_step(step)
     else
       let choice: a mapping from text to text = get(get(parsed, "choices"), 0)
-      let msg: a mapping from text to text = get(choice, "message")
-      let finish: text = unwrap_or(get(choice, "finish_reason"), "stop")
-      let returned_calls: a list of a mapping from text to text = unwrap_or(get(msg, "tool_calls"), [])
-      if not include_tools then
-        handle_local_text_round(msg, msgs, total_tools, max_tools, last_batch, explore_count, acted)
-      else if length(returned_calls) > 0 and length(filter(returned_calls, fn(tc: a mapping from text to text): boolean => tool_call_arguments_valid(tc))) != length(returned_calls) then
-        handle_incomplete_tool_calls(msgs, total_tools, last_batch, explore_count, acted)
-      else if finish == "tool_calls" or length(filter_valid_calls(returned_calls)) > 0 then
-        handle_tool_round(msg, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted, include_vision)
-      else if finish == "length" then
-        handle_length_finish(msg, msgs, total_tools, last_batch, explore_count, acted)
-      else if not force_text and not acted and looks_like_textual_tool_call(unwrap_or(get(msg, "content"), "")) then
-        handle_textual_tool_call_response(unwrap_or(get(msg, "content"), ""), msgs, total_tools, last_batch, explore_count, acted)
-      else if text_length(unwrap_or(get(msg, "content"), "")) == 0 then
-        handle_empty_text_response(resp_body, finish, msgs, total_tools, last_batch, force_text, explore_count, acted)
-      else
-        LoopStep {
-          messages: handle_text_response(msg, msgs),
-          count: total_tools,
-          last_batch: last_batch,
-          waiting: false,
-          must_force_text: false,
-          explore_count: explore_count,
-          acted: acted
-        }
-      end
+      handle_model_message(resp_body, get(choice, "message"), unwrap_or(get(choice, "finish_reason"), "stop"), step, ctx)
     end
   end
 end
@@ -1822,17 +1855,17 @@ function response_usage_counts(body: text, track_usage: boolean): a list of inte
   end
 end
 
-function process_api_round(resp: a mapping from text to text, msgs: a list of a mapping from text to text, messages_start: integer, round: integer, include_tools: boolean, total_tools: integer, max_tools: integer, last_batch: text, force_text: boolean, explore_count: integer, acted: boolean, include_vision: boolean, track_usage: boolean): ApiRoundOutcome
+function process_api_round(resp: a mapping from text to text, step: LoopStep, ctx: RoundContext): ApiRoundOutcome
   intent: print the round status then return an ApiRoundOutcome taking messages on error else via response_usage_counts and handle_success_response
   let status: text = get(resp, "status")
-  print("  [" ++ to_text(round) ++ "] status=" ++ status)
+  print("  [" ++ to_text(ctx.round) ++ "] status=" ++ status)
   if status != "200" then
     print("  API error: " ++ extract_error_message(get(resp, "body")))
-    ApiRoundOutcome {messages: take(msgs, messages_start), used_model: false, total_tools: total_tools, last_batch: last_batch, waiting: false, must_force_text: false, explore_count: explore_count, acted: acted, prompt_tokens: 0, completion_tokens: 0}
+    ApiRoundOutcome {messages: take(step.messages, ctx.messages_start), used_model: false, total_tools: step.count, last_batch: step.last_batch, waiting: false, must_force_text: false, explore_count: step.explore_count, acted: step.acted, prompt_tokens: 0, completion_tokens: 0}
   else
-    let counts: a list of integer = response_usage_counts(get(resp, "body"), track_usage)
-    let step: LoopStep = handle_success_response(get(resp, "body"), include_tools, msgs, total_tools, max_tools, last_batch, round, force_text, explore_count, acted, include_vision)
-    ApiRoundOutcome {messages: step.messages, used_model: true, total_tools: step.count, last_batch: step.last_batch, waiting: step.waiting, must_force_text: step.must_force_text, explore_count: step.explore_count, acted: step.acted, prompt_tokens: get(counts, 0), completion_tokens: get(counts, 1)}
+    let counts: a list of integer = response_usage_counts(get(resp, "body"), ctx.track_usage)
+    let next: LoopStep = handle_success_response(get(resp, "body"), step, ctx)
+    ApiRoundOutcome {messages: next.messages, used_model: true, total_tools: next.count, last_batch: next.last_batch, waiting: next.waiting, must_force_text: next.must_force_text, explore_count: next.explore_count, acted: next.acted, prompt_tokens: get(counts, 0), completion_tokens: get(counts, 1)}
   end
 end
 
@@ -1844,6 +1877,15 @@ function usage_field_number(parsed: a mapping from text to text, field: text): i
   else
     0
   end
+end
+
+record InnerProgress
+  step: LoopStep
+  state: MutsState
+  round: integer
+  used_model: boolean
+  prompt_tokens: integer
+  completion_tokens: integer
 end
 
 record TurnBudgetPlan
@@ -1882,6 +1924,25 @@ function announce_turn_budget(plan: TurnBudgetPlan, include_tools: boolean): not
   end
 end
 
+function force_summary_round(next_state: MutsState, outcome: ApiRoundOutcome, subject: text): BudgetRound
+  intent: append a request to stop calling tools and summarize, and force a text answer on the next round
+  BudgetRound {state: next_state, messages: append(outcome.messages, {"role": "user", "content": "The " ++ subject ++ " for this turn has been reached. Stop calling tools and summarize what you completed, including any work that remains unfinished."}), must_force_text: true, stop: false}
+end
+
+function turn_retry_bound(plan: TurnBudgetPlan, include_tools: boolean): integer
+  intent: return the round number at which a turn stops, allowing two forced-text retries past whichever limit binds first
+  -- Taking the minimum keeps the round bound in rounds instead of borrowing the
+  -- call allowance, which would let a 60 call ceiling permit 62 rounds.
+  if include_tools then min(plan.cap + 2, plan.call_ceiling + 2) else plan.ceiling + 2 end
+end
+
+function print_budget_diagnostics(next_state: MutsState, plan: TurnBudgetPlan, include_tools: boolean): nothing
+  intent: print the turn budget diagnostics when tools are enabled and the state requests them
+  if include_tools and next_state.diagnostics then
+    print(turn_budget.format_diagnostics(next_state, plan.cap))
+  end
+end
+
 function observe_turn_budget(state: MutsState, outcome: ApiRoundOutcome, prior_tools: integer, round: integer, plan: TurnBudgetPlan, include_tools: boolean): BudgetRound
   intent: fold the round into the budget state, print diagnostics, request a final answer at the budget limit and allow bounded text retries
   -- A round is productive exactly when it executed at least one new tool. A
@@ -1891,65 +1952,64 @@ function observe_turn_budget(state: MutsState, outcome: ApiRoundOutcome, prior_t
   let productive: boolean = outcome.total_tools > prior_tools
   let measured: integer = kv_cache.estimate_messages_tokens(outcome.messages)
   let next_state: MutsState = turn_budget.observe_round(state, measured, productive)
-  if include_tools and next_state.diagnostics then
-    print(turn_budget.format_diagnostics(next_state, plan.cap))
-  end
+  print_budget_diagnostics(next_state, plan, include_tools)
   let calls_spent: boolean = include_tools and outcome.total_tools >= plan.call_ceiling
-  -- Allow two forced-text retries past whichever limit binds first. Taking the
-  -- minimum keeps the round bound in rounds instead of borrowing the call
-  -- allowance, which would let a 60 call ceiling permit 62 rounds.
-  let retry_bound: integer = if include_tools then min(plan.cap + 2, plan.call_ceiling + 2) else plan.ceiling + 2 end
-  if round >= retry_bound then
+  if round >= turn_retry_bound(plan, include_tools) then
     print("  [warn] reached " ++ to_text(round) ++ " response rounds this turn, stopping]")
     BudgetRound {state: next_state, messages: outcome.messages, must_force_text: outcome.must_force_text, stop: true}
   else if include_tools and outcome.waiting and calls_spent then
     print("  [warn] tool call allowance of " ++ to_text(plan.call_ceiling) ++ " spent after " ++ to_text(round) ++ " of " ++ to_text(plan.cap) ++ " budgeted rounds; raise LEGIBLE_CODER_MAX_TOOLS to keep going")
-    BudgetRound {state: next_state, messages: append(outcome.messages, {"role": "user", "content": "The tool call allowance for this turn has been reached. Stop calling tools and summarize what you completed, including any work that remains unfinished."}), must_force_text: true, stop: false}
+    force_summary_round(next_state, outcome, "tool call allowance")
   else if include_tools and outcome.waiting and not turn_budget.should_continue(next_state, plan.cap) then
     print("  [budget] tool-round budget reached at round " ++ to_text(round) ++ "; asking for the final answer")
-    BudgetRound {state: next_state, messages: append(outcome.messages, {"role": "user", "content": "The tool budget for this turn has been reached. Stop calling tools and summarize what you completed, including any work that remains unfinished."}), must_force_text: true, stop: false}
+    force_summary_round(next_state, outcome, "tool budget")
   else
     BudgetRound {state: next_state, messages: outcome.messages, must_force_text: outcome.must_force_text, stop: false}
   end
 end
 
-function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, key: text, base_url: text, model: text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, max_output_tokens: integer, context_budget: integer, preserve_recent_messages: integer, compact_after: integer, include_vision: boolean, track_usage: boolean, turn_quality: decimal): InnerLoopResult
+function initial_loop_step(messages: a list of a mapping from text to text): LoopStep
+  intent: create the loop state that starts a turn with no tool calls made and the loop waiting for a response
+  LoopStep {messages: messages, count: 0, last_batch: "", waiting: true, must_force_text: false, explore_count: 0, acted: false}
+end
+
+function round_context(settings: TurnSettings, round: integer, force_text: boolean, messages_start: integer): RoundContext
+  intent: collect the per-round flags that response handlers need from the turn settings
+  RoundContext {round: round, force_text: force_text, include_tools: settings.include_tools, max_tools: settings.max_tools, include_vision: settings.include_vision, track_usage: settings.track_usage, messages_start: messages_start}
+end
+
+function call_round_api(messages: a list of a mapping from text to text, settings: TurnSettings, force_text: boolean): a mapping from text to text
+  intent: build the chat completion request for this round and send it to the configured provider
+  call_api(settings.key, settings.base_url, build_request(settings.model, messages, force_text, settings.include_tools, settings.include_dir_tools, settings.max_output_tokens, settings.include_vision))
+end
+
+function advance_inner_loop(progress: InnerProgress, settings: TurnSettings, plan: TurnBudgetPlan, messages_start: integer): InnerProgress
+  intent: run one API round then fold its outcome and the turn budget into the next loop progress
+  let round: integer = progress.round + 1
+  let force_text: boolean = if settings.include_tools then progress.step.must_force_text or not turn_budget.should_continue(progress.state, plan.cap) or progress.step.count >= settings.max_tools else false end
+  let compacted: LoopStep = progress.step with { messages: compact_loop_messages(progress.step.messages, settings.context_budget, settings.preserve_recent_messages, settings.compact_after) }
+  let ctx: RoundContext = round_context(settings, round, force_text, messages_start)
+  let outcome: ApiRoundOutcome = process_api_round(call_round_api(compacted.messages, settings, force_text), compacted, ctx)
+  let budget: BudgetRound = observe_turn_budget(progress.state, outcome, progress.step.count, round, plan, settings.include_tools)
+  InnerProgress {
+    step: LoopStep {messages: budget.messages, count: outcome.total_tools, last_batch: outcome.last_batch, waiting: outcome.waiting and not budget.stop, must_force_text: budget.must_force_text, explore_count: outcome.explore_count, acted: outcome.acted},
+    state: budget.state,
+    round: round,
+    used_model: outcome.used_model,
+    prompt_tokens: progress.prompt_tokens + outcome.prompt_tokens,
+    completion_tokens: progress.completion_tokens + outcome.completion_tokens
+  }
+end
+
+function run_inner_loop(init_messages: a list of a mapping from text to text, messages_start: integer, settings: TurnSettings): InnerLoopResult
   intent: call the API in a loop executing tool calls and return messages plus whether the model was used successfully and token usage when track_usage is set
-  mutable msgs: a list of a mapping from text to text = init_messages
-  mutable waiting: boolean = true
-  mutable used_model: boolean = false
-  mutable round: integer = 0
-  mutable total_tools: integer = 0
-  mutable last_batch: text = ""
-  mutable must_force_text: boolean = false
-  mutable explore_count: integer = 0
-  mutable acted: boolean = false
-  mutable session_prompt: integer = 0
-  mutable session_completion: integer = 0
-  let plan: TurnBudgetPlan = plan_turn_budget(init_messages, turn_quality, context_budget, max_tools, include_tools)
-  mutable state: MutsState = plan.state
-  announce_turn_budget(plan, include_tools)
-  while waiting do
-    set round = round + 1
-    let force_text: boolean = if include_tools then must_force_text or not turn_budget.should_continue(state, plan.cap) or total_tools >= max_tools else false end
-    set must_force_text = false
-    set msgs = compact_loop_messages(msgs, context_budget, preserve_recent_messages, compact_after)
-    let resp: a mapping from text to text = call_api(key, base_url, build_request(model, msgs, force_text, include_tools, include_dir_tools, max_output_tokens, include_vision))
-    let outcome: ApiRoundOutcome = process_api_round(resp, msgs, messages_start, round, include_tools, total_tools, max_tools, last_batch, force_text, explore_count, acted, include_vision, track_usage)
-    let budget: BudgetRound = observe_turn_budget(state, outcome, total_tools, round, plan, include_tools)
-    set state = budget.state
-    set msgs = budget.messages
-    set must_force_text = budget.must_force_text
-    set used_model = outcome.used_model
-    set total_tools = outcome.total_tools
-    set last_batch = outcome.last_batch
-    set waiting = outcome.waiting and not budget.stop
-    set explore_count = outcome.explore_count
-    set acted = outcome.acted
-    set session_prompt = session_prompt + outcome.prompt_tokens
-    set session_completion = session_completion + outcome.completion_tokens
+  let plan: TurnBudgetPlan = plan_turn_budget(init_messages, settings.turn_quality, settings.context_budget, settings.max_tools, settings.include_tools)
+  announce_turn_budget(plan, settings.include_tools)
+  mutable progress: InnerProgress = InnerProgress {step: initial_loop_step(init_messages), state: plan.state, round: 0, used_model: false, prompt_tokens: 0, completion_tokens: 0}
+  while progress.step.waiting do
+    set progress = advance_inner_loop(progress, settings, plan, messages_start)
   end
-  InnerLoopResult {messages: finish_inner_loop(msgs, messages_start, last_message_is_assistant_text(msgs)), used_model: used_model, context_budget: context_budget, prompt_tokens: session_prompt, completion_tokens: session_completion}
+  InnerLoopResult {messages: finish_inner_loop(progress.step.messages, messages_start, last_message_is_assistant_text(progress.step.messages)), used_model: progress.used_model, context_budget: settings.context_budget, prompt_tokens: progress.prompt_tokens, completion_tokens: progress.completion_tokens}
 end
 
 -- ─── Graphical token usage display (CLI) ────────────────────────────────────
@@ -2250,8 +2310,11 @@ function build_provider_list(): a list of a mapping from text to text
   end
 end
 
-function print_turn_model_banner(provider_idx: integer, switched: boolean, prov: a mapping from text to text, turn_model: text, p_full: text, p_fast: text, p_expert: text): nothing
+function print_turn_model_banner(provider_idx: integer, switched: boolean, prov: a mapping from text to text, turn_model: text): nothing
   intent: print the fallback notice or the expert/fast model banner before a turn runs
+  let p_full: text = get(prov, "full")
+  let p_fast: text = get(prov, "fast")
+  let p_expert: text = get(prov, "expert")
   if provider_idx > 0 or switched then
     print("  [fallback] trying " ++ get(prov, "name") ++ " with model " ++ turn_model)
   end
@@ -2270,51 +2333,59 @@ function fail_turn_no_provider(): nothing
   exit_process(1)
 end
 
-function run_turn_with_fallback(messages: a list of a mapping from text to text, user_input: text, start: integer, providers: a list of a mapping from text to text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, include_vision: boolean, track_usage: boolean): TurnResult
-  intent: cycle providers with provider-specific limits until the turn succeeds or every provider fails consecutively and carry the final token usage
-  mutable msgs: a list of a mapping from text to text = messages
-  mutable provider_idx: integer = 0
-  mutable consecutive_failures: integer = 0
-  mutable attempts: integer = 0
-  mutable turn_done: boolean = false
-  mutable last_inner: InnerLoopResult = InnerLoopResult {messages: [], used_model: false, context_budget: 0, prompt_tokens: 0, completion_tokens: 0}
-  while not turn_done do
-    let prov: a mapping from text to text = get(providers, provider_idx)
-    let p_full: text = get(prov, "full")
-    let p_fast: text = get(prov, "fast")
-    let p_expert: text = get(prov, "expert")
-    let turn_model: text = pick_model(user_input, p_full, p_fast, p_expert)
-    let limits: ProviderLimits = resolve_provider_limits(provider_tier(get(prov, "url")), include_tools)
-    print_turn_model_banner(provider_idx, attempts > 0, prov, turn_model, p_full, p_fast, p_expert)
-    if provider_is_reachable(get(prov, "url")) then
-      let turn_quality: decimal = turn_budget.difficulty_prior(is_expert_task(user_input), is_complex_task(user_input))
-      let inner: InnerLoopResult = run_inner_loop(msgs, start, get(prov, "key"), get(prov, "url"), turn_model, max_tools, include_tools, include_dir_tools, limits.max_output_tokens, limits.context_budget, limits.keep_messages, limits.compact_after, include_vision, track_usage, turn_quality)
-      set msgs = inner.messages
-      set last_inner = inner
-      if inner.used_model then
-        set consecutive_failures = 0
-      end
-    else
-      print("  [unavailable] cannot reach " ++ get(prov, "name"))
-    end
-    if length(msgs) > start then
-      set turn_done = true
-    else
-      set consecutive_failures = consecutive_failures + 1
-      if consecutive_failures >= length(providers) then
-        fail_turn_no_provider()
-      end
-      set provider_idx = (provider_idx + 1) % length(providers)
-      set attempts = attempts + 1
-      if provider_idx == 0 then
-        print("  [retry] reached the end of the fallback chain; trying the first option")
-      end
-    end
-  end
-  TurnResult {messages: msgs, inner: last_inner}
+function build_turn_settings(prov: a mapping from text to text, turn_model: text, user_input: text, tools: ToolSettings, track_usage: boolean): TurnSettings
+  intent: combine the provider, its tier limits, the tool flags, and the task difficulty into the settings for one turn
+  let limits: ProviderLimits = resolve_provider_limits(provider_tier(get(prov, "url")), tools.include_tools)
+  TurnSettings {key: get(prov, "key"), base_url: get(prov, "url"), model: turn_model, max_tools: tools.max_tools, include_tools: tools.include_tools, include_dir_tools: tools.include_dir_tools, max_output_tokens: limits.max_output_tokens, context_budget: limits.context_budget, preserve_recent_messages: limits.keep_messages, compact_after: limits.compact_after, include_vision: tools.include_vision, track_usage: track_usage, turn_quality: turn_budget.difficulty_prior(is_expert_task(user_input), is_complex_task(user_input))}
 end
 
-function run_repl(init_messages: a list of a mapping from text to text, providers: a list of a mapping from text to text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, include_vision: boolean): nothing
+function attempt_provider(state: FallbackState, prov: a mapping from text to text, settings: TurnSettings, start: integer): FallbackState
+  intent: run the turn on one provider when it is reachable and record the resulting messages and whether the model was used
+  if provider_is_reachable(get(prov, "url")) then
+    let inner: InnerLoopResult = run_inner_loop(state.messages, start, settings)
+    state with { messages: inner.messages, last_inner: inner, consecutive_failures: if inner.used_model then 0 else state.consecutive_failures end }
+  else
+    print("  [unavailable] cannot reach " ++ get(prov, "name"))
+    state
+  end
+end
+
+function advance_fallback(state: FallbackState, provider_count: integer): FallbackState
+  intent: count a failed provider attempt, stop when every provider failed in a row, and move to the next provider
+  let failures: integer = state.consecutive_failures + 1
+  if failures >= provider_count then
+    fail_turn_no_provider()
+  end
+  let next_index: integer = (state.provider_idx + 1) % provider_count
+  if next_index == 0 then
+    print("  [retry] reached the end of the fallback chain; trying the first option")
+  end
+  state with { consecutive_failures: failures, provider_idx: next_index, attempts: state.attempts + 1 }
+end
+
+function fallback_attempt(state: FallbackState, user_input: text, start: integer, providers: a list of a mapping from text to text, tools: ToolSettings, track_usage: boolean): FallbackState
+  intent: try the current provider once and either finish the turn or advance to the next provider
+  let prov: a mapping from text to text = get(providers, state.provider_idx)
+  let turn_model: text = pick_model(user_input, get(prov, "full"), get(prov, "fast"), get(prov, "expert"))
+  print_turn_model_banner(state.provider_idx, state.attempts > 0, prov, turn_model)
+  let attempted: FallbackState = attempt_provider(state, prov, build_turn_settings(prov, turn_model, user_input, tools, track_usage), start)
+  if length(attempted.messages) > start then
+    attempted with { done: true }
+  else
+    advance_fallback(attempted, length(providers))
+  end
+end
+
+function run_turn_with_fallback(messages: a list of a mapping from text to text, user_input: text, start: integer, providers: a list of a mapping from text to text, tools: ToolSettings, track_usage: boolean): TurnResult
+  intent: cycle providers with provider-specific limits until the turn succeeds or every provider fails consecutively and carry the final token usage
+  mutable state: FallbackState = FallbackState {messages: messages, last_inner: InnerLoopResult {messages: [], used_model: false, context_budget: 0, prompt_tokens: 0, completion_tokens: 0}, provider_idx: 0, consecutive_failures: 0, attempts: 0, done: false}
+  while not state.done do
+    set state = fallback_attempt(state, user_input, start, providers, tools, track_usage)
+  end
+  TurnResult {messages: state.messages, inner: state.last_inner}
+end
+
+function run_repl(init_messages: a list of a mapping from text to text, providers: a list of a mapping from text to text, tools: ToolSettings): nothing
   intent: run the interactive read-eval-print loop, dispatching each user turn through the provider fallback chain
   mutable messages: a list of a mapping from text to text = init_messages
   mutable running: boolean = true
@@ -2329,7 +2400,7 @@ function run_repl(init_messages: a list of a mapping from text to text, provider
     else
       set messages = append(messages, {"role": "user", "content": user_input})
       let start: integer = length(messages)
-      let turn: TurnResult = run_turn_with_fallback(messages, user_input, start, providers, max_tools, include_tools, include_dir_tools, include_vision, true)
+      let turn: TurnResult = run_turn_with_fallback(messages, user_input, start, providers, tools, true)
       set messages = turn.messages
       web_add_usage(turn.inner.prompt_tokens, turn.inner.completion_tokens, turn.inner.context_budget)
       print_cli_token_tracker(messages, turn.inner)
@@ -2788,41 +2859,54 @@ function web_start_turn(ws_id: text, conv_id: text, user_text: text, root_dir: t
   end
 end
 
-function web_handle_send(body: text, init_messages: a list of a mapping from text to text, providers: a list of a mapping from text to text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, include_vision: boolean): nothing
+function enter_directory(directory: text): nothing
+  intent: change the working directory when it exists, is not already current, and the host is not Windows
+  if not windows_host() and is_dir(directory) and normalize_cd_path(directory) != normalize_cd_path(get_cwd()) then
+    chdir(directory)
+  else
+    skip()
+  end
+end
+
+function web_start_saved_turn(ws_id: text, conv_id: text, root_dir: text, user_text: text, init_messages: a list of a mapping from text to text): nothing
+  intent: save the user message to the session then start the worker turn and report the result
+  let msgs: a list of a mapping from text to text = web_load_session(ws_id, conv_id, init_messages)
+  let saved: a list of a mapping from text to text = append(msgs, {"role": "user", "content": user_text})
+  web_save_session(ws_id, conv_id, saved)
+  let started: a mapping from text to text = web_start_turn(ws_id, conv_id, user_text, root_dir)
+  if unwrap_or(get(started, "ok"), "false") == "true" then
+    web_respond_json(200, json_encode({"ok": true, "started": true, "ws": ws_id, "conv": conv_id, "messages": web_display_messages(saved)}))
+  else
+    web_save_session(ws_id, conv_id, msgs)
+    web_respond_json(500, web_json_error(unwrap_or(get(started, "error"), "failed to start turn")))
+  end
+end
+
+function web_send_message(user_text: text, init_messages: a list of a mapping from text to text): nothing
+  intent: enter the active workspace and start a turn for the message unless one is already running for the conversation
+  let reg: a mapping from text to text = web_ensure_registry()
+  let ws: a mapping from text to text = web_active_workspace(reg)
+  let ws_id: text = unwrap_or(get(ws, "id"), "")
+  let conv_id: text = unwrap_or(get(web_active_conversation(ws), "id"), "")
+  let root_dir: text = unwrap_or(get(ws, "root_dir"), get_cwd())
+  enter_directory(root_dir)
+  if web_turn_is_locked(ws_id, conv_id) then
+    web_respond_json(409, web_json_error("a turn is already running for this conversation"))
+  else
+    web_start_saved_turn(ws_id, conv_id, root_dir, user_text, init_messages)
+  end
+end
+
+function web_handle_send(body: text, init_messages: a list of a mapping from text to text): nothing
   intent: json_parse the body then web_turn_is_locked web_load_session web_save_session and web_start_turn the worker
   if not json_valid(body) then
     web_respond_json(400, web_json_error("invalid JSON body"))
   else
-    let data: a mapping from text to text = json_parse(body)
-    let user_text: text = trim(unwrap_or(get(data, "text"), ""))
+    let user_text: text = trim(unwrap_or(get(json_parse(body), "text"), ""))
     if text_length(user_text) == 0 then
       web_respond_json(400, web_json_error("message text is required"))
     else
-      let reg: a mapping from text to text = web_ensure_registry()
-      let ws: a mapping from text to text = web_active_workspace(reg)
-      let ws_id: text = unwrap_or(get(ws, "id"), "")
-      let conv: a mapping from text to text = web_active_conversation(ws)
-      let conv_id: text = unwrap_or(get(conv, "id"), "")
-      let root_dir: text = unwrap_or(get(ws, "root_dir"), get_cwd())
-      if not windows_host() and is_dir(root_dir) then
-        chdir(root_dir)
-      else
-        skip()
-      end
-      if web_turn_is_locked(ws_id, conv_id) then
-        web_respond_json(409, web_json_error("a turn is already running for this conversation"))
-      else
-        let msgs: a list of a mapping from text to text = web_load_session(ws_id, conv_id, init_messages)
-        let saved: a list of a mapping from text to text = append(msgs, {"role": "user", "content": user_text})
-        web_save_session(ws_id, conv_id, saved)
-        let started: a mapping from text to text = web_start_turn(ws_id, conv_id, user_text, root_dir)
-        if unwrap_or(get(started, "ok"), "false") == "true" then
-          web_respond_json(200, json_encode({"ok": true, "started": true, "ws": ws_id, "conv": conv_id, "messages": web_display_messages(saved)}))
-        else
-          web_save_session(ws_id, conv_id, msgs)
-          web_respond_json(500, web_json_error(unwrap_or(get(started, "error"), "failed to start turn")))
-        end
-      end
+      web_send_message(user_text, init_messages)
     end
   end
 end
@@ -3298,47 +3382,62 @@ function web_index_html(): text
   "</script>\n</body>\n</html>\n"
 end
 
-function route_web_request(request: Request, init_messages: a list of a mapping from text to text, providers: a list of a mapping from text to text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, include_vision: boolean): nothing
-  intent: dispatch one HTTP request to the web GUI routes for pages state messages files live events and turns
-  let primary: a mapping from text to text = get(providers, 0)
-  let model: text = get(primary, "full")
-  let base_url: text = get(primary, "url")
-  if request.method == "GET" and request.path == "/" then
+function web_not_found(request: Request): nothing
+  intent: respond with a not found error naming the requested path
+  web_respond_json(404, web_json_error("not found: " ++ request.path))
+end
+
+function route_web_get(request: Request, init_messages: a list of a mapping from text to text, model: text, base_url: text): nothing
+  intent: dispatch one GET request to the page state messages files or live events handlers
+  if request.path == "/" then
     web_respond_html(web_index_html())
-  else if request.method == "GET" and request.path == "/api/state" then
+  else if request.path == "/api/state" then
     web_handle_state(model, base_url)
-  else if request.method == "GET" and request.path == "/api/messages" then
+  else if request.path == "/api/messages" then
     web_handle_messages(init_messages)
-  else if request.method == "GET" and request.path == "/api/files" then
+  else if request.path == "/api/files" then
     web_handle_files()
-  else if request.method == "GET" and request.path == "/api/events" then
+  else if request.path == "/api/events" then
     web_handle_events(request.query)
-  else if request.method == "POST" and request.path == "/api/workspaces" then
-    web_handle_create(request.body, model, base_url)
-  else if request.method == "POST" and request.path == "/api/select" then
-    web_handle_select(request.body, model, base_url)
-  else if request.method == "POST" and request.path == "/api/conversations" then
-    web_handle_create_conversation(request.body, model, base_url)
-  else if request.method == "POST" and request.path == "/api/select-conversation" then
-    web_handle_select_conversation(request.body, model, base_url)
-  else if request.method == "POST" and request.path == "/api/send" then
-    web_handle_send(request.body, init_messages, providers, max_tools, include_tools, include_dir_tools, include_vision)
   else
-    web_respond_json(404, web_json_error("not found: " ++ request.path))
+    web_not_found(request)
   end
 end
 
-function run_web_server(init_messages: a list of a mapping from text to text, providers: a list of a mapping from text to text, max_tools: integer, include_tools: boolean, include_dir_tools: boolean, include_vision: boolean): nothing
+function route_web_post(request: Request, init_messages: a list of a mapping from text to text, model: text, base_url: text): nothing
+  intent: dispatch one POST request to the workspace conversation or send handlers
+  if request.path == "/api/workspaces" then
+    web_handle_create(request.body, model, base_url)
+  else if request.path == "/api/select" then
+    web_handle_select(request.body, model, base_url)
+  else if request.path == "/api/conversations" then
+    web_handle_create_conversation(request.body, model, base_url)
+  else if request.path == "/api/select-conversation" then
+    web_handle_select_conversation(request.body, model, base_url)
+  else if request.path == "/api/send" then
+    web_handle_send(request.body, init_messages)
+  else
+    web_not_found(request)
+  end
+end
+
+function route_web_request(request: Request, init_messages: a list of a mapping from text to text, providers: a list of a mapping from text to text): nothing
+  intent: dispatch one HTTP request to the web GUI routes for pages state messages files live events and turns
+  let primary: a mapping from text to text = get(providers, 0)
+  if request.method == "GET" then
+    route_web_get(request, init_messages, get(primary, "full"), get(primary, "url"))
+  else if request.method == "POST" then
+    route_web_post(request, init_messages, get(primary, "full"), get(primary, "url"))
+  else
+    web_not_found(request)
+  end
+end
+
+function run_web_server(init_messages: a list of a mapping from text to text, providers: a list of a mapping from text to text): nothing
   intent: capture the launch state then start the HTTP server chdir into the active workspace and serve the web GUI until interrupted
   web_capture_launch_state()
-  let reg: a mapping from text to text = web_ensure_registry()
-  let ws: a mapping from text to text = web_active_workspace(reg)
-  let root_dir: text = unwrap_or(get(ws, "root_dir"), get_cwd())
-  if not windows_host() and is_dir(root_dir) and normalize_cd_path(root_dir) != normalize_cd_path(get_cwd()) then
-    chdir(root_dir)
-  else
-    skip()
-  end
+  let ws: a mapping from text to text = web_active_workspace(web_ensure_registry())
+  enter_directory(unwrap_or(get(ws, "root_dir"), get_cwd()))
   let port: integer = web_port()
   http_start(port)
   print("")
@@ -3347,7 +3446,7 @@ function run_web_server(init_messages: a list of a mapping from text to text, pr
   print("  Stop the server with Ctrl-C.")
   while true do
     let request: Request = http_next_request()
-    route_web_request(request, init_messages, providers, max_tools, include_tools, include_dir_tools, include_vision)
+    route_web_request(request, init_messages, providers)
   end
 end
 
@@ -3418,45 +3517,62 @@ function web_worker_launch_prefix(): text
   end
 end
 
-function web_worker_spawn_cmd(prefix: text, ws_id: text, conv_id: text, user_text: text, work_dir: text, events_path: text): text
+function web_worker_failure_json(): text
+  intent: encode the error event appended when the turn worker exits with a failure status
+  json_encode({"type": "error", "text": "The turn worker failed before completing the response. Please try again."})
+end
+
+function web_worker_powershell_environment(ws_id: text, conv_id: text, user_text: text, work_dir: text, events_path: text): text
+  intent: build the PowerShell lines that export the turn context and enter the work directory
+  "$ErrorActionPreference = 'Continue'\n" ++
+  "$env:PATH = " ++ powershell_quote(unwrap_or(env_get("PATH"), "")) ++ "\n" ++
+  "$env:LEGIBLE_CODER_WS_ID = " ++ powershell_quote(ws_id) ++ "\n" ++
+  "$env:LEGIBLE_CODER_CONV_ID = " ++ powershell_quote(conv_id) ++ "\n" ++
+  "$env:LEGIBLE_CODER_USER_TEXT = " ++ powershell_quote(user_text) ++ "\n" ++
+  "$env:LEGIBLE_CODER_WORKDIR = " ++ powershell_quote(work_dir) ++ "\n" ++
+  "$env:LEGIBLE_CODER_EVENTS_PATH = " ++ powershell_quote(events_path) ++ "\n" ++
+  "Set-Location -LiteralPath " ++ powershell_quote(work_dir) ++ "\n"
+end
+
+function web_worker_powershell_run(ws_id: text, conv_id: text, events_path: text, launcher: a list of text): text
+  intent: build the PowerShell lines that stamp the lock run the worker append error and done events and release the lock
+  let lock_path: text = web_turn_lock_path(ws_id, conv_id)
+  "Set-Content -LiteralPath " ++ powershell_quote(lock_path) ++ " -Value $PID -NoNewline\n" ++
+  "& " ++ powershell_quote(get(launcher, 0)) ++ " run " ++ powershell_quote(get(launcher, 1)) ++ " --turn *> " ++ powershell_quote(web_worker_log_path(ws_id, conv_id)) ++ "\n" ++
+  "$turnStatus = $LASTEXITCODE\n" ++
+  "if ($turnStatus -ne 0) \{ Add-Content -LiteralPath " ++ powershell_quote(events_path) ++ " -Value " ++ powershell_quote(web_worker_failure_json()) ++ " -Encoding UTF8 \}\n" ++
+  "Add-Content -LiteralPath " ++ powershell_quote(events_path) ++ " -Value " ++ powershell_quote(json_encode({"type": "done"})) ++ " -Encoding UTF8\n" ++
+  "Remove-Item -LiteralPath " ++ powershell_quote(lock_path) ++ " -Force -ErrorAction SilentlyContinue\n" ++
+  "exit $turnStatus\n"
+end
+
+function web_worker_spawn_windows(ws_id: text, conv_id: text, user_text: text, work_dir: text, events_path: text): text
+  intent: write the PowerShell worker script for the turn then return the command that starts it hidden
+  let worker_script: text = web_base_dir() ++ "/worker-" ++ ws_id ++ "--" ++ conv_id ++ ".ps1"
+  write_file(worker_script, web_worker_powershell_environment(ws_id, conv_id, user_text, work_dir, events_path) ++ web_worker_powershell_run(ws_id, conv_id, events_path, web_worker_launcher()))
+  powershell_command("Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File'," ++ powershell_quote(worker_script) ++ ") -WindowStyle Hidden")
+end
+
+function web_worker_spawn_posix(prefix: text, ws_id: text, conv_id: text, user_text: text, work_dir: text, events_path: text): text
   intent: build a detached setsid nohup supervisor command exporting the turn context after checking the work directory and log file
+  let supervisor: text = web_worker_supervisor_cmd(prefix, web_turn_lock_path(ws_id, conv_id), events_path)
+  "cd " ++ shell_quote(work_dir) ++ " && " ++
+  "command -v setsid >/dev/null && command -v nohup >/dev/null && " ++
+  ": > " ++ shell_quote(web_worker_log_path(ws_id, conv_id)) ++ " && ( " ++
+  "LEGIBLE_CODER_WS_ID=" ++ shell_quote(ws_id) ++ " " ++
+  "LEGIBLE_CODER_CONV_ID=" ++ shell_quote(conv_id) ++ " " ++
+  "LEGIBLE_CODER_USER_TEXT=" ++ shell_quote(user_text) ++ " " ++
+  "LEGIBLE_CODER_WORKDIR=" ++ shell_quote(work_dir) ++ " " ++
+  "LEGIBLE_CODER_EVENTS_PATH=" ++ shell_quote(events_path) ++ " " ++
+  "setsid nohup sh -c " ++ shell_quote(supervisor) ++ " </dev/null >> " ++ shell_quote(web_worker_log_path(ws_id, conv_id)) ++ " 2>&1 & )"
+end
+
+function web_worker_spawn_cmd(prefix: text, ws_id: text, conv_id: text, user_text: text, work_dir: text, events_path: text): text
+  intent: build the command that starts the detached turn worker using PowerShell on Windows and setsid nohup elsewhere
   if windows_host() then
-    let parts: a list of text = web_worker_launcher()
-    let worker_script: text = web_base_dir() ++ "/worker-" ++ ws_id ++ "--" ++ conv_id ++ ".ps1"
-    let interpreter: text = get(parts, 0)
-    let script: text = get(parts, 1)
-    let lock_path: text = web_turn_lock_path(ws_id, conv_id)
-    let log_path: text = web_worker_log_path(ws_id, conv_id)
-    let failure: text = json_encode({"type": "error", "text": "The turn worker failed before completing the response. Please try again."})
-    let done: text = json_encode({"type": "done"})
-    let worker_body: text = "$ErrorActionPreference = 'Continue'\n" ++
-      "$env:PATH = " ++ powershell_quote(unwrap_or(env_get("PATH"), "")) ++ "\n" ++
-      "$env:LEGIBLE_CODER_WS_ID = " ++ powershell_quote(ws_id) ++ "\n" ++
-      "$env:LEGIBLE_CODER_CONV_ID = " ++ powershell_quote(conv_id) ++ "\n" ++
-      "$env:LEGIBLE_CODER_USER_TEXT = " ++ powershell_quote(user_text) ++ "\n" ++
-      "$env:LEGIBLE_CODER_WORKDIR = " ++ powershell_quote(work_dir) ++ "\n" ++
-      "$env:LEGIBLE_CODER_EVENTS_PATH = " ++ powershell_quote(events_path) ++ "\n" ++
-      "Set-Location -LiteralPath " ++ powershell_quote(work_dir) ++ "\n" ++
-      "Set-Content -LiteralPath " ++ powershell_quote(lock_path) ++ " -Value $PID -NoNewline\n" ++
-      "& " ++ powershell_quote(interpreter) ++ " run " ++ powershell_quote(script) ++ " --turn *> " ++ powershell_quote(log_path) ++ "\n" ++
-      "$turnStatus = $LASTEXITCODE\n" ++
-      "if ($turnStatus -ne 0) \{ Add-Content -LiteralPath " ++ powershell_quote(events_path) ++ " -Value " ++ powershell_quote(failure) ++ " -Encoding UTF8 \}\n" ++
-      "Add-Content -LiteralPath " ++ powershell_quote(events_path) ++ " -Value " ++ powershell_quote(done) ++ " -Encoding UTF8\n" ++
-      "Remove-Item -LiteralPath " ++ powershell_quote(lock_path) ++ " -Force -ErrorAction SilentlyContinue\n" ++
-      "exit $turnStatus\n"
-    write_file(worker_script, worker_body)
-    powershell_command("Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File'," ++ powershell_quote(worker_script) ++ ") -WindowStyle Hidden")
+    web_worker_spawn_windows(ws_id, conv_id, user_text, work_dir, events_path)
   else
-    let supervisor: text = web_worker_supervisor_cmd(prefix, web_turn_lock_path(ws_id, conv_id), events_path)
-    "cd " ++ shell_quote(work_dir) ++ " && " ++
-    "command -v setsid >/dev/null && command -v nohup >/dev/null && " ++
-    ": > " ++ shell_quote(web_worker_log_path(ws_id, conv_id)) ++ " && ( " ++
-    "LEGIBLE_CODER_WS_ID=" ++ shell_quote(ws_id) ++ " " ++
-    "LEGIBLE_CODER_CONV_ID=" ++ shell_quote(conv_id) ++ " " ++
-    "LEGIBLE_CODER_USER_TEXT=" ++ shell_quote(user_text) ++ " " ++
-    "LEGIBLE_CODER_WORKDIR=" ++ shell_quote(work_dir) ++ " " ++
-    "LEGIBLE_CODER_EVENTS_PATH=" ++ shell_quote(events_path) ++ " " ++
-    "setsid nohup sh -c " ++ shell_quote(supervisor) ++ " </dev/null >> " ++ shell_quote(web_worker_log_path(ws_id, conv_id)) ++ " 2>&1 & )"
+    web_worker_spawn_posix(prefix, ws_id, conv_id, user_text, work_dir, events_path)
   end
 end
 
@@ -3494,36 +3610,42 @@ function web_title_conversation(ws_id: text, conv_id: text, user_text: text): no
   end
 end
 
-function run_web_turn(ws_id: text, conv_id: text, user_text: text, work_dir: text): nothing
-  intent: run one turn on the already saved transcript then persist it with its title and usage
-  if not windows_host() and is_dir(work_dir) then
-    chdir(work_dir)
-  else
-    skip()
-  end
-  let providers: a list of a mapping from text to text = build_provider_list()
-  let primary: a mapping from text to text = get(providers, 0)
+function resolve_tool_settings(primary: a mapping from text to text): ToolSettings
+  intent: derive the tool call limit and the tool, directory tool, and vision flags from the primary provider
   let tier: text = provider_tier(get(primary, "url"))
-  let is_local: boolean = tier == "local"
-  let include_tools: boolean = not is_local or resolve_local_native_tools(get(primary, "full"))
-  let include_dir_tools: boolean = include_tools
-  let max_tools: integer = resolve_max_tools(tier)
-  let include_vision: boolean = include_tools and resolve_include_vision(get(primary, "full"))
-  let sys_prompt: text = if is_local and not include_tools then local_system_prompt() else system_prompt(include_tools, include_dir_tools, include_vision) end
-  let init_messages: a list of a mapping from text to text = initial_messages(is_local, sys_prompt)
-  mutable msgs: a list of a mapping from text to text = web_load_session(ws_id, conv_id, init_messages)
-  let start: integer = length(msgs)
-  web_event_emit({"type": "model", "model": get(primary, "full"), "backend": backend_name(get(primary, "url"))})
+  let include_tools: boolean = tier != "local" or resolve_local_native_tools(get(primary, "full"))
+  ToolSettings {max_tools: resolve_max_tools(tier), include_tools: include_tools, include_dir_tools: include_tools, include_vision: include_tools and resolve_include_vision(get(primary, "full"))}
+end
+
+function build_initial_messages(primary: a mapping from text to text, tools: ToolSettings): a list of a mapping from text to text
+  intent: build the starting transcript from the system prompt that matches the primary provider and its tool flags
+  let is_local: boolean = provider_tier(get(primary, "url")) == "local"
+  let sys_prompt: text = if is_local and not tools.include_tools then local_system_prompt() else system_prompt(tools.include_tools, tools.include_dir_tools, tools.include_vision) end
+  initial_messages(is_local, sys_prompt)
+end
+
+function web_execute_turn(msgs: a list of a mapping from text to text, user_text: text, start: integer, providers: a list of a mapping from text to text, tools: ToolSettings): a list of a mapping from text to text
+  intent: run the turn through the provider fallback chain and emit its usage, or report that no provider is reachable
   if any_provider_reachable(providers) then
-    let turn: TurnResult = run_turn_with_fallback(msgs, user_text, start, providers, max_tools, include_tools, include_dir_tools, include_vision, true)
-    set msgs = turn.messages
+    let turn: TurnResult = run_turn_with_fallback(msgs, user_text, start, providers, tools, true)
     web_add_usage(turn.inner.prompt_tokens, turn.inner.completion_tokens, turn.inner.context_budget)
     web_event_emit({"type": "usage", "prompt": to_text(turn.inner.prompt_tokens), "completion": to_text(turn.inner.completion_tokens)})
+    turn.messages
   else
-    set msgs = append(msgs, {"role": "assistant", "content": "Error: no model provider is reachable. Check your API keys and network connection, then try again."})
     web_event_emit({"type": "final", "text": "Error: no model provider is reachable. Check your API keys and network connection, then try again."})
+    append(msgs, {"role": "assistant", "content": "Error: no model provider is reachable. Check your API keys and network connection, then try again."})
   end
-  web_save_session(ws_id, conv_id, msgs)
+end
+
+function run_web_turn(ws_id: text, conv_id: text, user_text: text, work_dir: text): nothing
+  intent: run one turn on the already saved transcript then persist it with its title and usage
+  enter_directory(work_dir)
+  let providers: a list of a mapping from text to text = build_provider_list()
+  let primary: a mapping from text to text = get(providers, 0)
+  let tools: ToolSettings = resolve_tool_settings(primary)
+  let msgs: a list of a mapping from text to text = web_load_session(ws_id, conv_id, build_initial_messages(primary, tools))
+  web_event_emit({"type": "model", "model": get(primary, "full"), "backend": backend_name(get(primary, "url"))})
+  web_save_session(ws_id, conv_id, web_execute_turn(msgs, user_text, length(msgs), providers, tools))
   web_title_conversation(ws_id, conv_id, user_text)
 end
 
@@ -3540,24 +3662,16 @@ function main(): nothing
   end
   let providers: a list of a mapping from text to text = build_provider_list()
   let primary: a mapping from text to text = get(providers, 0)
-  let primary_url: text = get(primary, "url")
-  let primary_model: text = get(primary, "full")
-  let tier: text = provider_tier(primary_url)
-  let is_local: boolean = tier == "local"
-  let include_tools: boolean = not is_local or resolve_local_native_tools(primary_model)
-  let include_dir_tools: boolean = include_tools
-  let max_tools: integer = resolve_max_tools(tier)
-  let include_vision: boolean = include_tools and resolve_include_vision(primary_model)
-  print_banner(primary_model, primary_url)
+  let tools: ToolSettings = resolve_tool_settings(primary)
+  print_banner(get(primary, "full"), get(primary, "url"))
   if length(providers) > 1 then
     print("  Fallbacks: " ++ join(drop(provider_name_list(providers), 1), " -> "))
   end
-  print_local_tool_mode(is_local, include_tools)
-  let sys_prompt: text = if is_local and not include_tools then local_system_prompt() else system_prompt(include_tools, include_dir_tools, include_vision) end
-  let messages: a list of a mapping from text to text = initial_messages(is_local, sys_prompt)
+  print_local_tool_mode(provider_tier(get(primary, "url")) == "local", tools.include_tools)
+  let messages: a list of a mapping from text to text = build_initial_messages(primary, tools)
   if web_mode_requested() then
-    run_web_server(messages, providers, max_tools, include_tools, include_dir_tools, include_vision)
+    run_web_server(messages, providers)
   else
-    run_repl(messages, providers, max_tools, include_tools, include_dir_tools, include_vision)
+    run_repl(messages, providers, tools)
   end
 end

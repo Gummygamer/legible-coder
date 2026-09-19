@@ -58,7 +58,7 @@ class TurnBudgetTest(unittest.TestCase):
 function main(): nothing
   intent: run_inner_loop against the test model and print whether the result ends with assistant text
   let messages: a list of a mapping from text to text = [{{"role": "system", "content": "Use tools as needed."}}, {{"role": "user", "content": "Complete the task."}}]
-  let result: InnerLoopResult = run_inner_loop(messages, 2, "test", "http://127.0.0.1:{model.server_port}/v1", "test-model", {maximum}, true, true, 4096, 120000, 12, 0, false, false, {quality})
+  let result: InnerLoopResult = run_inner_loop(messages, 2, TurnSettings {{key: "test", base_url: "http://127.0.0.1:{model.server_port}/v1", model: "test-model", max_tools: {maximum}, include_tools: true, include_dir_tools: true, max_output_tokens: 4096, context_budget: 120000, preserve_recent_messages: 12, compact_after: 0, include_vision: false, track_usage: false, turn_quality: {quality}}})
   print("TEST_FINAL=" ++ to_text(last_message_is_assistant_text(result.messages)))
 end
 '''

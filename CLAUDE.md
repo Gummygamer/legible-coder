@@ -56,6 +56,15 @@ that touches a handful of specific spots in an existing file, instead of
 `write_file` (which requires restating the whole file) or a `shell_exec`
 script that pattern-matches multiple locations with one replacement.
 
+Jev mode always prints one line per proposed tool call from the actor
+(Qwen3.8-Flash) and one line per Jev verdict on it — `[jev] #n propose: ...`
+and `[jev] #n verdict: GOOD|BAD - reason` — plus a `steps, good/bad` summary
+at the end of the turn, regardless of `LEGIBLE_CODER_JEV_TRACE`. A verdict
+that falls back to `good` because the judge call failed or returned garbage
+is labeled `(judge unavailable)` so it isn't read as a real judgment.
+`LEGIBLE_CODER_JEV_TRACE` still gates the verbose extras only: the raw JSON
+decision from the actor and a truncated preview of each tool's output.
+
 Local endpoints default to the manual `TOOL name JSON_arguments` protocol unless
 the model name looks like Gemma 4 or `LEGIBLE_CODER_LOCAL_TOOLS=1` is set. Set
 `LEGIBLE_CODER_LOCAL_TOOLS=0` to force the manual fallback for a local server

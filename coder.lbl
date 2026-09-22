@@ -171,26 +171,31 @@ function normalize_tool_call_arguments(arguments: text): text
   end
 end
 
+function describe_arg(args: a mapping from text to text, key: text, default: text): text
+  intent: get key from args defaulting to default, then convert the result to text with to_text so a non-text JSON value does not break later ++ concatenation
+  to_text(unwrap_or(get(args, key), default))
+end
+
 function describe_line_slice(name: text, args: a mapping from text to text): text
   intent: format a read_file_lines call as its path with the start line and line count
-  name ++ "  " ++ unwrap_or(get(args, "path"), "") ++ ":" ++ unwrap_or(get(args, "start_line"), "") ++ "+" ++ unwrap_or(get(args, "line_count"), "")
+  name ++ "  " ++ describe_arg(args, "path", "") ++ ":" ++ describe_arg(args, "start_line", "") ++ "+" ++ describe_arg(args, "line_count", "")
 end
 
 function describe_shell_call(name: text, args: a mapping from text to text): text
   intent: format a shell_exec call as its command without a redundant cd truncated to sixty characters
-  let cmd: text = strip_redundant_cd(unwrap_or(get(args, "command"), ""))
+  let cmd: text = strip_redundant_cd(describe_arg(args, "command", ""))
   let preview: text = if text_length(cmd) > 60 then substring(cmd, 0, 60) ++ "…" else cmd end
   name ++ "  $ " ++ preview
 end
 
 function describe_grep_call(name: text, args: a mapping from text to text): text
   intent: concatenate name with the pattern field of args between slashes and the path field of args, defaulting path to "."
-  name ++ "  /" ++ unwrap_or(get(args, "pattern"), "") ++ "/  " ++ unwrap_or(get(args, "path"), ".")
+  name ++ "  /" ++ describe_arg(args, "pattern", "") ++ "/  " ++ describe_arg(args, "path", ".")
 end
 
 function describe_search_call(name: text, args: a mapping from text to text): text
   intent: concatenate name with the query field of args between slashes, truncating the query preview to 60 characters
-  let q: text = unwrap_or(get(args, "query"), "")
+  let q: text = describe_arg(args, "query", "")
   let preview: text = if text_length(q) > 60 then substring(q, 0, 60) ++ "..." else q end
   name ++ "  /" ++ preview ++ "/"
 end
@@ -199,7 +204,7 @@ function describe_tool_call(name: text, arguments: text): text
   intent: format name with its path, command, or pattern argument as a short label
   let args: a mapping from text to text = json_parse(arguments)
   if name == "read_file" or name == "list_dir" or name == "read_dir_recursive" or name == "write_file" or name == "edit_file" then
-    name ++ "  " ++ unwrap_or(get(args, "path"), "")
+    name ++ "  " ++ describe_arg(args, "path", "")
   else if name == "read_file_lines" then
     describe_line_slice(name, args)
   else if name == "shell_exec" then
@@ -1017,6 +1022,7 @@ record JevState
   history: text
   steps: integer
   consecutive_bad: integer
+  bad_total: integer
   last_verdict: text
   last_reason: text
   done: boolean
@@ -1184,15 +1190,15 @@ function jev_judge_post(prov: a mapping from text to text, request: a mapping fr
 end
 
 function jev_verdict_from_response(response: a mapping from text to text, criteria: a mapping from text to text): a mapping from text to text
-  intent: extract a good/bad verdict mapping from one typed Jev choice response, defaulting to good on any API error or malformed reply so a flaky judge cannot stall real progress
+  intent: extract a good/bad verdict mapping from one typed Jev choice response, defaulting to good (flagged as judge unavailable) on any API error or malformed reply so a flaky judge cannot stall real progress
   let status: text = get(response, "status")
   if status != "200" then
     print("  [jev] judge API error (" ++ status ++ "): " ++ extract_error_message(get(response, "body")))
-    {"verdict": "good", "reason": ""}
+    {"verdict": "good", "reason": "", "note": "judge unavailable"}
   else
     let picked: an optional text = jev_response_verdict(get(response, "body"), criteria)
     if is_none(picked) then
-      {"verdict": "good", "reason": ""}
+      {"verdict": "good", "reason": "", "note": "judge unavailable"}
     else
       let label: text = unwrap(picked)
       {"verdict": label, "reason": if label == "bad" then unwrap_or(get(criteria, label), "") else "" end}
@@ -1208,12 +1214,14 @@ function jev_judge_tool_call(prov: a mapping from text to text, user_input: text
 end
 
 function jev_run_and_trace(n: integer, tool: text, args: a mapping from text to text): text
-  intent: run one tool call (or the built-in test_script check), emit its tool_start/tool_end events, and print a trace line when tracing is enabled
-  web_event_tool_start(n, tool, json_encode(args))
+  intent: print the proposed call, run it (or the built-in test_script check), emit its tool_start/tool_end events, and print a trace line when tracing is enabled
+  let arguments: text = json_encode(args)
+  print("  [jev] #" ++ to_text(n) ++ " propose: " ++ describe_tool_call(tool, arguments))
+  web_event_tool_start(n, tool, arguments)
   let output: text = if tool == "test_script" then
     jev_test_written_source(unwrap_or(get(args, "path"), "")).report
   else
-    execute_tool(tool, json_encode(args))
+    execute_tool(tool, arguments)
   end
   web_event_tool_end(n, tool, output)
   if jev_trace_enabled() then print("  [jev] " ++ tool ++ ": " ++ truncate_text(output, 200)) end
@@ -1221,14 +1229,18 @@ function jev_run_and_trace(n: integer, tool: text, args: a mapping from text to 
 end
 
 function jev_fold_step(state: JevState, n: integer, tool: text, args: a mapping from text to text, output: text, judged: a mapping from text to text): JevState
-  intent: score one already-executed tool call as good or bad from its judge reply and fold the outcome into the running turn state
-  -- a judge call that fails to parse defaults to "good" so a flaky judge request cannot stall real progress
+  intent: score one already-executed tool call as good or bad from its judge reply, always print the verdict, and fold the outcome into the running turn state
+  -- a judge call that fails to parse defaults to "good" (flagged as judge unavailable) so a flaky judge request cannot stall real progress
   let verdict: text = unwrap_or(get(judged, "verdict"), "good")
   let reason: text = unwrap_or(get(judged, "reason"), "")
-  if jev_trace_enabled() then print("  [jev] judge: " ++ verdict ++ (if text_length(reason) > 0 then " (" ++ reason ++ ")" else "" end)) end
+  let note: text = unwrap_or(get(judged, "note"), "")
+  let suffix: text = if text_length(note) > 0 then " (" ++ note ++ ")" else if text_length(reason) > 0 then " - " ++ reason else "" end
+  print("  [jev] #" ++ to_text(n) ++ " verdict: " ++ uppercase(verdict) ++ suffix)
+  web_event_jev_verdict(n, verdict, reason)
   let entry: text = "[" ++ tool ++ "] args=" ++ json_encode(args) ++ "\noutput:\n" ++ truncate_text(output, 2000) ++ "\njudged: " ++ verdict ++ (if text_length(reason) > 0 then " - " ++ reason else "" end)
   let next_consecutive_bad: integer = if verdict == "bad" then state.consecutive_bad + 1 else 0 end
-  state with { history: jev_history_append(state.history, entry), steps: n, consecutive_bad: next_consecutive_bad, last_verdict: verdict, last_reason: reason }
+  let next_bad_total: integer = if verdict == "bad" then state.bad_total + 1 else state.bad_total end
+  state with { history: jev_history_append(state.history, entry), steps: n, consecutive_bad: next_consecutive_bad, bad_total: next_bad_total, last_verdict: verdict, last_reason: reason }
 end
 
 function jev_execute_step(actor_prov: a mapping from text to text, judge_prov: a mapping from text to text, user_input: text, tool: text, args: a mapping from text to text, state: JevState): JevState
@@ -1254,8 +1266,9 @@ function jev_run_chain(actor_prov: a mapping from text to text, judge_prov: a ma
 end
 
 function jev_invalid_decision_state(state: JevState, note: text, reason: text): JevState
-  intent: return state with history appended via jev_history_append, steps and consecutive_bad incremented, last_verdict set to "bad", and last_reason set to reason
-  state with { history: jev_history_append(state.history, note), steps: state.steps + 1, consecutive_bad: state.consecutive_bad + 1, last_verdict: "bad", last_reason: reason }
+  intent: print the rejection, then return state with history appended via jev_history_append, steps and consecutive_bad incremented, last_verdict set to "bad", and last_reason set to reason
+  print("  [jev] #" ++ to_text(state.steps + 1) ++ " " ++ note)
+  state with { history: jev_history_append(state.history, note), steps: state.steps + 1, consecutive_bad: state.consecutive_bad + 1, bad_total: state.bad_total + 1, last_verdict: "bad", last_reason: reason }
 end
 
 function jev_apply_tool_decision(actor_prov: a mapping from text to text, judge_prov: a mapping from text to text, user_input: text, decision: a mapping from text to text, state: JevState): JevState
@@ -1294,10 +1307,16 @@ function jev_step_loop(actor_prov: a mapping from text to text, judge_prov: a ma
   current
 end
 
+function jev_step_summary_line(state: JevState): text
+  intent: format a "N steps, G good / B bad" summary line from the running turn state
+  "  [jev] " ++ to_text(state.steps) ++ " steps, " ++ to_text(state.steps - state.bad_total) ++ " good / " ++ to_text(state.bad_total) ++ " bad"
+end
+
 function finish_jev_turn(messages: a list of a mapping from text to text, state: JevState, settings: TurnSettings): InnerLoopResult
   intent: report the final answer, or a failure/budget explanation with the trailing history, and append it as an assistant message when the turn produced a usable result
   if state.failed then
     let summary: text = "[jev] stopping after repeated bad decisions" ++ (if text_length(state.last_reason) > 0 then ": " ++ state.last_reason else "" end) ++ ".\n\n" ++ truncate_text(state.history, 4000)
+    print(jev_step_summary_line(state))
     print("")
     print(summary)
     InnerLoopResult {messages: messages, used_model: false, context_budget: settings.context_budget, prompt_tokens: 0, completion_tokens: state.steps}
@@ -1309,6 +1328,7 @@ function finish_jev_turn(messages: a list of a mapping from text to text, state:
     else
       "[jev] reached the step budget (" ++ to_text(jev_max_steps()) ++ ") without a final answer.\n\n" ++ truncate_text(state.history, 4000)
     end
+    print(jev_step_summary_line(state))
     print("")
     print_separator()
     print(summary)
@@ -1325,9 +1345,14 @@ function run_jev_turn(messages: a list of a mapping from text to text, user_inpu
   let judge_prov: a mapping from text to text = jev_judge_provider()
   print("  [jev] " ++ get(actor_prov, "full") ++ " deciding")
   let chain: a list of a mapping from text to text = jev_plan_chain(actor_prov, user_input)
-  let seeded: JevState = JevState {history: "", steps: 0, consecutive_bad: 0, last_verdict: "", last_reason: "", done: false, failed: false, final_text: ""}
+  let seeded: JevState = JevState {history: "", steps: 0, consecutive_bad: 0, bad_total: 0, last_verdict: "", last_reason: "", done: false, failed: false, final_text: ""}
   let after_chain: JevState = if length(chain) > 0 then
-    print("  [jev] running a " ++ to_text(length(chain)) ++ "-step non-contingent chain")
+    print("  [jev] chain (" ++ to_text(length(chain)) ++ " steps):")
+    for step in chain do
+      let step_tool: text = clean_tool_name(unwrap_or(get(step, "tool"), ""))
+      let step_args: text = json_encode(unwrap_or(get(step, "args"), {}))
+      print("    " ++ describe_tool_call(step_tool, step_args))
+    end
     jev_run_chain(actor_prov, judge_prov, user_input, chain, seeded)
   else
     seeded
@@ -1702,6 +1727,11 @@ end
 function web_event_tool_end(n: integer, name: text, raw: text): nothing
   intent: emit a tool_end event with a truncated preview of the tool result
   web_event_emit({"type": "tool_end", "n": to_text(n), "name": name, "result": truncate_tool_output(raw, 3000)})
+end
+
+function web_event_jev_verdict(n: integer, verdict: text, reason: text): nothing
+  intent: emit a jev_verdict event so the web view can show each Jev judge decision
+  web_event_emit({"type": "jev_verdict", "n": to_text(n), "verdict": verdict, "reason": reason})
 end
 
 record ToolCallOutcome

@@ -19,7 +19,7 @@ function make_tool(name: text, description: text, param_names: a list of text, p
   mutable properties: a mapping from text to text = {}
   mutable i: integer = 0
   for pname in param_names do
-    let pdesc: text = get(param_descs, i)
+    let pdesc: text = unwrap_or(get(param_descs, i), "")
     set properties = put(properties, pname, make_param(pname, pdesc))
     set i = i + 1
   end
@@ -248,21 +248,58 @@ function legible_check_report(path: text): text
   end
 end
 
+function coder_tmp_dir(): text
+  intent: return the directory for coder scratch temp files, honoring LEGIBLE_CODER_TMPDIR then TMPDIR before falling back to /tmp
+  let override: an optional text = env_get("LEGIBLE_CODER_TMPDIR")
+  if is_some(override) and text_length(trim(unwrap(override))) > 0 then
+    trim(unwrap(override))
+  else
+    let tmpdir: an optional text = env_get("TMPDIR")
+    if is_some(tmpdir) and text_length(trim(unwrap(tmpdir))) > 0 then
+      trim(unwrap(tmpdir))
+    else
+      "/tmp"
+    end
+  end
+end
+
+function coder_tmp_path(name: text): text
+  intent: join coder_tmp_dir with name and a random_hex suffix to build a fresh scratch file path
+  coder_tmp_dir() ++ "/" ++ name ++ "_" ++ random_hex(8)
+end
+
+function print_file_diff(old_content: text, path: text): nothing
+  intent: write old_content to a coder_tmp_path scratch file via shell_exec, diff it against path, and print diff_output, skipping silently if the shell_exec write fails
+  if text_length(old_content) > 200000 then
+    skip()
+  else
+    let old_tmp: text = coder_tmp_path("legible_coder_old")
+    let stage_result: a mapping from text to text = shell_exec("printf '%s' " ++ shell_quote(old_content) ++ " > " ++ shell_quote(old_tmp) ++ " 2>&1")
+    if to_text(get(stage_result, "exit_code")) != "0" then
+      skip()
+    else
+      let diff_output: text = get(shell_exec("diff -u " ++ shell_quote(old_tmp) ++ " " ++ shell_quote(path) ++ " 2>&1 | head -120"), "stdout")
+      let ignored: a mapping from text to text = shell_exec("rm -f " ++ shell_quote(old_tmp))
+      if text_length(diff_output) > 0 then
+        print("")
+        print(diff_output)
+      else
+        skip()
+      end
+    end
+  end
+end
+
 function exec_write_file(args: a mapping from text to text): text
-  intent: write content to path, print a diff if the file existed, and run legible_check_report on .lbl files
+  intent: write content to path, print a best-effort diff if the file existed, and run legible_check_report on .lbl files
   let path: text = get(args, "path")
   let content: text = strip_code_fences(get(args, "content"))
   -- ensure the parent directory exists so writes to new subdirs don't fail
   let ignored: a mapping from text to text = shell_exec("mkdir -p \"$(dirname \"" ++ path ++ "\")\"")
   if file_exists(path) then
     let old_content: text = read_file(path)
-    write_file("/tmp/legible_coder_old", old_content)
     write_file(path, content)
-    let diff_output: text = get(shell_exec("diff -u /tmp/legible_coder_old " ++ path ++ " 2>&1 | head -120"), "stdout")
-    if text_length(diff_output) > 0 then
-      print("")
-      print(diff_output)
-    end
+    print_file_diff(old_content, path)
   else
     write_file(path, content)
   end
@@ -275,7 +312,7 @@ function exec_write_file(args: a mapping from text to text): text
 end
 
 function exec_edit_file(args: a mapping from text to text): text
-  intent: replace exactly one occurrence of old_string with new_string in path, print a diff, and run legible_check_report on .lbl files
+  intent: replace exactly one occurrence of old_string with new_string in path, print a best-effort diff, and run legible_check_report on .lbl files
   let path: text = get(args, "path")
   let old_string: text = get(args, "old_string")
   let new_string: text = get(args, "new_string")
@@ -293,13 +330,8 @@ function exec_edit_file(args: a mapping from text to text): text
       "Error: old_string appears " ++ to_text(occurrences) ++ " times in " ++ path ++ "; it must match exactly one location. Include more surrounding context to make it unique."
     else
       let content: text = join(parts, new_string)
-      write_file("/tmp/legible_coder_old", old_content)
       write_file(path, content)
-      let diff_output: text = get(shell_exec("diff -u /tmp/legible_coder_old " ++ path ++ " 2>&1 | head -120"), "stdout")
-      if text_length(diff_output) > 0 then
-        print("")
-        print(diff_output)
-      end
+      print_file_diff(old_content, path)
       let check_report: text = legible_check_report(path)
       if text_length(check_report) == 0 then
         "File edited successfully: " ++ path
@@ -395,7 +427,7 @@ function exec_web_search(args: a mapping from text to text): text
   if text_length(query) == 0 then
     "Error: web_search needs a non-empty query."
   else
-    let max_results: integer = min(max(to_integer(unwrap_or(get(args, "max_results"), "5")), 1), 10)
+    let max_results: integer = min(max(unwrap_or(to_integer(unwrap_or(get(args, "max_results"), "5")), 5), 1), 10)
     let url: text = "https://www.bing.com/search?q=" ++ web_search_encode(query) ++ "&format=rss"
     let headers: a mapping from text to text = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
     let response: a mapping from text to text = http_client_get(url, headers)
@@ -459,8 +491,8 @@ end
 
 function exec_take_screenshot(args: a mapping from text to text): text
   intent: launch optional GUI command in background then capture a screenshot and return the path
-  let path: text = "/tmp/legible_coder_screenshot.png"
-  let log_path: text = "/tmp/legible_coder_app.log"
+  let path: text = coder_tmp_path("legible_coder_screenshot") ++ ".png"
+  let log_path: text = coder_tmp_path("legible_coder_app") ++ ".log"
   let delay: text = unwrap_or(get(args, "delay"), "3")
   let command: text = unwrap_or(get(args, "command"), "")
   let cmd: text = if text_length(command) > 0 then
@@ -894,7 +926,7 @@ end
 
 function jev_test_timeout(): integer
   intent: resolve the maximum number of seconds allowed for one Jev script test
-  max(to_integer(unwrap_or(env_get("LEGIBLE_CODER_JEV_TEST_TIMEOUT"), "15")), 1)
+  max(unwrap_or(to_integer(unwrap_or(env_get("LEGIBLE_CODER_JEV_TEST_TIMEOUT"), "15")), 15), 1)
 end
 
 function jev_test_output_bounded(result: a mapping from text to text, max_len: integer): text
@@ -1101,7 +1133,7 @@ function resolve_jev_max_nodes(graph: a mapping from text to text, steps: intege
   intent: read LEGIBLE_CODER_JEV_MAX_NODES or grant this graph its allowance on top of the nodes already executed
   let override: an optional text = env_get("LEGIBLE_CODER_JEV_MAX_NODES")
   if is_some(override) then
-    max(to_integer(unwrap(override)), 1)
+    max(unwrap_or(to_integer(unwrap(override)), 1), 1)
   else
     min(steps + jev_graph_node_allowance(graph), jev_node_budget_ceiling())
   end
@@ -1117,7 +1149,7 @@ function resolve_jev_max_replans(graph: a mapping from text to text): integer
   -- looping regardless of how many replans are still available.
   let override: an optional text = env_get("LEGIBLE_CODER_JEV_MAX_REPLANS")
   if is_some(override) then
-    max(to_integer(unwrap(override)), 0)
+    max(unwrap_or(to_integer(unwrap(override)), 0), 0)
   else
     min(jev_repair_passes() + jev_graph_choice_count(graph), 4 * jev_repair_passes() + 6)
   end
@@ -2097,7 +2129,7 @@ end
 function advance_read_file_lines_request(req: ManualToolRequest): ManualToolRequest
   intent: increment read_file_lines start_line by 40 and keep the same path
   let args: a mapping from text to text = json_parse(req.arguments)
-  let next_start: integer = max(to_integer(unwrap_or(get(args, "start_line"), "1")), 1) + 40
+  let next_start: integer = max(unwrap_or(to_integer(unwrap_or(get(args, "start_line"), "1")), 1), 1) + 40
   let next_args: text = json_encode({
     "path": unwrap_or(get(args, "path"), ""),
     "start_line": to_text(next_start),
@@ -2472,7 +2504,7 @@ function last_message_is_assistant_text(msgs: a list of a mapping from text to t
   if length(msgs) == 0 then
     false
   else
-    let last_msg: a mapping from text to text = get(msgs, length(msgs) - 1)
+    let last_msg: a mapping from text to text = unwrap(get(msgs, length(msgs) - 1))
     unwrap_or(get(last_msg, "role"), "") == "assistant" and text_length(unwrap_or(get(last_msg, "content"), "")) > 0
   end
 end
@@ -2664,7 +2696,7 @@ function usage_sparkline(values: a list of integer, budget: integer): text
   let blocks: a list of text = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
   mutable out: text = ""
   for v in values do
-    set out = out ++ get(blocks, min(v * 8 / max(budget, 1), 7))
+    set out = out ++ unwrap_or(get(blocks, min(v * 8 / max(budget, 1), 7)), "")
   end
   out
 end

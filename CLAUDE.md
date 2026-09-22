@@ -48,11 +48,11 @@ models, notably on NIM, wrap file content in ``` fences) and runs
 in the tool result so it can immediately rewrite the file. `edit_file` rejects
 the call (rather than editing) when `old_string` is missing or matches more
 than once, and also runs `legible check` on written `.lbl` files the same way.
-The Jev graph planner's tool list mirrors this set (see `jev_planner_tool_names`
-and `jev_graph_system_prompt` in `coder.lbl`); its system prompt tells the
-planner to use `edit_file` — one node per distinct fix, with `old_string`
-copied verbatim from a prior `read_file`/`read_file_lines`/`grep` node — for
-tasks that touch a handful of specific spots in an existing file, instead of
+Jev mode's tool list mirrors this set (see `jev_decision_tool_names` and
+`jev_decision_system_prompt` in `coder.lbl`); its system prompt likewise tells
+the actor to use `edit_file` — with `old_string` copied verbatim from a prior
+`read_file`/`read_file_lines`/`grep` result already shown to it — for a change
+that touches a handful of specific spots in an existing file, instead of
 `write_file` (which requires restating the whole file) or a `shell_exec`
 script that pattern-matches multiple locations with one replacement.
 

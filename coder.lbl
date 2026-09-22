@@ -184,12 +184,12 @@ function describe_shell_call(name: text, args: a mapping from text to text): tex
 end
 
 function describe_grep_call(name: text, args: a mapping from text to text): text
-  intent: format a grep call as its slash-delimited pattern followed by the searched path
+  intent: concatenate name with the pattern field of args between slashes and the path field of args, defaulting path to "."
   name ++ "  /" ++ unwrap_or(get(args, "pattern"), "") ++ "/  " ++ unwrap_or(get(args, "path"), ".")
 end
 
 function describe_search_call(name: text, args: a mapping from text to text): text
-  intent: format a web_search call as its slash-delimited query truncated to sixty characters
+  intent: concatenate name with the query field of args between slashes, truncating the query preview to 60 characters
   let q: text = unwrap_or(get(args, "query"), "")
   let preview: text = if text_length(q) > 60 then substring(q, 0, 60) ++ "..." else q end
   name ++ "  /" ++ preview ++ "/"
@@ -447,7 +447,7 @@ function exec_read_file_lines(args: a mapping from text to text): text
   if not file_exists(path) then
     "Error: file not found: " ++ path
   else
-    let start_line: integer = max(to_integer(unwrap_or(get(args, "start_line"), "1")), 1)
+    let start_line: integer = max(unwrap_or(to_integer(unwrap_or(get(args, "start_line"), "1")), 1), 1)
     let line_count: integer = 40
     let lines: a list of text = split(read_file(path), "\n")
     let finish: integer = min(length(lines), start_line + line_count - 1)
@@ -523,14 +523,14 @@ function exec_read_file(args: a mapping from text to text): text
 end
 
 function exec_list_dir(args: a mapping from text to text): text
-  intent: list the entries of the directory at the path argument or report that it is not a directory
-  let path: text = get(args, "path")
+  intent: list the entries of the directory at the path argument, defaulting to the current directory, or report that it is not a directory
+  let path: text = unwrap_or(get(args, "path"), ".")
   if is_dir(path) then join(list_dir(path), "\n") else "Error: not a directory: " ++ path end
 end
 
 function exec_read_dir_recursive(args: a mapping from text to text): text
-  intent: list up to two hundred files under the path argument using find
-  get(shell_exec("find " ++ get(args, "path") ++ " -type f | sort 2>&1 | head -200"), "stdout")
+  intent: shell_exec find on the path field of args, defaulting to the current directory, piped through sort and head to return the first 200 lines of stdout
+  get(shell_exec("find " ++ unwrap_or(get(args, "path"), ".") ++ " -type f | sort 2>&1 | head -200"), "stdout")
 end
 
 function execute_file_tool(name: text, args: a mapping from text to text): an optional text
@@ -830,92 +830,35 @@ function call_api(api_key: text, base_url: text, request_body: a mapping from te
   http_client_post(base_url ++ "/chat/completions", headers, json_encode(request_body))
 end
 
--- Jev is a typed decision API rather than an OpenAI-compatible text model: it
--- only ever picks a labeled branch from criteria it is given, never free text.
--- A real LLM (the "planner") drafts a small JSON decision graph once per turn;
--- Jev then traverses that graph, making one typed choice per branch point.
--- Any choice node also carries a reserved <replan> branch so Jev itself can
--- ask the planner to regenerate the graph mid-turn when nothing else fits.
-function jev_base_url(): text
-  intent: return the TypeSafe System One endpoint, allowing a local test endpoint override
-  unwrap_or(env_get("LEGIBLE_CODER_JEV_URL"), "https://api.typesafe.ai/v1/systemone")
-end
+-- Jev mode pairs a real LLM actor (Qwen3.8-Flash) with TypeSafe Jev, a typed
+-- decision model that can only pick one labeled branch from criteria it is
+-- given, never generate free text. The actor never drafts a full plan up
+-- front for anything contingent on code it has not seen yet: it decides one
+-- tool call at a time, runs it, and Jev makes the one typed choice it is
+-- suited for -- was this action good or bad? A bad verdict is fed straight
+-- back into the actor's next decision so it corrects course immediately
+-- instead of executing a whole stale plan. The one exception is work that
+-- genuinely is not contingent on unseen code -- a fixed, ordered chain of
+-- read-only or shell commands the actor can already fully specify
+-- (installing a package then running a script, a sequence of git plumbing
+-- commands). For that narrow case only, the actor still drafts a short
+-- upfront chain and runs it straight through, still judging every step with
+-- Jev and falling back to one-decision-at-a-time mode the moment a step in
+-- that chain is judged bad.
 
-function is_jev_url(url: text): boolean
-  intent: identify the TypeSafe Jev endpoint by its host or explicit experimental URL
-  contains_text(url, "typesafe.ai") or url == unwrap_or(env_get("LEGIBLE_CODER_JEV_URL"), "")
+function jev_mode_active(): boolean
+  intent: report whether Jev mode (LEGIBLE_CODER_JEV_MODE) is enabled for this run
+  env_truthy("LEGIBLE_CODER_JEV_MODE")
 end
 
 function jev_trace_enabled(): boolean
-  intent: report whether to print every Jev graph step for debugging the experimental backend
+  intent: return true when env_get of LEGIBLE_CODER_JEV_TRACE, trimmed and lowercased, equals 1, true, or yes
   let value: text = lowercase(trim(unwrap_or(env_get("LEGIBLE_CODER_JEV_TRACE"), "")))
   value == "1" or value == "true" or value == "yes"
 end
 
-function jev_checked_choice(answer: a mapping from text to text, criteria: a mapping from text to text): an optional text
-  intent: accept only an exact choice label from the criteria map
-  if not has_key(answer, "choice") then
-    none
-  else
-    let choice: text = get(answer, "choice")
-    if has_key(criteria, choice) then
-      choice
-    else
-      print("  [jev] rejected invalid choice: " ++ choice)
-      none
-    end
-  end
-end
-
-function jev_response_choice_named(body: text, answer_name: text, criteria: a mapping from text to text): an optional text
-  intent: parse and validate a named choice returned by Jev
-  if not json_valid(body) then
-    print("  [jev] API returned a non-JSON response")
-    none
-  else
-    let parsed: a mapping from text to text = json_parse(body)
-    if not has_key(parsed, "answers") or not has_key(get(parsed, "answers"), answer_name) then
-      print("  [jev] response did not include the " ++ answer_name ++ " choice: " ++ empty_response_detail(body))
-      none
-    else
-      jev_checked_choice(get(get(parsed, "answers"), answer_name), criteria)
-    end
-  end
-end
-
-function jev_output_path(user_input: text): text
-  intent: resolve an explicit Jev output path or choose main.lbl for write-like requests
-  let configured: text = trim(unwrap_or(env_get("LEGIBLE_CODER_JEV_OUTPUT"), ""))
-  if text_length(configured) > 0 then
-    configured
-  else
-    mutable found: text = ""
-    for raw_word in split(user_input, " ") do
-      let word: text = trim(replace(replace(replace(strip_path_quotes(raw_word), ",", ""), ";", ""), "!", ""))
-      if ends_with(word, ".lbl") then set found = word end
-    end
-    if text_length(found) > 0 then
-      found
-    else
-      let request: text = lowercase(user_input)
-      if contains_text(request, "write") or contains_text(request, "create") or contains_text(request, "save") then "main.lbl" else "" end
-    end
-  end
-end
-
-function jev_write_source(output_path: text, source: text): text
-  intent: write generated Jev source through the same file helper used by normal tool calls
-  if text_length(output_path) == 0 then
-    ""
-  else
-    let result: text = exec_write_file({"path": output_path, "content": source})
-    print("  [jev] " ++ result)
-    result
-  end
-end
-
 function truncate_text(s: text, max_len: integer): text
-  intent: cut s to at most max_len characters and mark truncation
+  intent: return s unchanged when text_length(s) is within max_len, otherwise substring the first max_len characters with a "... (truncated)" marker appended
   if text_length(s) > max_len then substring(s, 0, max_len) ++ "... (truncated)" else s end
 end
 
@@ -925,19 +868,19 @@ record JevTestResult
 end
 
 function jev_test_timeout(): integer
-  intent: resolve the maximum number of seconds allowed for one Jev script test
+  intent: read env_get of LEGIBLE_CODER_JEV_TEST_TIMEOUT as an integer defaulting to 15, clamped to a minimum of 1
   max(unwrap_or(to_integer(unwrap_or(env_get("LEGIBLE_CODER_JEV_TEST_TIMEOUT"), "15")), 15), 1)
 end
 
 function jev_test_output_bounded(result: a mapping from text to text, max_len: integer): text
-  intent: format a script test exit code and captured output for Jev feedback, bounded to max_len characters
+  intent: build "exit_code: ...\noutput:\n..." from the exit_code and stdout fields of result, truncating stdout via truncate_text to max_len characters, or noting "(no output)" when stdout is empty
   let output: text = truncate_text(trim(unwrap_or(get(result, "stdout"), "")), max_len)
   let exit_code: text = to_text(get(result, "exit_code"))
   if text_length(output) > 0 then "exit_code: " ++ exit_code ++ "\noutput:\n" ++ output else "exit_code: " ++ exit_code ++ "\n(no output)" end
 end
 
 function jev_test_output(result: a mapping from text to text): text
-  intent: format a script test exit code and captured output for Jev feedback
+  intent: jev_test_output_bounded of result with max_len 4000
   jev_test_output_bounded(result, 4000)
 end
 
@@ -970,42 +913,40 @@ function jev_test_written_source(output_path: text): JevTestResult
   end
 end
 
--- ─── Jev decision graph: planner ──────────────────────────────────────────────
+-- ─── Jev turn: shared LLM call helpers ────────────────────────────────────────
 
-function jev_planner_provider(): a mapping from text to text
-  intent: pick a real text-generating backend to draft or redraft the Jev decision graph
-  let explicit_url: an optional text = env_get("LEGIBLE_CODER_JEV_PLANNER_URL")
-  let model_override: an optional text = env_get("LEGIBLE_CODER_JEV_PLANNER_MODEL")
-  if is_some(explicit_url) then
-    build_custom_provider(unwrap(explicit_url), model_override)
-  else
-    get(build_default_provider_list(model_override, qwen_api_key(), env_get("GEMINI_API_KEY"), env_get("ORCAROUTER_API_KEY"), env_get("NVIDIA_API_KEY"), env_get("OPENROUTER_API_KEY"), env_get("GROQ_API_KEY")), 0)
-  end
+function jev_actor_model(): text
+  intent: return the Qwen model Jev mode uses to decide each tool call, defaulting to qwen3.8-flash
+  unwrap_or(env_get("LEGIBLE_CODER_JEV_MODEL"), "qwen3.8-flash")
 end
 
-function jev_planner_tool_names(): text
-  intent: list the tool node names the planner may reference besides the built-in test_script check
-  "read_file, read_file_lines, write_file, edit_file, shell_exec, list_dir, read_dir_recursive, grep, web_search, and test_script (checks and runs a written .lbl file at args.path)"
+function jev_base_url(): text
+  intent: return the TypeSafe System One endpoint Jev mode uses for its typed good/bad judge choice, allowing a local test endpoint override
+  unwrap_or(env_get("LEGIBLE_CODER_JEV_URL"), "https://api.typesafe.ai/v1/systemone")
 end
 
-function jev_graph_system_prompt(): text
-  intent: describe the JSON decision-graph contract the planner model must produce for Jev to traverse
-  "You are the planning stage of a Jev-driven coding agent. Reply with ONE JSON object only: no prose, no markdown, no code fences.\n\n" ++
-  "Shape: \{\"start\": \"<node id>\", \"nodes\": \{\"<id>\": \{...\}, ...\}\}\n\n" ++
-  "Every node has \"kind\": \"tool\" or \"choice\".\n" ++
-  "tool node: \{\"kind\":\"tool\", \"tool\": \"<name>\", \"args\": \{...string arguments...\}, \"next\": \"<node id or \\\"\\\">\"\}\n" ++
-  "Valid tool names: " ++ jev_planner_tool_names() ++ ".\n" ++
-  "choice node: \{\"kind\":\"choice\", \"question\": \"<what Jev is deciding>\", \"options\": \{\"<label>\": \{\"desc\": \"<what this branch means>\", \"goto\": \"<node id or \\\"\\\">\"\}\}\}\n" ++
-  "Jev is a typed decision model: at a choice node it can only pick one of the labeled options you provide, never free text. Label every option in <angle-bracket> form, e.g. <pass>, <fix>. Jev always also has a reserved <replan> option that regenerates the whole graph from that point, so never author an option literally named <replan> yourself.\n" ++
-  "An empty \"next\" or \"goto\" (\"\") ends the turn successfully right there.\n" ++
-  "For any task that writes a Legible (.lbl) file: follow the write_file node with a test_script node on the same path, then a choice node whose branches include one that goes back to a corrected write_file (or to \"goto\":\"replan\") when the test report shows an error, and one that ends the turn when it passes.\n" ++
-  "For a task that changes one or a few specific spots in an existing file (fixing a handful of named issues, renaming something, correcting specific lines), use edit_file, not write_file: write_file requires you to know and restate the file's entire contents at plan time, which you usually cannot do for a file you have not fully read, and is wasteful and error-prone for a large file. edit_file args are \{\"path\":..., \"old_string\":..., \"new_string\":...\}; old_string must be copied verbatim from real tool output you can actually see in this prompt (the user request itself, or an \"Executed so far\" / \"Most recent tool or test output\" section below, never text you are guessing or paraphrasing from memory), and must be unique in the file — include a line or two of surrounding context if the exact text could appear more than once. Give each distinct fix its own edit_file node with its own literal old_string and new_string drawn from that fix's specific location; never rely on a single shell_exec script that pattern-matches or keyword-matches several locations at once and applies the same replacement text to all of them, since two unrelated spots can share the same keywords and a shared replacement is almost always wrong for at least one of them.\n" ++
-  "You are drafting this graph now, before any of its nodes have run — a tool node's real output does not exist until Jev actually executes it. So if the task needs edits to a file you have not been shown the contents of, or needs to fix findings from a check you have not yet run (for example, a lint or `legible check` report with more issues than the request already quotes verbatim), do not invent old_string values for those edits now. Instead plan a reconnaissance-only graph: one or more read_file, read_file_lines, grep, or shell_exec nodes (e.g. running `legible check <path>`) that gather the real content or diagnostic list, ending in a tool node whose \"next\" is a choice node with exactly one option whose \"goto\" is the literal node id \"replan\" (author that option yourself; it is separate from Jev's reserved <replan> escape hatch). That hands your own gathered output back to you as the \"Most recent tool or test output\" on the next planning call, and only then should you draft the concrete edit_file nodes, with old_string copied from what you now see. If the gathered diagnostic list has more distinct fixes than you can precisely and verifiably plan as edit_file nodes in one reply, fix as many as you can with real, verbatim old_string values in this pass, then end that batch the same way — a tool node feeding a choice node that routes to \"replan\" — so the remaining ones are picked up in a following pass with fresh output to draw from, rather than trying to plan every fix across the whole file at once.\n" ++
-  "Every node id referenced by \"start\", \"next\", or \"goto\" must exist in \"nodes\", except \"\" (end) and the reserved \"replan\".\n\n"
+function jev_judge_model(): text
+  intent: return the TypeSafe Jev model identifier Jev mode uses for its typed good/bad judge choice, defaulting to jev-latest
+  unwrap_or(env_get("LEGIBLE_CODER_JEV_JUDGE_MODEL"), "jev-latest")
 end
 
-function jev_planner_reply_text(body: text): text
-  intent: extract the assistant message content from a chat completions response body, or empty text on any parse failure
+function jev_judge_provider(): a mapping from text to text
+  intent: build the TypeSafe Jev provider used only for the typed good/bad judge choice, requiring TYPESAFE_API_KEY
+  {"key": require_provider_api_key("TYPESAFE_API_KEY", "Jev"), "url": jev_base_url(), "full": jev_judge_model()}
+end
+
+function jev_max_steps(): integer
+  intent: read LEGIBLE_CODER_JEV_MAX_STEPS or default to 40 decisions in one Jev turn
+  max(unwrap_or(to_integer(unwrap_or(env_get("LEGIBLE_CODER_JEV_MAX_STEPS"), "40")), 40), 1)
+end
+
+function jev_max_step_retries(): integer
+  intent: read LEGIBLE_CODER_JEV_MAX_RETRIES or default to 2 consecutive bad judgments allowed before Jev gives up on the turn
+  max(unwrap_or(to_integer(unwrap_or(env_get("LEGIBLE_CODER_JEV_MAX_RETRIES"), "2")), 2), 0)
+end
+
+function jev_reply_text(body: text): text
+  intent: return empty text unless body is a valid JSON chat completion, otherwise the message content of its first choice
   if not json_valid(body) or not starts_with(trim(body), "\{") then
     ""
   else
@@ -1019,398 +960,362 @@ function jev_planner_reply_text(body: text): text
   end
 end
 
-function jev_request_graph(prov: a mapping from text to text, user_input: text, context: text): text
-  intent: ask the planner backend to draft or replace the Jev decision graph as a single JSON reply, retrying once on a transport-level failure
-  let context_block: text = if text_length(context) > 0 then "\n\n" ++ context else "" end
+function jev_parse_json_reply(raw: text): a mapping from text to text
+  intent: strip code fences and parse a model reply as a JSON object, returning an empty mapping when it is not valid JSON
+  let cleaned: text = strip_code_fences(raw)
+  if text_length(trim(cleaned)) == 0 or not json_valid(cleaned) then
+    if jev_trace_enabled() then print("  [jev] reply was not valid JSON: " ++ truncate_text(raw, 300)) end
+    {}
+  else
+    json_parse(cleaned)
+  end
+end
+
+function jev_call_llm(prov: a mapping from text to text, system_prompt: text, user_content: text, max_tokens: integer): text
+  intent: send one system+user chat completion to the Jev actor or judge backend and return the raw reply text, retrying once on a transport-level failure
   let messages: a list of a mapping from text to text = [
-    {"role": "system", "content": jev_graph_system_prompt()},
-    {"role": "user", "content": "User request:\n" ++ user_input ++ context_block}
+    {"role": "system", "content": system_prompt},
+    {"role": "user", "content": user_content}
   ]
-  let request: a mapping from text to text = build_request(get(prov, "full"), messages, true, false, false, 6000, false)
+  let request: a mapping from text to text = build_request(get(prov, "full"), messages, true, false, false, max_tokens, false)
   let first: a mapping from text to text = call_api(get(prov, "key"), get(prov, "url"), request)
   let response: a mapping from text to text = if get(first, "status") == "000" then
-    print("  [jev] planner request failed (" ++ extract_error_message(get(first, "body")) ++ "); retrying once")
+    print("  [jev] request failed (" ++ extract_error_message(get(first, "body")) ++ "); retrying once")
     call_api(get(prov, "key"), get(prov, "url"), request)
   else
     first
   end
   let status: text = get(response, "status")
   if status != "200" then
-    print("  [jev] planner API error (" ++ status ++ "): " ++ extract_error_message(get(response, "body")))
+    print("  [jev] API error (" ++ status ++ "): " ++ extract_error_message(get(response, "body")))
     ""
   else
-    jev_planner_reply_text(get(response, "body"))
+    jev_reply_text(get(response, "body"))
   end
 end
 
-function jev_graph_valid(graph: a mapping from text to text): boolean
-  intent: confirm the parsed graph has a start node id that exists among its own nodes
-  if not has_key(graph, "start") or not has_key(graph, "nodes") then
-    false
-  else
-    has_key(get(graph, "nodes"), get(graph, "start"))
-  end
-end
+-- ─── Jev turn: running state ───────────────────────────────────────────────────
 
-function jev_generate_graph(user_input: text, context: text): a mapping from text to text
-  intent: ask the planner backend for a decision graph and validate its shape before handing it to Jev
-  let prov: a mapping from text to text = jev_planner_provider()
-  let raw: text = jev_request_graph(prov, user_input, context)
-  let cleaned: text = strip_code_fences(raw)
-  if text_length(trim(cleaned)) == 0 or not json_valid(cleaned) then
-    print("  [jev] planner returned a non-JSON graph")
-    {}
-  else
-    let parsed: a mapping from text to text = json_parse(cleaned)
-    if jev_graph_valid(parsed) then
-      parsed
-    else
-      print("  [jev] planner graph failed validation (bad start/nodes)")
-      {}
-    end
-  end
-end
-
--- ─── Jev decision graph: traversal ────────────────────────────────────────────
-
-record GraphState
-  graph: a mapping from text to text
-  node_id: text
-  last_output: text
-  trace: text
-  gathered: text
-  recon_passes: integer
+record JevState
+  history: text
   steps: integer
-  replans: integer
-  node_budget: integer
-  replan_budget: integer
+  consecutive_bad: integer
+  last_verdict: text
+  last_reason: text
   done: boolean
   failed: boolean
+  final_text: text
 end
 
--- Both Jev budgets are sized from the graph the planner actually drafted
--- rather than fixed at a constant, because the agent-scaling literature says a
--- flat budget is the wrong shape: it starves a large plan and is never reached
--- by a small one, and simply raising it does nothing on its own. The
--- multipliers below come from three findings: iterative self-repair saturates
--- after about three attempts, long-horizon runs still pay off out to a couple
--- of hundred steps, and agents given their remaining budget explicitly reach
--- the same accuracy on a fraction of the calls, which is why every replan
--- prompt and every Jev choice also carries the budget line.
-
-function jev_repair_passes(): integer
-  intent: return the attempt count after which iterative self-correction is known to stop improving
-  3
-end
-
-function jev_node_budget_floor(): integer
-  intent: return the smallest node budget worth granting, below which even a short tool plan is cut off mid-way
-  12
-end
-
-function jev_node_budget_ceiling(): integer
-  intent: return the absolute node budget one turn may never exceed however large the graph is
-  200
-end
-
-function jev_graph_node_count(graph: a mapping from text to text): integer
-  intent: count how many nodes the planner drafted in this graph
-  length(keys(unwrap_or(get(graph, "nodes"), {})))
-end
-
-function jev_graph_choice_count(graph: a mapping from text to text): integer
-  intent: count the choice nodes in this graph, each one an independent point where the plan can need repair
-  let nodes: a mapping from text to text = unwrap_or(get(graph, "nodes"), {})
-  reduce(keys(nodes), 0, fn(acc: integer, id: text): integer => acc + (if unwrap_or(get(get(nodes, id), "kind"), "") == "choice" then 1 else 0 end))
-end
-
-function jev_graph_node_allowance(graph: a mapping from text to text): integer
-  intent: allow one full traversal of this graph plus the repair passes self-correction still gains from, within the floor and ceiling
-  min(max(jev_graph_node_count(graph) * (1 + jev_repair_passes()), jev_node_budget_floor()), jev_node_budget_ceiling())
-end
-
-function resolve_jev_max_nodes(graph: a mapping from text to text, steps: integer): integer
-  intent: read LEGIBLE_CODER_JEV_MAX_NODES or grant this graph its allowance on top of the nodes already executed
-  let override: an optional text = env_get("LEGIBLE_CODER_JEV_MAX_NODES")
-  if is_some(override) then
-    max(unwrap_or(to_integer(unwrap(override)), 1), 1)
-  else
-    min(steps + jev_graph_node_allowance(graph), jev_node_budget_ceiling())
-  end
-end
-
-function resolve_jev_max_replans(graph: a mapping from text to text): integer
-  intent: read LEGIBLE_CODER_JEV_MAX_REPLANS or allow enough replans for both per-decision-point self-repair and a multi-batch gather-then-fix graph
-  -- Replanning now also serves a deliberate continuation pattern (gather real
-  -- content or diagnostics, then hand it to a fresh planning pass as one
-  -- batch of a larger cleanup), not just error recovery at a single decision
-  -- point, so the ceiling here is looser than jev_repair_passes() alone
-  -- would suggest; node_budget remains the hard backstop against runaway
-  -- looping regardless of how many replans are still available.
-  let override: an optional text = env_get("LEGIBLE_CODER_JEV_MAX_REPLANS")
-  if is_some(override) then
-    max(unwrap_or(to_integer(unwrap(override)), 0), 0)
-  else
-    min(jev_repair_passes() + jev_graph_choice_count(graph), 4 * jev_repair_passes() + 6)
-  end
-end
-
-function jev_trace_append(trace: text, entry: text): text
-  intent: append one bounded trace entry, keeping only the most recent history for planner and Jev context
-  let combined: text = trace ++ (if text_length(trace) > 0 then " -> " else "" end) ++ entry
+function jev_history_append(history: text, entry: text): text
+  intent: append entry to history separated by a divider, keeping only the last 8000 characters with a trimmed-earlier marker when longer
+  let combined: text = history ++ (if text_length(history) > 0 then "\n\n---\n\n" else "" end) ++ entry
   let total: integer = text_length(combined)
-  if total > 2000 then "(earlier steps trimmed) ... " ++ substring(combined, total - 2000, 2000) else combined end
+  if total > 8000 then "(earlier steps trimmed) ... " ++ substring(combined, total - 8000, 8000) else combined end
 end
 
-function jev_gathered_append(gathered: text, entry: text): text
-  intent: combine gathered with entry and keep only the most recent 6000 characters of combined gathered tool output, trimming earlier output when it grows too long
-  let combined: text = gathered ++ (if text_length(gathered) > 0 then "\n\n---\n\n" else "" end) ++ entry
-  let total: integer = text_length(combined)
-  if total > 6000 then "(earlier gathered output trimmed) ... " ++ substring(combined, total - 6000, 6000) else combined end
-end
-
-function jev_mutating_tool(tool: text): boolean
-  intent: check whether tool equals write_file or edit_file, the two tools that actually change a file
-  tool == "write_file" or tool == "edit_file"
-end
-
-function jev_graph_has_mutation(graph: a mapping from text to text): boolean
-  intent: reduce over the graph nodes, keyed by id, checking with jev_mutating_tool whether any node tool is write_file or edit_file
-  let nodes: a mapping from text to text = unwrap_or(get(graph, "nodes"), {})
-  reduce(keys(nodes), false, fn(acc: boolean, id: text): boolean => acc or jev_mutating_tool(unwrap_or(get(get(nodes, id), "tool"), "")))
-end
-
-function jev_graph_node_summary(nodes: a mapping from text to text, id: text): text
-  intent: describe one graph node compactly as id, kind, and detail for a replan prompt that should not repeat the same plan
-  let node: a mapping from text to text = get(nodes, id)
-  let kind: text = unwrap_or(get(node, "kind"), "?")
-  let detail: text = if kind == "tool" then unwrap_or(get(node, "tool"), "?") else unwrap_or(get(node, "question"), "?") end
-  id ++ ":" ++ kind ++ ":" ++ truncate_text(detail, 40)
-end
-
-function jev_graph_summary(graph: a mapping from text to text): text
-  intent: join the graph node keys, each summarized by jev_graph_node_summary, with a semicolon separator, or none when the nodes mapping is empty
-  let nodes: a mapping from text to text = unwrap_or(get(graph, "nodes"), {})
-  if length(keys(nodes)) == 0 then "(none)" else join(map(keys(nodes), fn(id: text): text => jev_graph_node_summary(nodes, id)), "; ") end
-end
-
-function jev_recon_pass_cap(): integer
-  intent: return 2, the cap on consecutive reconnaissance-only graphs the planner may draft in one turn before Jev forces concrete edits
-  2
-end
-
-function jev_budget_line(state: GraphState): text
-  intent: state how much of the node and replan budget is left so the planner and Jev can both condition on it
-  "Budget: " ++ to_text(state.steps) ++ " of " ++ to_text(state.node_budget) ++ " graph nodes executed, " ++
-  to_text(state.replans) ++ " of " ++ to_text(state.replan_budget) ++ " replans used."
-end
-
-function jev_grow_budgets(state: GraphState, graph: a mapping from text to text): GraphState
-  intent: resize both budgets for a freshly drafted graph without ever shrinking what an earlier graph was already granted
-  let nodes: integer = max(state.node_budget, resolve_jev_max_nodes(graph, state.steps))
-  state with { node_budget: nodes, replan_budget: max(state.replan_budget, resolve_jev_max_replans(graph)) }
-end
-
-function jev_replan_context(user_input: text, state: GraphState, reason: text, next_recon_passes: integer): text
-  intent: summarize the previous graph, executed trace, and any gathered tool output so the planner regenerates a graph that makes real progress instead of repeating a prior reconnaissance-only pass
-  let gather_block: text = if text_length(trim(state.gathered)) > 0 then
-    "Already gathered this turn (do not re-run these reads/greps; use this content directly):\n" ++ state.gathered ++ "\n\n"
+function jev_turn_state_block(user_input: text, state: JevState): text
+  intent: describe the user request, the running step budget, the last judgment, and everything executed so far for the next Jev decision or judge call
+  let judgment_block: text = if text_length(state.last_verdict) > 0 then
+    "Your last action was judged " ++ uppercase(state.last_verdict) ++ (if text_length(state.last_reason) > 0 then ": " ++ state.last_reason else "" end) ++ "\n\n"
   else
     ""
   end
-  let force_edit_line: text = if next_recon_passes >= jev_recon_pass_cap() then
-    "Reconnaissance is over: this would be gather-only pass " ++ to_text(next_recon_passes) ++ " of the " ++ to_text(jev_recon_pass_cap()) ++ " allowed this turn. You already have the gathered content above. Draft concrete write_file/edit_file nodes now, with old_string copied verbatim from that gathered content — a graph whose only path is a choice node routing to replan will be rejected.\n\n"
-  else if text_length(trim(state.gathered)) > 0 then
-    "You already gathered real content above; prefer drafting concrete edit_file/write_file nodes from it now rather than another reconnaissance-only graph.\n\n"
-  else
-    ""
-  end
-  "The previous decision graph needs to change. Reason: " ++ reason ++ "\n\n" ++
-  jev_budget_line(state) ++ " Draft a graph that finishes within it.\n\n" ++
-  "Previous graph's nodes (do not redraft this same plan):\n" ++ jev_graph_summary(state.graph) ++ "\n\n" ++
-  "Executed so far:\n" ++ state.trace ++ "\n\n" ++
-  gather_block ++
-  force_edit_line ++
-  "Most recent tool or test output:\n" ++ truncate_text(state.last_output, 8000) ++ "\n\n" ++
-  "Produce a full replacement graph (a fresh \"start\" and \"nodes\") that continues correctly from here for the original request."
+  "User request:\n" ++ user_input ++ "\n\n" ++
+  "Step " ++ to_text(state.steps) ++ " of at most " ++ to_text(jev_max_steps()) ++ ".\n\n" ++
+  judgment_block ++
+  "Executed so far this turn:\n" ++ (if text_length(state.history) > 0 then state.history else "(nothing yet)" end)
 end
 
-function jev_apply_replan(state: GraphState, user_input: text, reason: text): GraphState
-  intent: regenerate the whole graph in place, bounded by the replan budget and by a separate cap on consecutive reconnaissance-only graphs, whether Jev or a malformed goto asked for it
-  if state.replans >= state.replan_budget then
-    state with { failed: true, last_output: "[jev] replan limit reached; stopping.\n" ++ state.last_output }
+-- ─── Jev turn: chain planning (non-code-contingent work only) ─────────────────
+
+function jev_tool_arg_spec(): text
+  intent: describe the exact JSON args shape every Jev tool expects, so the model never omits a required field
+  "Exact args shape per tool (fields not marked optional are required; a directory tool needs a real path, use \".\" for the current directory):\n" ++
+  "  read_file: \{\"path\": \"<file path>\"\}\n" ++
+  "  read_file_lines: \{\"path\": \"<file path>\", \"start_line\": \"<1-based line number>\"\} (always returns 40 lines from start_line)\n" ++
+  "  write_file: \{\"path\": \"<file path>\", \"content\": \"<full file contents>\"\}\n" ++
+  "  edit_file: \{\"path\": \"<file path>\", \"old_string\": \"<verbatim text to replace>\", \"new_string\": \"<replacement text>\"\}\n" ++
+  "  shell_exec: \{\"command\": \"<shell command>\"\}\n" ++
+  "  list_dir: \{\"path\": \"<directory path, use \\\".\\\" for the current directory>\"\}\n" ++
+  "  read_dir_recursive: \{\"path\": \"<directory path, use \\\".\\\" for the current directory>\"\}\n" ++
+  "  grep: \{\"pattern\": \"<regex pattern>\", \"path\": \"<directory or file to search, optional, defaults to \\\".\\\">\", \"glob\": \"<file glob, optional, e.g. *.lbl>\"\}\n" ++
+  "  web_search: \{\"query\": \"<search query>\"\}\n" ++
+  "  test_script: \{\"path\": \"<.lbl file path>\"\}\n"
+end
+
+function jev_chain_tool_names(): text
+  intent: return the fixed text listing the read-only and shell tools a non-contingent chain may use
+  "read_file, read_file_lines, list_dir, read_dir_recursive, grep, web_search, and shell_exec"
+end
+
+function jev_chain_system_prompt(): text
+  intent: describe the JSON contract for an optional upfront chain of tool calls that do not depend on code not yet seen
+  "You are the chain-planning stage of a coding agent. Most requests need to be worked one decision at a time, because each step depends on what an earlier step actually finds (file contents, command output, error text). But some requests are just a fixed, ordered sequence of read-only or shell commands you can already fully specify right now, without needing to see any command's output first to decide the next one — for example, a chain of independent shell commands (installing a package then running a script, a sequence of git plumbing commands with fixed arguments), or a fixed set of lookups.\n\n" ++
+  "Decide which this is. Reply with ONE JSON object only: no prose, no markdown, no code fences.\n" ++
+  "If the whole task is such a fixed chain: \{\"chain\": [\{\"tool\": \"<name>\", \"args\": \{...\}\}, ...]\}\n" ++
+  "Valid tool names for a chain: " ++ jev_chain_tool_names() ++ ". Never include write_file or edit_file in a chain: any step that changes a file needs to see real, current file content first and must go through one-decision-at-a-time mode instead.\n\n" ++
+  jev_tool_arg_spec() ++ "\n" ++
+  "Otherwise — the task needs to write or edit a file, or any step's choice depends on a result you have not seen yet — reply with \{\"chain\": []\}.\n"
+end
+
+function jev_chain_safe_tool(tool: text): boolean
+  intent: confirm a chain step only uses a read-only or shell tool, never write_file or edit_file
+  tool == "read_file" or tool == "read_file_lines" or tool == "list_dir" or tool == "read_dir_recursive" or tool == "grep" or tool == "web_search" or tool == "shell_exec"
+end
+
+function jev_chain_all_safe(steps: a list of a mapping from text to text): boolean
+  intent: confirm every step in a proposed chain uses only a read-only or shell tool
+  reduce(steps, true, fn(acc: boolean, step: a mapping from text to text): boolean => acc and jev_chain_safe_tool(clean_tool_name(unwrap_or(get(step, "tool"), ""))))
+end
+
+function jev_plan_chain(prov: a mapping from text to text, user_input: text): a list of a mapping from text to text
+  intent: ask the actor model whether the whole task is a fixed, non-code-contingent chain of read-only/shell tool calls, returning it only when every step is safe and otherwise an empty list so the turn falls back to one-decision-at-a-time mode
+  let raw: text = jev_call_llm(prov, jev_chain_system_prompt(), "User request:\n" ++ user_input, 4000)
+  let parsed: a mapping from text to text = jev_parse_json_reply(raw)
+  let steps: a list of a mapping from text to text = unwrap_or(get(parsed, "chain"), [])
+  if jev_chain_all_safe(steps) then steps else [] end
+end
+
+-- ─── Jev turn: one decision at a time ──────────────────────────────────────────
+
+function jev_decision_tool_names(): text
+  intent: return the fixed text listing every tool name a one-step Jev decision may call, including the synthetic test_script check
+  "read_file, read_file_lines, write_file, edit_file, shell_exec, list_dir, read_dir_recursive, grep, web_search, and test_script (checks and runs a written .lbl file at args.path)"
+end
+
+function jev_decision_system_prompt(): text
+  intent: describe the JSON contract for exactly one next tool call or final answer, given everything executed so far this turn
+  "You are a coding agent working one decision at a time. You will be shown the user's request and everything executed so far this turn, including whether your last action was judged good or bad. Decide the single best next action.\n\n" ++
+  "Reply with ONE JSON object only: no prose, no markdown, no code fences.\n" ++
+  "To call a tool: \{\"action\": \"tool\", \"tool\": \"<name>\", \"args\": \{...\}\}\n" ++
+  "To finish the turn: \{\"action\": \"final\", \"text\": \"<answer for the user>\"\}\n" ++
+  "Valid tool names: " ++ jev_decision_tool_names() ++ ".\n\n" ++
+  jev_tool_arg_spec() ++ "\n" ++
+  "Only decide the very next action, not a whole plan; you will be asked again after it runs. Never invent a file's contents from memory: if you have not been shown the real content of a file in this prompt (the user request, or a read_file/read_file_lines/grep/shell_exec result below), read or grep it first instead of guessing.\n" ++
+  "For a change that touches one or a few specific spots in an existing file (fixing a named issue, renaming something, correcting specific lines), use edit_file, not write_file: write_file requires restating the file's entire contents, which is wasteful and error-prone unless you have not just read it fresh. old_string must be copied verbatim from real tool output shown below, and must be unique in the file — include a line or two of surrounding context if the exact text could appear more than once.\n" ++
+  "After write_file or edit_file on a .lbl file, call test_script on the same path before finishing, and fix any reported error with a further edit_file/write_file action rather than finishing with a failing script.\n" ++
+  "If your previous action was judged bad, your next action must address that judgment directly (fix the error, pick a different tool, or read more before writing) rather than repeating it or moving on as if it had succeeded.\n"
+end
+
+function jev_judge_criteria(): a mapping from text to text
+  intent: describe the fixed good/bad labels the typed Jev judge picks from when scoring one already-executed tool action
+  {
+    "good": "The action made real progress toward the user request, ran without error, and used the right tool for the job.",
+    "bad": "The action produced a real error, a rejected edit, or a failed check, or was pointless, redundant, or off-task; the next decision must directly address what went wrong instead of repeating it or moving on as if it had succeeded."
+  }
+end
+
+function jev_checked_verdict(answer: a mapping from text to text, criteria: a mapping from text to text): an optional text
+  intent: accept only an exact verdict label from the criteria map
+  if not has_key(answer, "choice") then
+    none
   else
-    let was_recon_only: boolean = not jev_graph_has_mutation(state.graph)
-    let next_recon_passes: integer = if was_recon_only then state.recon_passes + 1 else 0 end
-    if was_recon_only and next_recon_passes > jev_recon_pass_cap() then
-      state with { failed: true, last_output: "[jev] planner kept drafting reconnaissance-only graphs without proposing edits; stopping after " ++ to_text(jev_recon_pass_cap()) ++ " gather passes.\n\nGathered:\n" ++ state.gathered }
+    let choice: text = get(answer, "choice")
+    if has_key(criteria, choice) then
+      choice
     else
-      print("  [jev] replanning (" ++ to_text(state.replans + 1) ++ "): " ++ reason)
-      let context: text = jev_replan_context(user_input, state, reason, next_recon_passes)
-      let graph: a mapping from text to text = jev_generate_graph(user_input, context)
-      if not has_key(graph, "start") then
-        state with { failed: true, last_output: "[jev] planner failed to produce a replacement graph." }
-      else
-        jev_grow_budgets(state, graph) with { graph: graph, node_id: get(graph, "start"), replans: state.replans + 1, recon_passes: next_recon_passes, trace: jev_trace_append(state.trace, "replan: " ++ reason) }
-      end
+      print("  [jev] judge rejected invalid verdict: " ++ choice)
+      none
     end
   end
 end
 
-function jev_run_tool_node(node: a mapping from text to text, node_id: text, state: GraphState): GraphState
-  intent: execute one graph tool node (or the built-in test_script check) and advance toward its declared next node
-  let tool: text = unwrap_or(get(node, "tool"), "")
-  let args: a mapping from text to text = unwrap_or(get(node, "args"), {})
-  let output: text = if tool == "test_script" then
-    jev_test_written_source(unwrap_or(get(args, "path"), "")).report
-  else if is_known_tool(tool) then
-    execute_tool(tool, json_encode(args))
+function jev_response_verdict(body: text, criteria: a mapping from text to text): an optional text
+  intent: parse and validate the verdict choice returned by the typed Jev judge API
+  if not json_valid(body) then
+    print("  [jev] judge API returned a non-JSON response")
+    none
   else
-    "[jev] unknown tool in graph node " ++ node_id ++ ": " ++ tool
-  end
-  if jev_trace_enabled() then print("  [jev] node " ++ node_id ++ " tool " ++ tool ++ ": " ++ truncate_text(output, 200)) end
-  let advanced: GraphState = state with { steps: state.steps + 1, last_output: output, trace: jev_trace_append(state.trace, node_id ++ ":" ++ tool), gathered: jev_gathered_append(state.gathered, "[" ++ tool ++ " @ " ++ node_id ++ "]\n" ++ output) }
-  let next_id: text = unwrap_or(get(node, "next"), "")
-  if next_id == "" then advanced with { done: true } else advanced with { node_id: next_id } end
-end
-
-function jev_choice_criteria(node: a mapping from text to text): a mapping from text to text
-  intent: build the label to description criteria Jev must choose from, always including the reserved replan escape hatch
-  let options: a mapping from text to text = unwrap_or(get(node, "options"), {})
-  let base: a mapping from text to text = reduce(keys(options), {}, fn(acc: a mapping from text to text, label: text): a mapping from text to text => put(acc, label, unwrap_or(get(get(options, label), "desc"), "")))
-  put(base, "<replan>", "None of the other branches fit what actually happened; regenerate the graph from this point.")
-end
-
-function jev_choice_goto(node: a mapping from text to text, label: text): text
-  intent: resolve the node id a chosen choice-node label advances to, treating the reserved label as a replan request
-  if label == "<replan>" then
-    "replan"
-  else
-    let options: a mapping from text to text = unwrap_or(get(node, "options"), {})
-    unwrap_or(get(unwrap_or(get(options, label), {}), "goto"), "replan")
+    let parsed: a mapping from text to text = json_parse(body)
+    if not has_key(parsed, "answers") or not has_key(get(parsed, "answers"), "verdict") then
+      print("  [jev] judge response did not include the verdict choice: " ++ empty_response_detail(body))
+      none
+    else
+      jev_checked_verdict(get(get(parsed, "answers"), "verdict"), criteria)
+    end
   end
 end
 
-function jev_ask_choice(api_key: text, node: a mapping from text to text, state: GraphState, user_input: text): an optional text
-  intent: send one Jev typed-choice request for the current node and return the validated label, retrying once on a transport-level failure
-  let criteria: a mapping from text to text = jev_choice_criteria(node)
-  let question_text: text = unwrap_or(get(node, "question"), "Choose the branch that matches what actually happened.")
-  let request: a mapping from text to text = {
-    "model": unwrap_or(env_get("LEGIBLE_CODER_JEV_MODEL"), "jev-latest"),
-    "state": "User request:\n" ++ user_input ++ "\n\n" ++ jev_budget_line(state) ++ "\n\nRecent trace:\n" ++ truncate_text(state.trace, 1500) ++ "\n\nMost recent output:\n" ++ truncate_text(state.last_output, 1500),
-    "questions": {"choice": {"type": "choice", "instructions": question_text ++ " Return the choice label exactly; do not explain.", "criteria": criteria}}
+function jev_next_decision(prov: a mapping from text to text, user_input: text, state: JevState): a mapping from text to text
+  intent: ask the actor model for exactly one next tool call or final answer, given everything executed so far
+  let decision: a mapping from text to text = jev_parse_json_reply(jev_call_llm(prov, jev_decision_system_prompt(), jev_turn_state_block(user_input, state), 8000))
+  if jev_trace_enabled() then print("  [jev] decision: " ++ json_encode(decision)) end
+  decision
+end
+
+function jev_judge_request_body(prov: a mapping from text to text, user_input: text, state: JevState, tool: text, args: a mapping from text to text, output: text, criteria: a mapping from text to text): a mapping from text to text
+  intent: build the typed Jev choice request body judging one already-executed tool action as good or bad
+  let action_text: text = "\n\nAction just taken:\n\{\"tool\": \"" ++ tool ++ "\", \"args\": " ++ json_encode(args) ++ "\}\n\nResult it produced:\n" ++ truncate_text(output, 3000)
+  {
+    "model": get(prov, "full"),
+    "state": jev_turn_state_block(user_input, state) ++ action_text,
+    "questions": {"verdict": {"type": "choice", "instructions": "Judge only whether this one action was a good or bad decision. Return the label exactly; do not explain.", "criteria": criteria}}
   }
-  let headers: a mapping from text to text = {"Authorization": "Bearer " ++ api_key, "Content-Type": "application/json"}
-  let first: a mapping from text to text = http_client_post(jev_base_url(), headers, json_encode(request))
-  let response: a mapping from text to text = if get(first, "status") == "000" then
-    print("  [jev] choice request failed (" ++ extract_error_message(get(first, "body")) ++ "); retrying once")
-    http_client_post(jev_base_url(), headers, json_encode(request))
+end
+
+function jev_judge_post(prov: a mapping from text to text, request: a mapping from text to text): a mapping from text to text
+  intent: post one typed Jev choice request, retrying once on a transport-level failure
+  let headers: a mapping from text to text = {"Authorization": "Bearer " ++ get(prov, "key"), "Content-Type": "application/json"}
+  let first: a mapping from text to text = http_client_post(get(prov, "url"), headers, json_encode(request))
+  if get(first, "status") == "000" then
+    print("  [jev] judge request failed (" ++ extract_error_message(get(first, "body")) ++ "); retrying once")
+    http_client_post(get(prov, "url"), headers, json_encode(request))
   else
     first
   end
+end
+
+function jev_verdict_from_response(response: a mapping from text to text, criteria: a mapping from text to text): a mapping from text to text
+  intent: extract a good/bad verdict mapping from one typed Jev choice response, defaulting to good on any API error or malformed reply so a flaky judge cannot stall real progress
   let status: text = get(response, "status")
   if status != "200" then
-    print("  [jev] API error (" ++ status ++ "): " ++ extract_error_message(get(response, "body")))
-    none
+    print("  [jev] judge API error (" ++ status ++ "): " ++ extract_error_message(get(response, "body")))
+    {"verdict": "good", "reason": ""}
   else
-    jev_response_choice_named(get(response, "body"), "choice", criteria)
-  end
-end
-
-function jev_run_choice_node(api_key: text, node: a mapping from text to text, node_id: text, state: GraphState, user_input: text): GraphState
-  intent: ask Jev to pick a branch at a choice node and advance, routing the reserved label or a goto of replan through the planner
-  let picked: an optional text = jev_ask_choice(api_key, node, state, user_input)
-  if is_none(picked) then
-    state with { failed: true, last_output: "Jev did not return a valid choice at node " ++ node_id ++ "." }
-  else
-    let label: text = unwrap(picked)
-    if jev_trace_enabled() then print("  [jev] node " ++ node_id ++ " choice: " ++ label) end
-    let goto: text = jev_choice_goto(node, label)
-    let advanced: GraphState = state with { steps: state.steps + 1, trace: jev_trace_append(state.trace, node_id ++ ":choice:" ++ label) }
-    if goto == "replan" then
-      jev_apply_replan(advanced, user_input, "node " ++ node_id ++ " chose \"" ++ label ++ "\" (this branch calls for replanning)")
-    else if goto == "" then
-      advanced with { done: true }
+    let picked: an optional text = jev_response_verdict(get(response, "body"), criteria)
+    if is_none(picked) then
+      {"verdict": "good", "reason": ""}
     else
-      advanced with { node_id: goto }
+      let label: text = unwrap(picked)
+      {"verdict": label, "reason": if label == "bad" then unwrap_or(get(criteria, label), "") else "" end}
     end
   end
 end
 
-function jev_check_next(state: GraphState, user_input: text): GraphState
-  intent: replan when a tool node advanced to a node id that is missing from the graph
-  if state.done or state.failed then
-    state
-  else if has_key(unwrap_or(get(state.graph, "nodes"), {}), state.node_id) then
-    state
+function jev_judge_tool_call(prov: a mapping from text to text, user_input: text, state: JevState, tool: text, args: a mapping from text to text, output: text): a mapping from text to text
+  intent: send one typed Jev choice request judging the action just executed as good or bad
+  let criteria: a mapping from text to text = jev_judge_criteria()
+  let request: a mapping from text to text = jev_judge_request_body(prov, user_input, state, tool, args, output, criteria)
+  jev_verdict_from_response(jev_judge_post(prov, request), criteria)
+end
+
+function jev_run_and_trace(n: integer, tool: text, args: a mapping from text to text): text
+  intent: run one tool call (or the built-in test_script check), emit its tool_start/tool_end events, and print a trace line when tracing is enabled
+  web_event_tool_start(n, tool, json_encode(args))
+  let output: text = if tool == "test_script" then
+    jev_test_written_source(unwrap_or(get(args, "path"), "")).report
   else
-    jev_apply_replan(state, user_input, "node \"" ++ state.node_id ++ "\" referenced by \"next\" does not exist in the graph")
+    execute_tool(tool, json_encode(args))
+  end
+  web_event_tool_end(n, tool, output)
+  if jev_trace_enabled() then print("  [jev] " ++ tool ++ ": " ++ truncate_text(output, 200)) end
+  output
+end
+
+function jev_fold_step(state: JevState, n: integer, tool: text, args: a mapping from text to text, output: text, judged: a mapping from text to text): JevState
+  intent: score one already-executed tool call as good or bad from its judge reply and fold the outcome into the running turn state
+  -- a judge call that fails to parse defaults to "good" so a flaky judge request cannot stall real progress
+  let verdict: text = unwrap_or(get(judged, "verdict"), "good")
+  let reason: text = unwrap_or(get(judged, "reason"), "")
+  if jev_trace_enabled() then print("  [jev] judge: " ++ verdict ++ (if text_length(reason) > 0 then " (" ++ reason ++ ")" else "" end)) end
+  let entry: text = "[" ++ tool ++ "] args=" ++ json_encode(args) ++ "\noutput:\n" ++ truncate_text(output, 2000) ++ "\njudged: " ++ verdict ++ (if text_length(reason) > 0 then " - " ++ reason else "" end)
+  let next_consecutive_bad: integer = if verdict == "bad" then state.consecutive_bad + 1 else 0 end
+  state with { history: jev_history_append(state.history, entry), steps: n, consecutive_bad: next_consecutive_bad, last_verdict: verdict, last_reason: reason }
+end
+
+function jev_execute_step(actor_prov: a mapping from text to text, judge_prov: a mapping from text to text, user_input: text, tool: text, args: a mapping from text to text, state: JevState): JevState
+  intent: run one tool call, judge it as a good or bad decision, and fold the result into the running turn state
+  let n: integer = state.steps + 1
+  let output: text = jev_run_and_trace(n, tool, args)
+  let judged: a mapping from text to text = jev_judge_tool_call(judge_prov, user_input, state, tool, args, output)
+  jev_fold_step(state, n, tool, args, output, judged)
+end
+
+function jev_run_chain(actor_prov: a mapping from text to text, judge_prov: a mapping from text to text, user_input: text, chain: a list of a mapping from text to text, state: JevState): JevState
+  intent: execute a pre-approved chain of non-contingent tool calls in order, judging each and stopping the moment one is judged bad so the rest falls back to one-decision-at-a-time mode
+  mutable current: JevState = state
+  mutable i: integer = 0
+  while i < length(chain) and current.consecutive_bad == 0 and current.steps < jev_max_steps() do
+    let step: a mapping from text to text = unwrap_or(get(chain, i), {})
+    let tool: text = clean_tool_name(unwrap_or(get(step, "tool"), ""))
+    let args: a mapping from text to text = unwrap_or(get(step, "args"), {})
+    set current = jev_execute_step(actor_prov, judge_prov, user_input, tool, args, current)
+    set i = i + 1
+  end
+  current
+end
+
+function jev_invalid_decision_state(state: JevState, note: text, reason: text): JevState
+  intent: record one malformed or unusable actor reply as a bad decision so the next decision prompt is told to correct it
+  state with { history: jev_history_append(state.history, note), steps: state.steps + 1, consecutive_bad: state.consecutive_bad + 1, last_verdict: "bad", last_reason: reason }
+end
+
+function jev_apply_tool_decision(actor_prov: a mapping from text to text, judge_prov: a mapping from text to text, user_input: text, decision: a mapping from text to text, state: JevState): JevState
+  intent: execute the tool named in one actor decision when it is a known tool, otherwise record the decision as invalid
+  let tool: text = clean_tool_name(unwrap_or(get(decision, "tool"), ""))
+  let args: a mapping from text to text = unwrap_or(get(decision, "args"), {})
+  if tool == "test_script" or is_known_tool(tool) then
+    jev_execute_step(actor_prov, judge_prov, user_input, tool, args, state)
+  else
+    jev_invalid_decision_state(state, "[invalid decision] unknown tool \"" ++ tool ++ "\"", "unknown tool \"" ++ tool ++ "\": choose one of the valid tool names")
   end
 end
 
-function jev_advance_node(api_key: text, state: GraphState, user_input: text): GraphState
-  intent: execute the current node and route to whichever node, replan, or completion it advances to
-  let nodes: a mapping from text to text = unwrap_or(get(state.graph, "nodes"), {})
-  if not has_key(nodes, state.node_id) then
-    jev_apply_replan(state, user_input, "node \"" ++ state.node_id ++ "\" does not exist in the graph")
+function jev_apply_decision(actor_prov: a mapping from text to text, judge_prov: a mapping from text to text, user_input: text, decision: a mapping from text to text, state: JevState): JevState
+  intent: apply one actor decision, either finishing the turn, running a tool, or recording an invalid reply, to the running turn state
+  let action: text = unwrap_or(get(decision, "action"), "")
+  if action == "final" then
+    state with { done: true, final_text: unwrap_or(get(decision, "text"), "") }
+  else if action == "tool" then
+    jev_apply_tool_decision(actor_prov, judge_prov, user_input, decision, state)
   else
-    let node: a mapping from text to text = get(nodes, state.node_id)
-    let kind: text = unwrap_or(get(node, "kind"), "")
-    let node_id: text = state.node_id
-    if kind == "tool" then
-      jev_check_next(jev_run_tool_node(node, node_id, state), user_input)
-    else if kind == "choice" then
-      jev_run_choice_node(api_key, node, node_id, state, user_input)
+    jev_invalid_decision_state(state, "[invalid decision] reply was not a valid tool call or final answer", "your reply must be exactly one JSON object shaped either \{\"action\":\"tool\",...\} or \{\"action\":\"final\",...\}")
+  end
+end
+
+function jev_step_loop(actor_prov: a mapping from text to text, judge_prov: a mapping from text to text, user_input: text, state: JevState): JevState
+  intent: decide, execute, and judge one tool call at a time until the actor emits a final answer, the step budget runs out, or too many consecutive decisions are judged bad
+  mutable current: JevState = state
+  while not current.done and not current.failed and current.steps < jev_max_steps() do
+    if current.consecutive_bad > jev_max_step_retries() then
+      set current = current with { failed: true }
     else
-      state with { failed: true, last_output: "[jev] unknown node kind \"" ++ kind ++ "\" at " ++ node_id ++ "." }
+      set current = jev_apply_decision(actor_prov, judge_prov, user_input, jev_next_decision(actor_prov, user_input, current), current)
     end
   end
+  current
 end
 
-function jev_graph_loop_complete(state: GraphState): boolean
-  intent: report whether graph traversal reached a terminal state or the node budget its graphs have earned
-  state.steps >= state.node_budget or state.done or state.failed
-end
-
-function jev_graph_loop_step(state: GraphState, api_key: text, user_input: text): GraphState
-  intent: advance one graph node and periodically report progress
-  let advanced: GraphState = jev_advance_node(api_key, state, user_input)
-  if advanced.steps > state.steps and advanced.steps % 10 == 0 then print("  [jev] executed " ++ to_text(advanced.steps) ++ " graph nodes") end
-  advanced
-end
-
-function finish_jev_graph_turn(messages: a list of a mapping from text to text, state: GraphState, settings: TurnSettings): InnerLoopResult
-  intent: print the final graph-turn output and append it as the assistant reply, or leave the transcript unchanged on total failure
-  if state.failed and text_length(trim(state.last_output)) == 0 then
+function finish_jev_turn(messages: a list of a mapping from text to text, state: JevState, settings: TurnSettings): InnerLoopResult
+  intent: report the final answer, or a failure/budget explanation with the trailing history, and append it as an assistant message when the turn produced a usable result
+  if state.failed then
+    let summary: text = "[jev] stopping after repeated bad decisions" ++ (if text_length(state.last_reason) > 0 then ": " ++ state.last_reason else "" end) ++ ".\n\n" ++ truncate_text(state.history, 4000)
+    print("")
+    print(summary)
     InnerLoopResult {messages: messages, used_model: false, context_budget: settings.context_budget, prompt_tokens: 0, completion_tokens: state.steps}
   else
-    let summary: text = if text_length(trim(state.last_output)) > 0 then trim(state.last_output) else "Done." end
+    let summary: text = if state.done and text_length(trim(state.final_text)) > 0 then
+      trim(state.final_text)
+    else if state.done then
+      "Done."
+    else
+      "[jev] reached the step budget (" ++ to_text(jev_max_steps()) ++ ") without a final answer.\n\n" ++ truncate_text(state.history, 4000)
+    end
     print("")
     print_separator()
     print(summary)
     print_separator()
     print("")
     web_event_emit({"type": "final", "text": summary})
-    InnerLoopResult {messages: append(messages, {"role": "assistant", "content": summary}), used_model: not state.failed, context_budget: settings.context_budget, prompt_tokens: 0, completion_tokens: state.steps}
+    InnerLoopResult {messages: append(messages, {"role": "assistant", "content": summary}), used_model: true, context_budget: settings.context_budget, prompt_tokens: 0, completion_tokens: state.steps}
   end
 end
 
-function run_jev_graph_turn(messages: a list of a mapping from text to text, user_input: text, settings: TurnSettings): InnerLoopResult
-  intent: draft a Jev decision graph once, size its budgets from it, then let Jev traverse and replan it until the turn completes
-  print("  [jev] drafting decision graph")
-  let graph: a mapping from text to text = jev_generate_graph(user_input, "")
-  if not has_key(graph, "start") then
-    finish_jev_graph_turn(messages, GraphState {graph: {}, node_id: "", last_output: "[jev] the planner failed to produce a usable decision graph.", trace: "", gathered: "", recon_passes: 0, steps: 0, replans: 0, node_budget: 0, replan_budget: 0, done: false, failed: true}, settings)
+function run_jev_turn(messages: a list of a mapping from text to text, user_input: text, settings: TurnSettings): InnerLoopResult
+  intent: run one Jev-mode turn, deciding with Qwen3.8-Flash and judging each executed tool call with the typed TypeSafe Jev API: front-load any non-contingent chain of read-only/shell tool calls, then decide, execute, and judge one tool call at a time until the actor emits a final answer or the step budget runs out
+  let actor_prov: a mapping from text to text = {"key": settings.key, "url": settings.base_url, "full": settings.model}
+  let judge_prov: a mapping from text to text = jev_judge_provider()
+  print("  [jev] " ++ get(actor_prov, "full") ++ " deciding")
+  let chain: a list of a mapping from text to text = jev_plan_chain(actor_prov, user_input)
+  let seeded: JevState = JevState {history: "", steps: 0, consecutive_bad: 0, last_verdict: "", last_reason: "", done: false, failed: false, final_text: ""}
+  let after_chain: JevState = if length(chain) > 0 then
+    print("  [jev] running a " ++ to_text(length(chain)) ++ "-step non-contingent chain")
+    jev_run_chain(actor_prov, judge_prov, user_input, chain, seeded)
   else
-    let max_nodes: integer = resolve_jev_max_nodes(graph, 0)
-    let max_replans: integer = resolve_jev_max_replans(graph)
-    print("  [jev] " ++ to_text(jev_graph_node_count(graph)) ++ "-node graph, budget " ++ to_text(max_nodes) ++ " nodes and " ++ to_text(max_replans) ++ " replans")
-    mutable state: GraphState = GraphState {graph: graph, node_id: get(graph, "start"), last_output: "", trace: "", gathered: "", recon_passes: 0, steps: 0, replans: 0, node_budget: max_nodes, replan_budget: max_replans, done: false, failed: false}
-    while not jev_graph_loop_complete(state) do
-      set state = jev_graph_loop_step(state, settings.key, user_input)
-    end
-    finish_jev_graph_turn(messages, state, settings)
+    seeded
   end
+  finish_jev_turn(messages, jev_step_loop(actor_prov, judge_prov, user_input, after_chain), settings)
 end
 
 function shell_quote(value: text): text
@@ -1435,9 +1340,7 @@ end
 
 function provider_is_reachable(base_url: text): boolean
   intent: use curl through shell_exec to check whether the provider endpoint is reachable before calling its model
-  if is_jev_url(base_url) then
-    true
-  else if windows_host() then
+  if windows_host() then
     true
   else
     let url: text = shell_quote(base_url ++ "/models")
@@ -1505,7 +1408,7 @@ end
 
 function backend_name(base_url: text): text
   intent: call is_qwen_url, is_gemini_url, is_orcarouter_url, is_nims_url, is_openrouter_url, and is_groq_url to return a label for base_url
-  if is_jev_url(base_url) then "Jev"
+  if jev_mode_active() then "Jev"
   else if is_qwen_url(base_url) then "Qwen"
   else if is_gemini_url(base_url) then "Gemini"
   else if is_orcarouter_url(base_url) then "OrcaRouter"
@@ -1518,7 +1421,7 @@ end
 
 function provider_tier(base_url: text): text
   intent: return qwen gemini orcarouter nims openrouter groq or local based on the base URL for context-window tuning
-  if is_jev_url(base_url) then "jev"
+  if jev_mode_active() then "jev"
   else if is_qwen_url(base_url) then "qwen"
   else if is_gemini_url(base_url) then "gemini"
   else if is_orcarouter_url(base_url) then "orcarouter"
@@ -1886,7 +1789,7 @@ function mask_old_tool_results(msgs: a list of a mapping from text to text, keep
   mutable result: a list of a mapping from text to text = []
   mutable i: integer = 0
   while i < total do
-    let msg: a mapping from text to text = get(msgs, i)
+    let msg: a mapping from text to text = unwrap(get(msgs, i))
     if i < mask_before and get(msg, "role") == "tool" then
       set result = append(result, put(msg, "content", "[tool result removed]"))
     else
@@ -1904,7 +1807,7 @@ function strip_old_vision_images(msgs: a list of a mapping from text to text, ke
   mutable result: a list of a mapping from text to text = []
   mutable i: integer = 0
   while i < total do
-    let msg: a mapping from text to text = get(msgs, i)
+    let msg: a mapping from text to text = unwrap(get(msgs, i))
     let is_vision: boolean = get(msg, "role") == "user" and contains_text(kv_cache.msg_content_text(msg), "image_url")
     if i < mask_before and is_vision then
       set result = append(result, put(msg, "content", "[screenshot evaluated — image removed from context]"))
@@ -1998,7 +1901,7 @@ function normalize_read_file_lines_arguments(arguments: text): text
   intent: normalize read_file_lines to a 1-based start line and a fixed 40-line window
   let args: a mapping from text to text = json_parse(arguments)
   let path: text = unwrap_or(get(args, "path"), "")
-  let start_line: integer = max(to_integer(unwrap_or(get(args, "start_line"), "1")), 1)
+  let start_line: integer = max(unwrap_or(to_integer(unwrap_or(get(args, "start_line"), "1")), 1), 1)
   json_encode({
     "path": path,
     "start_line": to_text(start_line),
@@ -2181,7 +2084,7 @@ end
 function resolve_local_explore_budget(): integer
   intent: read LEGIBLE_CODER_MAX_EXPLORE or use default 8 for the local exploration budget
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_MAX_EXPLORE"), "8")
-  max(to_integer(raw), 1)
+  max(unwrap_or(to_integer(raw), 1), 1)
 end
 
 function local_needs_action(explore_count: integer, acted: boolean): boolean
@@ -2299,7 +2202,7 @@ function handle_local_text_round(msg: a mapping from text to text, msgs: a list 
 end
 
 function prompt_loop_step(step: LoopStep, prompt: text, must_force_text: boolean): LoopStep
-  intent: append a user follow-up prompt and continue the loop with updated forcing state
+  intent: return step with prompt appended to messages as a user message, waiting set true, and must_force_text set to the given must_force_text
   step with { messages: append(step.messages, {"role": "user", "content": prompt}), waiting: true, must_force_text: must_force_text }
 end
 
@@ -2385,7 +2288,7 @@ function handle_empty_text_response(resp_body: text, finish: text, step: LoopSte
 end
 
 function terminal_loop_step(step: LoopStep): LoopStep
-  intent: return a LoopStep that stops the current response loop
+  intent: return step with waiting and must_force_text both set to false
   step with { waiting: false, must_force_text: false }
 end
 
@@ -2423,7 +2326,7 @@ function handle_textual_tool_call_response(content: text, step: LoopStep): LoopS
 end
 
 function has_invalid_tool_arguments(calls: a list of a mapping from text to text): boolean
-  intent: detect a response whose tool calls include at least one with incomplete or non-object arguments
+  intent: return true when calls is non-empty and filtering calls by tool_call_arguments_valid removes at least one entry
   length(calls) > 0 and length(filter(calls, fn(tc: a mapping from text to text): boolean => tool_call_arguments_valid(tc))) != length(calls)
 end
 
@@ -2542,7 +2445,7 @@ function process_api_round(resp: a mapping from text to text, step: LoopStep, ct
   else
     let counts: a list of integer = response_usage_counts(get(resp, "body"), ctx.track_usage)
     let next: LoopStep = handle_success_response(get(resp, "body"), step, ctx)
-    ApiRoundOutcome {messages: next.messages, used_model: true, total_tools: next.count, last_batch: next.last_batch, waiting: next.waiting, must_force_text: next.must_force_text, explore_count: next.explore_count, acted: next.acted, prompt_tokens: get(counts, 0), completion_tokens: get(counts, 1)}
+    ApiRoundOutcome {messages: next.messages, used_model: true, total_tools: next.count, last_batch: next.last_batch, waiting: next.waiting, must_force_text: next.must_force_text, explore_count: next.explore_count, acted: next.acted, prompt_tokens: unwrap(get(counts, 0)), completion_tokens: unwrap(get(counts, 1))}
   end
 end
 
@@ -2607,7 +2510,7 @@ function force_summary_round(next_state: MutsState, outcome: ApiRoundOutcome, su
 end
 
 function turn_retry_bound(plan: TurnBudgetPlan, include_tools: boolean): integer
-  intent: return the round number at which a turn stops, allowing two forced-text retries past whichever limit binds first
+  intent: when include_tools return min(plan.cap + 2, plan.call_ceiling + 2), otherwise return plan.ceiling + 2
   -- Taking the minimum keeps the round bound in rounds instead of borrowing the
   -- call allowance, which would let a 60 call ceiling permit 62 rounds.
   if include_tools then min(plan.cap + 2, plan.call_ceiling + 2) else plan.ceiling + 2 end
@@ -2651,12 +2554,12 @@ function initial_loop_step(messages: a list of a mapping from text to text): Loo
 end
 
 function round_context(settings: TurnSettings, round: integer, force_text: boolean, messages_start: integer): RoundContext
-  intent: collect the per-round flags that response handlers need from the turn settings
+  intent: build a RoundContext from round, force_text, and messages_start plus the include_tools, max_tools, include_vision, and track_usage fields of settings
   RoundContext {round: round, force_text: force_text, include_tools: settings.include_tools, max_tools: settings.max_tools, include_vision: settings.include_vision, track_usage: settings.track_usage, messages_start: messages_start}
 end
 
 function call_round_api(messages: a list of a mapping from text to text, settings: TurnSettings, force_text: boolean): a mapping from text to text
-  intent: build the chat completion request for this round and send it to the configured provider
+  intent: call_api with settings.key and settings.base_url on the request built by build_request from settings.model, messages, force_text, settings.include_tools, settings.include_dir_tools, settings.max_output_tokens, and settings.include_vision
   call_api(settings.key, settings.base_url, build_request(settings.model, messages, force_text, settings.include_tools, settings.include_dir_tools, settings.max_output_tokens, settings.include_vision))
 end
 
@@ -2778,8 +2681,6 @@ function resolve_api_key(base_url: text): text
   let explicit_key: an optional text = env_get("LEGIBLE_CODER_API_KEY")
   if is_some(explicit_key) then
     unwrap(explicit_key)
-  else if is_jev_url(base_url) then
-    require_provider_api_key("TYPESAFE_API_KEY", "Jev")
   else if is_qwen_url(base_url) then
     require_qwen_api_key()
   else if is_gemini_url(base_url) then
@@ -2803,15 +2704,15 @@ function resolve_max_tools(tier: text): integer
   -- round, so the expert round cap of 28 needs about 56 calls to be reachable.
   let default_text: text = if tier == "local" then "120" else "60" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_MAX_TOOLS"), default_text)
-  max(to_integer(raw), 1)
+  max(unwrap_or(to_integer(raw), 1), 1)
 end
 
 function resolve_context_budget(tier: text): integer
   intent: read LEGIBLE_CODER_CONTEXT_TOKENS or use a provider-appropriate token budget before compaction
   -- gemini-3.7-flash and qwen3.8-max have 1M-token contexts, OrcaRouter Qwen3.8 has 65K, NIM has 131K, local is very limited
-  let default_text: text = if tier == "jev" then "64000" else if tier == "local" then "6000" else if tier == "gemini" then "700000" else if tier == "qwen" then "850000" else if tier == "orcarouter" then "60000" else if tier == "nims" then "120000" else "90000" end
+  let default_text: text = if tier == "jev" then "128000" else if tier == "local" then "6000" else if tier == "gemini" then "700000" else if tier == "qwen" then "850000" else if tier == "orcarouter" then "60000" else if tier == "nims" then "120000" else "90000" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_TOKENS"), default_text)
-  max(to_integer(raw), 1000)
+  max(unwrap_or(to_integer(raw), 1000), 1000)
 end
 
 function resolve_context_compact_after(tier: text): integer
@@ -2819,22 +2720,22 @@ function resolve_context_compact_after(tier: text): integer
   -- qwen3.8-max has a 1M-token window, so the transcript stays untouched until it is around 100K estimated tokens
   let default_text: text = if tier == "qwen" then "100000" else "0" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_COMPACT_AFTER"), default_text)
-  max(to_integer(raw), 0)
+  max(unwrap_or(to_integer(raw), 0), 0)
 end
 
 function resolve_context_keep_messages(tier: text): integer
   intent: read LEGIBLE_CODER_CONTEXT_KEEP_MESSAGES or use a provider-appropriate recent-message default
-  let default_text: text = if tier == "jev" then "4" else if tier == "local" then "8" else if tier == "gemini" then "24" else "12" end
+  let default_text: text = if tier == "local" then "8" else if tier == "gemini" then "24" else "12" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_KEEP_MESSAGES"), default_text)
-  max(to_integer(raw), 2)
+  max(unwrap_or(to_integer(raw), 2), 2)
 end
 
 function resolve_max_output_tokens(tier: text, include_tools: boolean): integer
   intent: read LEGIBLE_CODER_MAX_OUTPUT_TOKENS or pick a default suited to the backend
   -- qwen3.8-max supports up to 131K output, gemini-3.7-flash up to 65K, NIM up to 131K, local is small
-  let default_text: text = if tier == "jev" then "128" else if tier == "local" and include_tools then "4096" else if tier == "local" then "750" else if tier == "qwen" then "131072" else if tier == "gemini" then "32768" else if tier == "nims" then "32768" else "16384" end
+  let default_text: text = if tier == "jev" then "8000" else if tier == "local" and include_tools then "4096" else if tier == "local" then "750" else if tier == "qwen" then "131072" else if tier == "gemini" then "32768" else if tier == "nims" then "32768" else "16384" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_MAX_OUTPUT_TOKENS"), default_text)
-  max(to_integer(raw), 128)
+  max(unwrap_or(to_integer(raw), 128), 128)
 end
 
 function resolve_provider_limits(tier: text, include_tools: boolean): ProviderLimits
@@ -2914,8 +2815,8 @@ function build_custom_provider(url: text, model_override: an optional text): a m
 end
 
 function build_jev_provider(): a mapping from text to text
-  intent: build the explicit experimental Jev provider using the TypeSafe API key and sequential-choice adapter
-  {"name": "Jev", "key": resolve_api_key(jev_base_url()), "url": jev_base_url(), "full": unwrap_or(env_get("LEGIBLE_CODER_JEV_MODEL"), "jev-latest"), "fast": "", "expert": ""}
+  intent: build the experimental Jev provider for the actor half of Jev mode on the normal Qwen endpoint using Qwen3.8-Flash, leaving the judge half to be built separately by jev_judge_provider on the typed TypeSafe Jev endpoint
+  {"name": "Jev", "key": require_qwen_api_key(), "url": qwen_base_url(), "full": jev_actor_model(), "fast": "", "expert": ""}
 end
 
 function build_qwen_provider(key: text, model_override: an optional text): a mapping from text to text
@@ -3028,7 +2929,7 @@ end
 function attempt_provider(state: FallbackState, prov: a mapping from text to text, settings: TurnSettings, start: integer, user_input: text): FallbackState
   intent: run the turn on one provider when it is reachable and record the resulting messages and whether the model was used
   if provider_is_reachable(get(prov, "url")) then
-    let inner: InnerLoopResult = if provider_tier(get(prov, "url")) == "jev" then run_jev_graph_turn(state.messages, user_input, settings) else run_inner_loop(state.messages, start, settings) end
+    let inner: InnerLoopResult = if provider_tier(get(prov, "url")) == "jev" then run_jev_turn(state.messages, user_input, settings) else run_inner_loop(state.messages, start, settings) end
     state with { messages: inner.messages, last_inner: inner, consecutive_failures: if inner.used_model then 0 else state.consecutive_failures end }
   else
     print("  [unavailable] cannot reach " ++ get(prov, "name"))
@@ -3051,7 +2952,7 @@ end
 
 function fallback_attempt(state: FallbackState, user_input: text, start: integer, providers: a list of a mapping from text to text, tools: ToolSettings, track_usage: boolean): FallbackState
   intent: try the current provider once and either finish the turn or advance to the next provider
-  let prov: a mapping from text to text = get(providers, state.provider_idx)
+  let prov: a mapping from text to text = unwrap(get(providers, state.provider_idx))
   let turn_model: text = pick_model(user_input, get(prov, "full"), get(prov, "fast"), get(prov, "expert"))
   print_turn_model_banner(state.provider_idx, state.attempts > 0, prov, turn_model)
   let attempted: FallbackState = attempt_provider(state, prov, build_turn_settings(prov, turn_model, user_input, tools, track_usage), start, user_input)
@@ -3278,7 +3179,7 @@ function web_active_workspace(reg: a mapping from text to text): a mapping from 
     unwrap(found)
   else
     let all: a list of a mapping from text to text = web_registry_workspaces(reg)
-    if length(all) > 0 then get(all, 0) else {} end
+    if length(all) > 0 then unwrap(get(all, 0)) else {} end
   end
 end
 
@@ -3300,7 +3201,7 @@ function web_active_conversation(ws: a mapping from text to text): a mapping fro
     unwrap(found)
   else
     let all: a list of a mapping from text to text = web_workspace_conversations(ws)
-    if length(all) > 0 then get(all, 0) else {} end
+    if length(all) > 0 then unwrap(get(all, 0)) else {} end
   end
 end
 
@@ -3516,7 +3417,7 @@ end
 
 function web_conversation_title_from(text_value: text): text
   intent: split text_value on newline get first_line trim it and substring to 40 chars appending ellipsis
-  let first_line: text = trim(get(split(text_value, "\n"), 0))
+  let first_line: text = trim(unwrap(get(split(text_value, "\n"), 0)))
   if text_length(first_line) > 40 then substring(first_line, 0, 40) ++ "..." else first_line end
 end
 
@@ -3584,7 +3485,7 @@ function web_send_message(user_text: text, init_messages: a list of a mapping fr
 end
 
 function web_handle_send(body: text, init_messages: a list of a mapping from text to text): nothing
-  intent: json_parse the body then web_turn_is_locked web_load_session web_save_session and web_start_turn the worker
+  intent: respond 400 unless body is valid JSON with a non-empty trimmed text field, otherwise delegate to web_send_message
   if not json_valid(body) then
     web_respond_json(400, web_json_error("invalid JSON body"))
   else
@@ -3613,8 +3514,8 @@ end
 function web_handle_events(query: text): nothing
   intent: respond with the events json after the since cursor for the pinned conv plus the running flag
   let target: a list of text = web_events_target(query)
-  let ws_id: text = get(target, 0)
-  let conv_id: text = get(target, 1)
+  let ws_id: text = unwrap(get(target, 0))
+  let conv_id: text = unwrap(get(target, 1))
   let since: integer = unwrap_or(to_integer(web_query_value(query, "since")), 0)
   let payload: a mapping from text to text = json_parse(web_events_since(web_events_path(ws_id, conv_id), since))
   let running: boolean = web_turn_is_locked(ws_id, conv_id)
@@ -4108,8 +4009,8 @@ function route_web_post(request: Request, init_messages: a list of a mapping fro
 end
 
 function route_web_request(request: Request, init_messages: a list of a mapping from text to text, providers: a list of a mapping from text to text): nothing
-  intent: dispatch one HTTP request to the web GUI routes for pages state messages files live events and turns
-  let primary: a mapping from text to text = get(providers, 0)
+  intent: take the first entry of providers as primary, then dispatch to route_web_get or route_web_post by request.method using the full and url fields of primary, or web_not_found otherwise
+  let primary: a mapping from text to text = unwrap(get(providers, 0))
   if request.method == "GET" then
     route_web_get(request, init_messages, get(primary, "full"), get(primary, "url"))
   else if request.method == "POST" then
@@ -4174,7 +4075,7 @@ function web_capture_launch_state(): nothing
   intent: record this interpreter and its absolute script path while the launch cwd can still resolve a relative script argument
   create_dir(web_base_dir())
   let args: a list of text = get_args()
-  let script: text = if length(args) > 0 then web_absolute_script(get(args, 0)) else "" end
+  let script: text = if length(args) > 0 then web_absolute_script(unwrap(get(args, 0))) else "" end
   web_write_json_atomic(web_launch_state_path(), json_encode({"interpreter": web_worker_interpreter(), "script": script}))
 end
 
@@ -4199,17 +4100,17 @@ function web_worker_launch_prefix(): text
   if length(parts) < 2 then
     ""
   else
-    shell_quote(get(parts, 0)) ++ " run " ++ shell_quote(get(parts, 1))
+    shell_quote(unwrap(get(parts, 0))) ++ " run " ++ shell_quote(unwrap(get(parts, 1)))
   end
 end
 
 function web_worker_failure_json(): text
-  intent: encode the error event appended when the turn worker exits with a failure status
+  intent: return json_encode of a fixed error event whose text says the turn worker failed before completing the response
   json_encode({"type": "error", "text": "The turn worker failed before completing the response. Please try again."})
 end
 
 function web_worker_powershell_environment(ws_id: text, conv_id: text, user_text: text, work_dir: text, events_path: text): text
-  intent: build the PowerShell lines that export the turn context and enter the work directory
+  intent: build PowerShell lines setting ErrorActionPreference, exporting PATH and the ws_id, conv_id, user_text, work_dir, and events_path as env vars via powershell_quote, then Set-Location to work_dir
   "$ErrorActionPreference = 'Continue'\n" ++
   "$env:PATH = " ++ powershell_quote(unwrap_or(env_get("PATH"), "")) ++ "\n" ++
   "$env:LEGIBLE_CODER_WS_ID = " ++ powershell_quote(ws_id) ++ "\n" ++
@@ -4224,7 +4125,7 @@ function web_worker_powershell_run(ws_id: text, conv_id: text, events_path: text
   intent: build the PowerShell lines that stamp the lock run the worker append error and done events and release the lock
   let lock_path: text = web_turn_lock_path(ws_id, conv_id)
   "Set-Content -LiteralPath " ++ powershell_quote(lock_path) ++ " -Value $PID -NoNewline\n" ++
-  "& " ++ powershell_quote(get(launcher, 0)) ++ " run " ++ powershell_quote(get(launcher, 1)) ++ " --turn *> " ++ powershell_quote(web_worker_log_path(ws_id, conv_id)) ++ "\n" ++
+  "& " ++ powershell_quote(unwrap_or(get(launcher, 0), "")) ++ " run " ++ powershell_quote(unwrap_or(get(launcher, 1), "")) ++ " --turn *> " ++ powershell_quote(web_worker_log_path(ws_id, conv_id)) ++ "\n" ++
   "$turnStatus = $LASTEXITCODE\n" ++
   "if ($turnStatus -ne 0) \{ Add-Content -LiteralPath " ++ powershell_quote(events_path) ++ " -Value " ++ powershell_quote(web_worker_failure_json()) ++ " -Encoding UTF8 \}\n" ++
   "Add-Content -LiteralPath " ++ powershell_quote(events_path) ++ " -Value " ++ powershell_quote(json_encode({"type": "done"})) ++ " -Encoding UTF8\n" ++
@@ -4254,7 +4155,7 @@ function web_worker_spawn_posix(prefix: text, ws_id: text, conv_id: text, user_t
 end
 
 function web_worker_spawn_cmd(prefix: text, ws_id: text, conv_id: text, user_text: text, work_dir: text, events_path: text): text
-  intent: build the command that starts the detached turn worker using PowerShell on Windows and setsid nohup elsewhere
+  intent: return web_worker_spawn_windows on Windows, otherwise web_worker_spawn_posix, passing prefix, ws_id, conv_id, user_text, work_dir, and events_path through
   if windows_host() then
     web_worker_spawn_windows(ws_id, conv_id, user_text, work_dir, events_path)
   else
@@ -4327,7 +4228,7 @@ function run_web_turn(ws_id: text, conv_id: text, user_text: text, work_dir: tex
   intent: run one turn on the already saved transcript then persist it with its title and usage
   enter_directory(work_dir)
   let providers: a list of a mapping from text to text = build_provider_list()
-  let primary: a mapping from text to text = get(providers, 0)
+  let primary: a mapping from text to text = unwrap(get(providers, 0))
   let tools: ToolSettings = resolve_tool_settings(primary)
   let msgs: a list of a mapping from text to text = web_load_session(ws_id, conv_id, build_initial_messages(primary, tools))
   web_event_emit({"type": "model", "model": get(primary, "full"), "backend": backend_name(get(primary, "url"))})
@@ -4347,7 +4248,7 @@ function main(): nothing
     exit_process(0)
   end
   let providers: a list of a mapping from text to text = build_provider_list()
-  let primary: a mapping from text to text = get(providers, 0)
+  let primary: a mapping from text to text = unwrap(get(providers, 0))
   let tools: ToolSettings = resolve_tool_settings(primary)
   print_banner(get(primary, "full"), get(primary, "url"))
   if length(providers) > 1 then

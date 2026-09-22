@@ -114,6 +114,20 @@ cd your-project-directory
 legible-coder
 ```
 
+### Experimental Jev choice backend
+
+This branch includes an opt-in experiment for [TypeSafe Jev](https://docs.typesafe.ai/). Jev is a typed decision model, not a chat or code-completion model, so legible-coder asks it to choose one item at a time and appends that item to a Legible source buffer. It cannot use the normal file and shell tools in this mode.
+
+```bash
+export TYPESAFE_API_KEY="your-typesafe-key-here"
+export LEGIBLE_CODER_JEV_MODE=1
+export LEGIBLE_CODER_JEV_GRANULARITY=char   # or token
+export LEGIBLE_CODER_JEV_MAX_STEPS=512
+legible-coder
+```
+
+`char` offers printable characters plus newline and tab. `token` offers a small fixed set of common Legible syntax tokens. The generated source is returned as the assistant response when Jev selects `<done>` or the step limit is reached. This is deliberately a separate experimental backend; unset `LEGIBLE_CODER_JEV_MODE` to use the normal provider chain.
+
 For a local OpenAI-compatible server such as LM Studio:
 
 ```bash

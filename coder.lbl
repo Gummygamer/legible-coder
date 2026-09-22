@@ -749,6 +749,140 @@ function call_api(api_key: text, base_url: text, request_body: a mapping from te
   http_client_post(base_url ++ "/chat/completions", headers, json_encode(request_body))
 end
 
+-- Jev is a typed decision API rather than an OpenAI-compatible text model. The
+-- adapter below deliberately keeps it opt-in: each call asks Jev to choose one
+-- appendable item, and the caller renders that choice into Legible source.
+function jev_base_url(): text
+  intent: return the TypeSafe System One endpoint, allowing a local test endpoint override
+  unwrap_or(env_get("LEGIBLE_CODER_JEV_URL"), "https://api.typesafe.ai/v1/systemone")
+end
+
+function is_jev_url(url: text): boolean
+  intent: identify the TypeSafe Jev endpoint by its host or explicit experimental URL
+  contains_text(url, "typesafe.ai") or url == unwrap_or(env_get("LEGIBLE_CODER_JEV_URL"), "")
+end
+
+function jev_choice_criteria(mode: text): a mapping from text to text
+  intent: construct the closed set of character or Legible token choices sent to Jev
+  let chars: a list of text = filter(split("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,;:!?_+-=*/%()[]\\\{\}<>\\\\\"'@#$^&|~`", ""), fn(c: text): boolean => text_length(c) > 0)
+  let char_map: a mapping from text to text = reduce(chars, {}, fn(acc: a mapping from text to text, c: text): a mapping from text to text => put(acc, c, "Append this exact character to the generated Legible source."))
+  let with_char_controls: a mapping from text to text = put(put(char_map, "<newline>", "Append one newline character."), "<tab>", "Append one tab character for indentation.")
+  let tokens: a list of text = ["function ", "let ", "const ", "mutable ", "record ", "if ", "else if ", "else", "end", "for ", "while ", "return ", "intent: ", "nothing", "text", "integer", "decimal", "boolean", "true", "false", "none", "print(", "read_line()", "length(", "text_length(", "append(", "get(", "put(", "==", "!=", "<=", ">=", "=>", "++", " + ", " - ", " * ", " / ", "(", ")", "[", "]", "\{", "\}", ": ", ", ", ".", "\""]
+  let token_map: a mapping from text to text = reduce(tokens, {}, fn(acc: a mapping from text to text, token: text): a mapping from text to text => put(acc, token, "Append this Legible syntax token exactly: " ++ token))
+  let selected: a mapping from text to text = if mode == "token" then token_map else with_char_controls end
+  put(selected, "<done>", "Stop only when the generated source is a complete answer to the user's request." )
+end
+
+function jev_choice_output(choice: text): text
+  intent: translate the control labels used for whitespace and completion into generated source
+  if choice == "<newline>" then "\n"
+  else if choice == "<tab>" then "\t"
+  else choice
+  end
+end
+
+function jev_next_choice(api_key: text, state: text, mode: text): an optional text
+  intent: ask Jev for the single next source item and return its selected choice label
+  let request: a mapping from text to text = {
+    "model": unwrap_or(env_get("LEGIBLE_CODER_JEV_MODEL"), "jev-latest"),
+    "state": state,
+    "questions": {
+      "next": {
+        "type": "choice",
+        "instructions": "Choose the next item to append to the Legible source. Satisfy the user's request, keep the source syntactically valid, and return <done> only when the source is complete. Return the choice label exactly; do not explain.",
+        "criteria": jev_choice_criteria(mode)
+      }
+    }
+  }
+  let response: a mapping from text to text = http_client_post(jev_base_url(), {"Authorization": "Bearer " ++ api_key, "Content-Type": "application/json"}, json_encode(request))
+  let status: text = get(response, "status")
+  let body: text = get(response, "body")
+  if status != "200" then
+    print("  [jev] API error (" ++ status ++ "): " ++ extract_error_message(body))
+    none
+  else if not json_valid(body) then
+    print("  [jev] API returned a non-JSON response")
+    none
+  else
+    let parsed: a mapping from text to text = json_parse(body)
+    if not has_key(parsed, "answers") or not has_key(get(parsed, "answers"), "next") then
+      print("  [jev] response did not include the next choice: " ++ empty_response_detail(body))
+      none
+    else
+      let answer: a mapping from text to text = get(get(parsed, "answers"), "next")
+      if has_key(answer, "choice") then get(answer, "choice") else none end
+    end
+  end
+end
+
+function resolve_jev_steps(): integer
+  intent: read the maximum number of Jev sequential choices for one experimental turn
+  max(to_integer(unwrap_or(env_get("LEGIBLE_CODER_JEV_MAX_STEPS"), "512")), 1)
+end
+
+record JevStepResult
+  source: text
+  done: boolean
+  failed: boolean
+end
+
+function jev_generation_step(source: text, user_input: text, settings: TurnSettings, mode: text): JevStepResult
+  intent: ask Jev for one item and fold the selected item into the generated source
+  let state: text = "User request:\n" ++ user_input ++ "\n\nGenerated Legible source so far:\n" ++ source
+  let choice_opt: an optional text = jev_next_choice(settings.key, state, mode)
+  if is_none(choice_opt) then
+    JevStepResult {source: source, done: false, failed: true}
+  else
+    let choice: text = unwrap(choice_opt)
+    if choice == "<done>" then
+      JevStepResult {source: source, done: true, failed: false}
+    else
+      JevStepResult {source: source ++ jev_choice_output(choice), done: false, failed: false}
+    end
+  end
+end
+
+function finish_jev_choice_turn(messages: a list of a mapping from text to text, source: text, failed: boolean, finished: boolean, step: integer, settings: TurnSettings): InnerLoopResult
+  intent: print and return the source produced by Jev, or preserve the transcript when generation failed
+  if not finished and not failed then
+    print("  [jev] reached LEGIBLE_CODER_JEV_MAX_STEPS before Jev selected <done>]")
+  end
+  if text_length(source) > 0 then
+    print("")
+    print_separator()
+    print(source)
+    print_separator()
+    print("")
+    web_event_emit({"type": "final", "text": source})
+    InnerLoopResult {messages: append(messages, {"role": "assistant", "content": source}), used_model: not failed, context_budget: settings.context_budget, prompt_tokens: 0, completion_tokens: step}
+  else
+    InnerLoopResult {messages: messages, used_model: false, context_budget: settings.context_budget, prompt_tokens: 0, completion_tokens: step}
+  end
+end
+
+function run_jev_choice_turn(messages: a list of a mapping from text to text, user_input: text, settings: TurnSettings): InnerLoopResult
+  intent: generate Legible source by repeatedly asking Jev to choose a character or token until completion
+  let mode: text = lowercase(trim(unwrap_or(env_get("LEGIBLE_CODER_JEV_GRANULARITY"), "char")))
+  let selected_mode: text = if mode == "token" then "token" else "char" end
+  let max_steps: integer = resolve_jev_steps()
+  print("  [jev] sequential " ++ selected_mode ++ " generation (max " ++ to_text(max_steps) ++ " choices)")
+  mutable source: text = ""
+  mutable step: integer = 0
+  mutable finished: boolean = false
+  mutable failed: boolean = false
+  while step < max_steps and not finished and not failed do
+    let next: JevStepResult = jev_generation_step(source, user_input, settings, selected_mode)
+    set source = next.source
+    set finished = next.done
+    set failed = next.failed
+    if not finished and not failed then
+      set step = step + 1
+      if step % 20 == 0 then print("  [jev] generated " ++ to_text(step) ++ " items]") end
+    end
+  end
+  finish_jev_choice_turn(messages, source, failed, finished, step, settings)
+end
+
 function shell_quote(value: text): text
   intent: concatenate quoted text around value after replace escapes its single quotes
   "'" ++ replace(value, "'", "'\"'\"'") ++ "'"
@@ -771,7 +905,9 @@ end
 
 function provider_is_reachable(base_url: text): boolean
   intent: use curl through shell_exec to check whether the provider endpoint is reachable before calling its model
-  if windows_host() then
+  if is_jev_url(base_url) then
+    true
+  else if windows_host() then
     true
   else
     let url: text = shell_quote(base_url ++ "/models")
@@ -839,7 +975,8 @@ end
 
 function backend_name(base_url: text): text
   intent: call is_qwen_url, is_gemini_url, is_orcarouter_url, is_nims_url, is_openrouter_url, and is_groq_url to return a label for base_url
-  if is_qwen_url(base_url) then "Qwen"
+  if is_jev_url(base_url) then "Jev"
+  else if is_qwen_url(base_url) then "Qwen"
   else if is_gemini_url(base_url) then "Gemini"
   else if is_orcarouter_url(base_url) then "OrcaRouter"
   else if is_nims_url(base_url) then "NIM"
@@ -851,7 +988,8 @@ end
 
 function provider_tier(base_url: text): text
   intent: return qwen gemini orcarouter nims openrouter groq or local based on the base URL for context-window tuning
-  if is_qwen_url(base_url) then "qwen"
+  if is_jev_url(base_url) then "jev"
+  else if is_qwen_url(base_url) then "qwen"
   else if is_gemini_url(base_url) then "gemini"
   else if is_orcarouter_url(base_url) then "orcarouter"
   else if is_nims_url(base_url) then "nims"
@@ -2110,6 +2248,8 @@ function resolve_api_key(base_url: text): text
   let explicit_key: an optional text = env_get("LEGIBLE_CODER_API_KEY")
   if is_some(explicit_key) then
     unwrap(explicit_key)
+  else if is_jev_url(base_url) then
+    require_provider_api_key("TYPESAFE_API_KEY", "Jev")
   else if is_qwen_url(base_url) then
     require_qwen_api_key()
   else if is_gemini_url(base_url) then
@@ -2139,7 +2279,7 @@ end
 function resolve_context_budget(tier: text): integer
   intent: read LEGIBLE_CODER_CONTEXT_TOKENS or use a provider-appropriate token budget before compaction
   -- gemini-3.7-flash and qwen3.8-max have 1M-token contexts, OrcaRouter Qwen3.8 has 65K, NIM has 131K, local is very limited
-  let default_text: text = if tier == "local" then "6000" else if tier == "gemini" then "700000" else if tier == "qwen" then "850000" else if tier == "orcarouter" then "60000" else if tier == "nims" then "120000" else "90000" end
+  let default_text: text = if tier == "jev" then "64000" else if tier == "local" then "6000" else if tier == "gemini" then "700000" else if tier == "qwen" then "850000" else if tier == "orcarouter" then "60000" else if tier == "nims" then "120000" else "90000" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_TOKENS"), default_text)
   max(to_integer(raw), 1000)
 end
@@ -2154,7 +2294,7 @@ end
 
 function resolve_context_keep_messages(tier: text): integer
   intent: read LEGIBLE_CODER_CONTEXT_KEEP_MESSAGES or use a provider-appropriate recent-message default
-  let default_text: text = if tier == "local" then "8" else if tier == "gemini" then "24" else "12" end
+  let default_text: text = if tier == "jev" then "4" else if tier == "local" then "8" else if tier == "gemini" then "24" else "12" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_KEEP_MESSAGES"), default_text)
   max(to_integer(raw), 2)
 end
@@ -2162,7 +2302,7 @@ end
 function resolve_max_output_tokens(tier: text, include_tools: boolean): integer
   intent: read LEGIBLE_CODER_MAX_OUTPUT_TOKENS or pick a default suited to the backend
   -- qwen3.8-max supports up to 131K output, gemini-3.7-flash up to 65K, NIM up to 131K, local is small
-  let default_text: text = if tier == "local" and include_tools then "4096" else if tier == "local" then "750" else if tier == "qwen" then "131072" else if tier == "gemini" then "32768" else if tier == "nims" then "32768" else "16384" end
+  let default_text: text = if tier == "jev" then "128" else if tier == "local" and include_tools then "4096" else if tier == "local" then "750" else if tier == "qwen" then "131072" else if tier == "gemini" then "32768" else if tier == "nims" then "32768" else "16384" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_MAX_OUTPUT_TOKENS"), default_text)
   max(to_integer(raw), 128)
 end
@@ -2243,6 +2383,11 @@ function build_custom_provider(url: text, model_override: an optional text): a m
   {"name": "Custom", "key": key, "url": url, "full": model, "fast": fast_model, "expert": expert_model}
 end
 
+function build_jev_provider(): a mapping from text to text
+  intent: build the explicit experimental Jev provider using the TypeSafe API key and sequential-choice adapter
+  {"name": "Jev", "key": resolve_api_key(jev_base_url()), "url": jev_base_url(), "full": unwrap_or(env_get("LEGIBLE_CODER_JEV_MODEL"), "jev-latest"), "fast": "", "expert": ""}
+end
+
 function build_qwen_provider(key: text, model_override: an optional text): a mapping from text to text
   intent: build a provider mapping for the Qwen DashScope API using the qwen3.8-max default
   let model: text = unwrap_or(model_override, "qwen3.8-max")
@@ -2312,7 +2457,9 @@ function build_provider_list(): a list of a mapping from text to text
   intent: use env_get to read LEGIBLE_CODER_BASE_URL and is_some to pick build_custom_provider or build_default_provider_list
   let custom_url_opt: an optional text = env_get("LEGIBLE_CODER_BASE_URL")
   let model_override: an optional text = env_get("LEGIBLE_CODER_MODEL")
-  if is_some(custom_url_opt) then
+  if env_truthy("LEGIBLE_CODER_JEV_MODE") then
+    [build_jev_provider()]
+  else if is_some(custom_url_opt) then
     [build_custom_provider(unwrap(custom_url_opt), model_override)]
   else
     build_default_provider_list(model_override, qwen_api_key(), env_get("GEMINI_API_KEY"), env_get("ORCAROUTER_API_KEY"), env_get("NVIDIA_API_KEY"), env_get("OPENROUTER_API_KEY"), env_get("GROQ_API_KEY"))
@@ -2348,10 +2495,10 @@ function build_turn_settings(prov: a mapping from text to text, turn_model: text
   TurnSettings {key: get(prov, "key"), base_url: get(prov, "url"), model: turn_model, max_tools: tools.max_tools, include_tools: tools.include_tools, include_dir_tools: tools.include_dir_tools, max_output_tokens: limits.max_output_tokens, context_budget: limits.context_budget, preserve_recent_messages: limits.keep_messages, compact_after: limits.compact_after, include_vision: tools.include_vision, track_usage: track_usage, turn_quality: turn_budget.difficulty_prior(is_expert_task(user_input), is_complex_task(user_input))}
 end
 
-function attempt_provider(state: FallbackState, prov: a mapping from text to text, settings: TurnSettings, start: integer): FallbackState
+function attempt_provider(state: FallbackState, prov: a mapping from text to text, settings: TurnSettings, start: integer, user_input: text): FallbackState
   intent: run the turn on one provider when it is reachable and record the resulting messages and whether the model was used
   if provider_is_reachable(get(prov, "url")) then
-    let inner: InnerLoopResult = run_inner_loop(state.messages, start, settings)
+    let inner: InnerLoopResult = if provider_tier(get(prov, "url")) == "jev" then run_jev_choice_turn(state.messages, user_input, settings) else run_inner_loop(state.messages, start, settings) end
     state with { messages: inner.messages, last_inner: inner, consecutive_failures: if inner.used_model then 0 else state.consecutive_failures end }
   else
     print("  [unavailable] cannot reach " ++ get(prov, "name"))
@@ -2377,7 +2524,7 @@ function fallback_attempt(state: FallbackState, user_input: text, start: integer
   let prov: a mapping from text to text = get(providers, state.provider_idx)
   let turn_model: text = pick_model(user_input, get(prov, "full"), get(prov, "fast"), get(prov, "expert"))
   print_turn_model_banner(state.provider_idx, state.attempts > 0, prov, turn_model)
-  let attempted: FallbackState = attempt_provider(state, prov, build_turn_settings(prov, turn_model, user_input, tools, track_usage), start)
+  let attempted: FallbackState = attempt_provider(state, prov, build_turn_settings(prov, turn_model, user_input, tools, track_usage), start, user_input)
   if length(attempted.messages) > start then
     attempted with { done: true }
   else
@@ -3622,7 +3769,7 @@ end
 function resolve_tool_settings(primary: a mapping from text to text): ToolSettings
   intent: derive the tool call limit and the tool, directory tool, and vision flags from the primary provider
   let tier: text = provider_tier(get(primary, "url"))
-  let include_tools: boolean = tier != "local" or resolve_local_native_tools(get(primary, "full"))
+  let include_tools: boolean = (tier != "local" and tier != "jev") or resolve_local_native_tools(get(primary, "full"))
   ToolSettings {max_tools: resolve_max_tools(tier), include_tools: include_tools, include_dir_tools: include_tools, include_vision: include_tools and resolve_include_vision(get(primary, "full"))}
 end
 

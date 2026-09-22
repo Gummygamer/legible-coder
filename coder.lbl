@@ -897,11 +897,16 @@ function jev_test_timeout(): integer
   max(to_integer(unwrap_or(env_get("LEGIBLE_CODER_JEV_TEST_TIMEOUT"), "15")), 1)
 end
 
-function jev_test_output(result: a mapping from text to text): text
-  intent: format a script test exit code and captured output for Jev feedback
-  let output: text = truncate_text(trim(unwrap_or(get(result, "stdout"), "")), 4000)
+function jev_test_output_bounded(result: a mapping from text to text, max_len: integer): text
+  intent: format a script test exit code and captured output for Jev feedback, bounded to max_len characters
+  let output: text = truncate_text(trim(unwrap_or(get(result, "stdout"), "")), max_len)
   let exit_code: text = to_text(get(result, "exit_code"))
   if text_length(output) > 0 then "exit_code: " ++ exit_code ++ "\noutput:\n" ++ output else "exit_code: " ++ exit_code ++ "\n(no output)" end
+end
+
+function jev_test_output(result: a mapping from text to text): text
+  intent: format a script test exit code and captured output for Jev feedback
+  jev_test_output_bounded(result, 4000)
 end
 
 function jev_test_written_source(output_path: text): JevTestResult
@@ -912,12 +917,12 @@ function jev_test_written_source(output_path: text): JevTestResult
     JevTestResult {passed: false, report: "The generated script was not written: " ++ output_path}
   else
     let quoted_path: text = shell_quote(output_path)
-    let check_command: text = "if command -v legible >/dev/null 2>&1; then legible check " ++ quoted_path ++ " 2>&1 | head -40; else echo 'legible interpreter not found'; exit 127; fi"
+    let check_command: text = "if command -v legible >/dev/null 2>&1; then legible check " ++ quoted_path ++ " 2>&1; else echo 'legible interpreter not found'; exit 127; fi"
     let check_result: a mapping from text to text = shell_exec(check_command)
     let check_report: text = trim(unwrap_or(get(check_result, "stdout"), ""))
     let check_ok: boolean = to_text(get(check_result, "exit_code")) == "0" and (text_length(check_report) == 0 or contains_text(check_report, "No errors found"))
     if not check_ok then
-      JevTestResult {passed: false, report: "legible check failed for " ++ output_path ++ ":\n" ++ jev_test_output(check_result)}
+      JevTestResult {passed: false, report: "legible check failed for " ++ output_path ++ ":\n" ++ jev_test_output_bounded(check_result, 12000)}
     else
       let timeout: text = to_text(jev_test_timeout())
       let run_command: text = "if command -v legible >/dev/null 2>&1; then if command -v timeout >/dev/null 2>&1; then timeout " ++ timeout ++ "s legible run " ++ quoted_path ++ " 2>&1; else legible run " ++ quoted_path ++ " 2>&1; fi; else echo 'legible interpreter not found'; exit 127; fi"
@@ -962,7 +967,8 @@ function jev_graph_system_prompt(): text
   "Jev is a typed decision model: at a choice node it can only pick one of the labeled options you provide, never free text. Label every option in <angle-bracket> form, e.g. <pass>, <fix>. Jev always also has a reserved <replan> option that regenerates the whole graph from that point, so never author an option literally named <replan> yourself.\n" ++
   "An empty \"next\" or \"goto\" (\"\") ends the turn successfully right there.\n" ++
   "For any task that writes a Legible (.lbl) file: follow the write_file node with a test_script node on the same path, then a choice node whose branches include one that goes back to a corrected write_file (or to \"goto\":\"replan\") when the test report shows an error, and one that ends the turn when it passes.\n" ++
-  "For a task that changes one or a few specific spots in an existing file (fixing a handful of named issues, renaming something, correcting specific lines), use edit_file, not write_file: write_file requires you to know and restate the file's entire contents at plan time, which you usually cannot do for a file you have not fully read, and is wasteful and error-prone for a large file. edit_file args are \{\"path\":..., \"old_string\":..., \"new_string\":...\}; old_string must be copied verbatim from a read_file, read_file_lines, or grep node you already planned earlier in the graph (never guessed or paraphrased), and must be unique in the file — include a line or two of surrounding context if the exact text could appear more than once. Give each distinct fix its own edit_file node with its own literal old_string and new_string drawn from that fix's specific location; never rely on a single shell_exec script that pattern-matches or keyword-matches several locations at once and applies the same replacement text to all of them, since two unrelated spots can share the same keywords and a shared replacement is almost always wrong for at least one of them.\n" ++
+  "For a task that changes one or a few specific spots in an existing file (fixing a handful of named issues, renaming something, correcting specific lines), use edit_file, not write_file: write_file requires you to know and restate the file's entire contents at plan time, which you usually cannot do for a file you have not fully read, and is wasteful and error-prone for a large file. edit_file args are \{\"path\":..., \"old_string\":..., \"new_string\":...\}; old_string must be copied verbatim from real tool output you can actually see in this prompt (the user request itself, or an \"Executed so far\" / \"Most recent tool or test output\" section below, never text you are guessing or paraphrasing from memory), and must be unique in the file — include a line or two of surrounding context if the exact text could appear more than once. Give each distinct fix its own edit_file node with its own literal old_string and new_string drawn from that fix's specific location; never rely on a single shell_exec script that pattern-matches or keyword-matches several locations at once and applies the same replacement text to all of them, since two unrelated spots can share the same keywords and a shared replacement is almost always wrong for at least one of them.\n" ++
+  "You are drafting this graph now, before any of its nodes have run — a tool node's real output does not exist until Jev actually executes it. So if the task needs edits to a file you have not been shown the contents of, or needs to fix findings from a check you have not yet run (for example, a lint or `legible check` report with more issues than the request already quotes verbatim), do not invent old_string values for those edits now. Instead plan a reconnaissance-only graph: one or more read_file, read_file_lines, grep, or shell_exec nodes (e.g. running `legible check <path>`) that gather the real content or diagnostic list, ending in a tool node whose \"next\" is a choice node with exactly one option whose \"goto\" is the literal node id \"replan\" (author that option yourself; it is separate from Jev's reserved <replan> escape hatch). That hands your own gathered output back to you as the \"Most recent tool or test output\" on the next planning call, and only then should you draft the concrete edit_file nodes, with old_string copied from what you now see. If the gathered diagnostic list has more distinct fixes than you can precisely and verifiably plan as edit_file nodes in one reply, fix as many as you can with real, verbatim old_string values in this pass, then end that batch the same way — a tool node feeding a choice node that routes to \"replan\" — so the remaining ones are picked up in a following pass with fresh output to draw from, rather than trying to plan every fix across the whole file at once.\n" ++
   "Every node id referenced by \"start\", \"next\", or \"goto\" must exist in \"nodes\", except \"\" (end) and the reserved \"replan\".\n\n"
 end
 
@@ -988,7 +994,7 @@ function jev_request_graph(prov: a mapping from text to text, user_input: text, 
     {"role": "system", "content": jev_graph_system_prompt()},
     {"role": "user", "content": "User request:\n" ++ user_input ++ context_block}
   ]
-  let request: a mapping from text to text = build_request(get(prov, "full"), messages, true, false, false, 4000, false)
+  let request: a mapping from text to text = build_request(get(prov, "full"), messages, true, false, false, 8000, false)
   let response: a mapping from text to text = call_api(get(prov, "key"), get(prov, "url"), request)
   let status: text = get(response, "status")
   if status != "200" then
@@ -1094,18 +1100,26 @@ function resolve_jev_max_nodes(graph: a mapping from text to text, steps: intege
 end
 
 function resolve_jev_max_replans(graph: a mapping from text to text): integer
-  intent: read LEGIBLE_CODER_JEV_MAX_REPLANS or allow the saturation point of self-repair plus one whole-graph redraft per decision point
+  intent: read LEGIBLE_CODER_JEV_MAX_REPLANS or allow enough replans for both per-decision-point self-repair and a multi-batch gather-then-fix graph
+  -- Replanning now also serves a deliberate continuation pattern (gather real
+  -- content or diagnostics, then hand it to a fresh planning pass as one
+  -- batch of a larger cleanup), not just error recovery at a single decision
+  -- point, so the ceiling here is looser than jev_repair_passes() alone
+  -- would suggest; node_budget remains the hard backstop against runaway
+  -- looping regardless of how many replans are still available.
   let override: an optional text = env_get("LEGIBLE_CODER_JEV_MAX_REPLANS")
   if is_some(override) then
     max(to_integer(unwrap(override)), 0)
   else
-    min(jev_repair_passes() + jev_graph_choice_count(graph), 2 * jev_repair_passes() + 2)
+    min(jev_repair_passes() + jev_graph_choice_count(graph), 4 * jev_repair_passes() + 6)
   end
 end
 
 function jev_trace_append(trace: text, entry: text): text
   intent: append one bounded trace entry, keeping only the most recent history for planner and Jev context
-  truncate_text(trace ++ (if text_length(trace) > 0 then " -> " else "" end) ++ entry, 2000)
+  let combined: text = trace ++ (if text_length(trace) > 0 then " -> " else "" end) ++ entry
+  let total: integer = text_length(combined)
+  if total > 2000 then "(earlier steps trimmed) ... " ++ substring(combined, total - 2000, 2000) else combined end
 end
 
 function jev_budget_line(state: GraphState): text
@@ -1125,7 +1139,7 @@ function jev_replan_context(user_input: text, state: GraphState, reason: text): 
   "The previous decision graph needs to change. Reason: " ++ reason ++ "\n\n" ++
   jev_budget_line(state) ++ " Draft a graph that finishes within it.\n\n" ++
   "Executed so far:\n" ++ state.trace ++ "\n\n" ++
-  "Most recent tool or test output:\n" ++ truncate_text(state.last_output, 2000) ++ "\n\n" ++
+  "Most recent tool or test output:\n" ++ truncate_text(state.last_output, 8000) ++ "\n\n" ++
   "Produce a full replacement graph (a fresh \"start\" and \"nodes\") that continues correctly from here for the original request."
 end
 

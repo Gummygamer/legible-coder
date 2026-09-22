@@ -749,9 +749,12 @@ function call_api(api_key: text, base_url: text, request_body: a mapping from te
   http_client_post(base_url ++ "/chat/completions", headers, json_encode(request_body))
 end
 
--- Jev is a typed decision API rather than an OpenAI-compatible text model. The
--- adapter below deliberately keeps it opt-in: each call asks Jev to choose one
--- appendable item, and the caller renders that choice into Legible source.
+-- Jev is a typed decision API rather than an OpenAI-compatible text model: it
+-- only ever picks a labeled branch from criteria it is given, never free text.
+-- A real LLM (the "planner") drafts a small JSON decision graph once per turn;
+-- Jev then traverses that graph, making one typed choice per branch point.
+-- Any choice node also carries a reserved <replan> branch so Jev itself can
+-- ask the planner to regenerate the graph mid-turn when nothing else fits.
 function jev_base_url(): text
   intent: return the TypeSafe System One endpoint, allowing a local test endpoint override
   unwrap_or(env_get("LEGIBLE_CODER_JEV_URL"), "https://api.typesafe.ai/v1/systemone")
@@ -762,125 +765,415 @@ function is_jev_url(url: text): boolean
   contains_text(url, "typesafe.ai") or url == unwrap_or(env_get("LEGIBLE_CODER_JEV_URL"), "")
 end
 
-function jev_choice_criteria(mode: text): a mapping from text to text
-  intent: construct the closed set of character or Legible token choices sent to Jev
-  let chars: a list of text = filter(split("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,;:!?_+-=*/%()[]\\\{\}<>\\\\\"'@#$^&|~`", ""), fn(c: text): boolean => text_length(c) > 0)
-  let char_map: a mapping from text to text = reduce(chars, {}, fn(acc: a mapping from text to text, c: text): a mapping from text to text => put(acc, c, "Append this exact character to the generated Legible source."))
-  let with_char_controls: a mapping from text to text = put(put(char_map, "<newline>", "Append one newline character."), "<tab>", "Append one tab character for indentation.")
-  let tokens: a list of text = ["function ", "let ", "const ", "mutable ", "record ", "if ", "else if ", "else", "end", "for ", "while ", "return ", "intent: ", "nothing", "text", "integer", "decimal", "boolean", "true", "false", "none", "print(", "read_line()", "length(", "text_length(", "append(", "get(", "put(", "==", "!=", "<=", ">=", "=>", "++", " + ", " - ", " * ", " / ", "(", ")", "[", "]", "\{", "\}", ": ", ", ", ".", "\""]
-  let token_map: a mapping from text to text = reduce(tokens, {}, fn(acc: a mapping from text to text, token: text): a mapping from text to text => put(acc, token, "Append this Legible syntax token exactly: " ++ token))
-  let selected: a mapping from text to text = if mode == "token" then token_map else with_char_controls end
-  put(selected, "<done>", "Stop only when the generated source is a complete answer to the user's request." )
+function jev_trace_enabled(): boolean
+  intent: report whether to print every Jev graph step for debugging the experimental backend
+  let value: text = lowercase(trim(unwrap_or(env_get("LEGIBLE_CODER_JEV_TRACE"), "")))
+  value == "1" or value == "true" or value == "yes"
 end
 
-function jev_choice_output(choice: text): text
-  intent: translate the control labels used for whitespace and completion into generated source
-  if choice == "<newline>" then "\n"
-  else if choice == "<tab>" then "\t"
-  else choice
+function jev_checked_choice(answer: a mapping from text to text, criteria: a mapping from text to text): an optional text
+  intent: accept only an exact choice label from the criteria map
+  if not has_key(answer, "choice") then
+    none
+  else
+    let choice: text = get(answer, "choice")
+    if has_key(criteria, choice) then
+      choice
+    else
+      print("  [jev] rejected invalid choice: " ++ choice)
+      none
+    end
   end
 end
 
-function jev_next_choice(api_key: text, state: text, mode: text): an optional text
-  intent: ask Jev for the single next source item and return its selected choice label
-  let request: a mapping from text to text = {
-    "model": unwrap_or(env_get("LEGIBLE_CODER_JEV_MODEL"), "jev-latest"),
-    "state": state,
-    "questions": {
-      "next": {
-        "type": "choice",
-        "instructions": "Choose the next item to append to the Legible source. Satisfy the user's request, keep the source syntactically valid, and return <done> only when the source is complete. Return the choice label exactly; do not explain.",
-        "criteria": jev_choice_criteria(mode)
-      }
-    }
-  }
-  let response: a mapping from text to text = http_client_post(jev_base_url(), {"Authorization": "Bearer " ++ api_key, "Content-Type": "application/json"}, json_encode(request))
-  let status: text = get(response, "status")
-  let body: text = get(response, "body")
-  if status != "200" then
-    print("  [jev] API error (" ++ status ++ "): " ++ extract_error_message(body))
-    none
-  else if not json_valid(body) then
+function jev_response_choice_named(body: text, answer_name: text, criteria: a mapping from text to text): an optional text
+  intent: parse and validate a named choice returned by Jev
+  if not json_valid(body) then
     print("  [jev] API returned a non-JSON response")
     none
   else
     let parsed: a mapping from text to text = json_parse(body)
-    if not has_key(parsed, "answers") or not has_key(get(parsed, "answers"), "next") then
-      print("  [jev] response did not include the next choice: " ++ empty_response_detail(body))
+    if not has_key(parsed, "answers") or not has_key(get(parsed, "answers"), answer_name) then
+      print("  [jev] response did not include the " ++ answer_name ++ " choice: " ++ empty_response_detail(body))
       none
     else
-      let answer: a mapping from text to text = get(get(parsed, "answers"), "next")
-      if has_key(answer, "choice") then get(answer, "choice") else none end
+      jev_checked_choice(get(get(parsed, "answers"), answer_name), criteria)
     end
   end
 end
 
-function resolve_jev_steps(): integer
-  intent: read the maximum number of Jev sequential choices for one experimental turn
-  max(to_integer(unwrap_or(env_get("LEGIBLE_CODER_JEV_MAX_STEPS"), "512")), 1)
+function jev_output_path(user_input: text): text
+  intent: resolve an explicit Jev output path or choose main.lbl for write-like requests
+  let configured: text = trim(unwrap_or(env_get("LEGIBLE_CODER_JEV_OUTPUT"), ""))
+  if text_length(configured) > 0 then
+    configured
+  else
+    mutable found: text = ""
+    for raw_word in split(user_input, " ") do
+      let word: text = trim(replace(replace(replace(strip_path_quotes(raw_word), ",", ""), ";", ""), "!", ""))
+      if ends_with(word, ".lbl") then set found = word end
+    end
+    if text_length(found) > 0 then
+      found
+    else
+      let request: text = lowercase(user_input)
+      if contains_text(request, "write") or contains_text(request, "create") or contains_text(request, "save") then "main.lbl" else "" end
+    end
+  end
 end
 
-record JevStepResult
-  source: text
+function jev_write_source(output_path: text, source: text): text
+  intent: write generated Jev source through the same file helper used by normal tool calls
+  if text_length(output_path) == 0 then
+    ""
+  else
+    let result: text = exec_write_file({"path": output_path, "content": source})
+    print("  [jev] " ++ result)
+    result
+  end
+end
+
+function truncate_text(s: text, max_len: integer): text
+  intent: cut s to at most max_len characters and mark truncation
+  if text_length(s) > max_len then substring(s, 0, max_len) ++ "... (truncated)" else s end
+end
+
+record JevTestResult
+  passed: boolean
+  report: text
+end
+
+function jev_test_timeout(): integer
+  intent: resolve the maximum number of seconds allowed for one Jev script test
+  max(to_integer(unwrap_or(env_get("LEGIBLE_CODER_JEV_TEST_TIMEOUT"), "15")), 1)
+end
+
+function jev_test_output(result: a mapping from text to text): text
+  intent: format a script test exit code and captured output for Jev feedback
+  let output: text = truncate_text(trim(unwrap_or(get(result, "stdout"), "")), 4000)
+  let exit_code: text = to_text(get(result, "exit_code"))
+  if text_length(output) > 0 then "exit_code: " ++ exit_code ++ "\noutput:\n" ++ output else "exit_code: " ++ exit_code ++ "\n(no output)" end
+end
+
+function jev_test_written_source(output_path: text): JevTestResult
+  intent: check and run a written Jev Legible script and return a bounded diagnostic report
+  if text_length(output_path) == 0 then
+    JevTestResult {passed: true, report: "No output path was selected; script test skipped."}
+  else if not file_exists(output_path) then
+    JevTestResult {passed: false, report: "The generated script was not written: " ++ output_path}
+  else
+    let quoted_path: text = shell_quote(output_path)
+    let check_command: text = "if command -v legible >/dev/null 2>&1; then legible check " ++ quoted_path ++ " 2>&1 | head -40; else echo 'legible interpreter not found'; exit 127; fi"
+    let check_result: a mapping from text to text = shell_exec(check_command)
+    let check_report: text = trim(unwrap_or(get(check_result, "stdout"), ""))
+    let check_ok: boolean = to_text(get(check_result, "exit_code")) == "0" and (text_length(check_report) == 0 or contains_text(check_report, "No errors found"))
+    if not check_ok then
+      JevTestResult {passed: false, report: "legible check failed for " ++ output_path ++ ":\n" ++ jev_test_output(check_result)}
+    else
+      let timeout: text = to_text(jev_test_timeout())
+      let run_command: text = "if command -v legible >/dev/null 2>&1; then if command -v timeout >/dev/null 2>&1; then timeout " ++ timeout ++ "s legible run " ++ quoted_path ++ " 2>&1; else legible run " ++ quoted_path ++ " 2>&1; fi; else echo 'legible interpreter not found'; exit 127; fi"
+      let run_result: a mapping from text to text = shell_exec(run_command)
+      let run_report: text = jev_test_output(run_result)
+      let run_ok: boolean = to_text(get(run_result, "exit_code")) == "0"
+      if run_ok then
+        JevTestResult {passed: true, report: "legible check passed.\n" ++ run_report}
+      else
+        JevTestResult {passed: false, report: "legible run failed for " ++ output_path ++ ":\n" ++ run_report}
+      end
+    end
+  end
+end
+
+-- ─── Jev decision graph: planner ──────────────────────────────────────────────
+
+function jev_planner_provider(): a mapping from text to text
+  intent: pick a real text-generating backend to draft or redraft the Jev decision graph
+  let explicit_url: an optional text = env_get("LEGIBLE_CODER_JEV_PLANNER_URL")
+  let model_override: an optional text = env_get("LEGIBLE_CODER_JEV_PLANNER_MODEL")
+  if is_some(explicit_url) then
+    build_custom_provider(unwrap(explicit_url), model_override)
+  else
+    get(build_default_provider_list(model_override, qwen_api_key(), env_get("GEMINI_API_KEY"), env_get("ORCAROUTER_API_KEY"), env_get("NVIDIA_API_KEY"), env_get("OPENROUTER_API_KEY"), env_get("GROQ_API_KEY")), 0)
+  end
+end
+
+function jev_planner_tool_names(): text
+  intent: list the tool node names the planner may reference besides the built-in test_script check
+  "read_file, read_file_lines, write_file, shell_exec, list_dir, read_dir_recursive, grep, web_search, and test_script (checks and runs a written .lbl file at args.path)"
+end
+
+function jev_graph_system_prompt(): text
+  intent: describe the JSON decision-graph contract the planner model must produce for Jev to traverse
+  "You are the planning stage of a Jev-driven coding agent. Reply with ONE JSON object only: no prose, no markdown, no code fences.\n\n" ++
+  "Shape: \{\"start\": \"<node id>\", \"nodes\": \{\"<id>\": \{...\}, ...\}\}\n\n" ++
+  "Every node has \"kind\": \"tool\" or \"choice\".\n" ++
+  "tool node: \{\"kind\":\"tool\", \"tool\": \"<name>\", \"args\": \{...string arguments...\}, \"next\": \"<node id or \\\"\\\">\"\}\n" ++
+  "Valid tool names: " ++ jev_planner_tool_names() ++ ".\n" ++
+  "choice node: \{\"kind\":\"choice\", \"question\": \"<what Jev is deciding>\", \"options\": \{\"<label>\": \{\"desc\": \"<what this branch means>\", \"goto\": \"<node id or \\\"\\\">\"\}\}\}\n" ++
+  "Jev is a typed decision model: at a choice node it can only pick one of the labeled options you provide, never free text. Label every option in <angle-bracket> form, e.g. <pass>, <fix>. Jev always also has a reserved <replan> option that regenerates the whole graph from that point, so never author an option literally named <replan> yourself.\n" ++
+  "An empty \"next\" or \"goto\" (\"\") ends the turn successfully right there.\n" ++
+  "For any task that writes a Legible (.lbl) file: follow the write_file node with a test_script node on the same path, then a choice node whose branches include one that goes back to a corrected write_file (or to \"goto\":\"replan\") when the test report shows an error, and one that ends the turn when it passes.\n" ++
+  "Every node id referenced by \"start\", \"next\", or \"goto\" must exist in \"nodes\", except \"\" (end) and the reserved \"replan\".\n\n"
+end
+
+function jev_planner_reply_text(body: text): text
+  intent: extract the assistant message content from a chat completions response body, or empty text on any parse failure
+  if not json_valid(body) or not starts_with(trim(body), "\{") then
+    ""
+  else
+    let parsed: a mapping from text to text = json_parse(body)
+    if not response_has_choices(parsed) then
+      ""
+    else
+      let choice: a mapping from text to text = get(get(parsed, "choices"), 0)
+      unwrap_or(get(get(choice, "message"), "content"), "")
+    end
+  end
+end
+
+function jev_request_graph(prov: a mapping from text to text, user_input: text, context: text): text
+  intent: ask the planner backend to draft or replace the Jev decision graph as a single JSON reply
+  let context_block: text = if text_length(context) > 0 then "\n\n" ++ context else "" end
+  let messages: a list of a mapping from text to text = [
+    {"role": "system", "content": jev_graph_system_prompt()},
+    {"role": "user", "content": "User request:\n" ++ user_input ++ context_block}
+  ]
+  let request: a mapping from text to text = build_request(get(prov, "full"), messages, true, false, false, 4000, false)
+  let response: a mapping from text to text = call_api(get(prov, "key"), get(prov, "url"), request)
+  let status: text = get(response, "status")
+  if status != "200" then
+    print("  [jev] planner API error (" ++ status ++ "): " ++ extract_error_message(get(response, "body")))
+    ""
+  else
+    jev_planner_reply_text(get(response, "body"))
+  end
+end
+
+function jev_graph_valid(graph: a mapping from text to text): boolean
+  intent: confirm the parsed graph has a start node id that exists among its own nodes
+  if not has_key(graph, "start") or not has_key(graph, "nodes") then
+    false
+  else
+    has_key(get(graph, "nodes"), get(graph, "start"))
+  end
+end
+
+function jev_generate_graph(user_input: text, context: text): a mapping from text to text
+  intent: ask the planner backend for a decision graph and validate its shape before handing it to Jev
+  let prov: a mapping from text to text = jev_planner_provider()
+  let raw: text = jev_request_graph(prov, user_input, context)
+  let cleaned: text = strip_code_fences(raw)
+  if text_length(trim(cleaned)) == 0 or not json_valid(cleaned) then
+    print("  [jev] planner returned a non-JSON graph")
+    {}
+  else
+    let parsed: a mapping from text to text = json_parse(cleaned)
+    if jev_graph_valid(parsed) then
+      parsed
+    else
+      print("  [jev] planner graph failed validation (bad start/nodes)")
+      {}
+    end
+  end
+end
+
+-- ─── Jev decision graph: traversal ────────────────────────────────────────────
+
+record GraphState
+  graph: a mapping from text to text
+  node_id: text
+  last_output: text
+  trace: text
+  steps: integer
+  replans: integer
   done: boolean
   failed: boolean
 end
 
-function jev_generation_step(source: text, user_input: text, settings: TurnSettings, mode: text): JevStepResult
-  intent: ask Jev for one item and fold the selected item into the generated source
-  let state: text = "User request:\n" ++ user_input ++ "\n\nGenerated Legible source so far:\n" ++ source
-  let choice_opt: an optional text = jev_next_choice(settings.key, state, mode)
-  if is_none(choice_opt) then
-    JevStepResult {source: source, done: false, failed: true}
+function resolve_jev_max_nodes(): integer
+  intent: read the maximum number of Jev graph nodes to execute in one turn
+  max(to_integer(unwrap_or(env_get("LEGIBLE_CODER_JEV_MAX_NODES"), "40")), 1)
+end
+
+function resolve_jev_max_replans(): integer
+  intent: read the maximum number of whole-graph replans Jev may trigger in one turn
+  max(to_integer(unwrap_or(env_get("LEGIBLE_CODER_JEV_MAX_REPLANS"), "3")), 0)
+end
+
+function jev_trace_append(trace: text, entry: text): text
+  intent: append one bounded trace entry, keeping only the most recent history for planner and Jev context
+  truncate_text(trace ++ (if text_length(trace) > 0 then " -> " else "" end) ++ entry, 2000)
+end
+
+function jev_replan_context(user_input: text, state: GraphState, reason: text): text
+  intent: summarize the executed trace and last tool output so the planner can regenerate the graph in place
+  "The previous decision graph needs to change. Reason: " ++ reason ++ "\n\n" ++
+  "Executed so far:\n" ++ state.trace ++ "\n\n" ++
+  "Most recent tool or test output:\n" ++ truncate_text(state.last_output, 2000) ++ "\n\n" ++
+  "Produce a full replacement graph (a fresh \"start\" and \"nodes\") that continues correctly from here for the original request."
+end
+
+function jev_apply_replan(state: GraphState, user_input: text, reason: text): GraphState
+  intent: regenerate the whole graph in place, bounded by the replan budget, whether Jev or a malformed goto asked for it
+  if state.replans >= resolve_jev_max_replans() then
+    state with { failed: true, last_output: "[jev] replan limit reached; stopping.\n" ++ state.last_output }
   else
-    let choice: text = unwrap(choice_opt)
-    if choice == "<done>" then
-      JevStepResult {source: source, done: true, failed: false}
+    print("  [jev] replanning (" ++ to_text(state.replans + 1) ++ "): " ++ reason)
+    let context: text = jev_replan_context(user_input, state, reason)
+    let graph: a mapping from text to text = jev_generate_graph(user_input, context)
+    if not has_key(graph, "start") then
+      state with { failed: true, last_output: "[jev] planner failed to produce a replacement graph." }
     else
-      JevStepResult {source: source ++ jev_choice_output(choice), done: false, failed: false}
+      state with { graph: graph, node_id: get(graph, "start"), replans: state.replans + 1, trace: jev_trace_append(state.trace, "replan: " ++ reason) }
     end
   end
 end
 
-function finish_jev_choice_turn(messages: a list of a mapping from text to text, source: text, failed: boolean, finished: boolean, step: integer, settings: TurnSettings): InnerLoopResult
-  intent: print and return the source produced by Jev, or preserve the transcript when generation failed
-  if not finished and not failed then
-    print("  [jev] reached LEGIBLE_CODER_JEV_MAX_STEPS before Jev selected <done>]")
-  end
-  if text_length(source) > 0 then
-    print("")
-    print_separator()
-    print(source)
-    print_separator()
-    print("")
-    web_event_emit({"type": "final", "text": source})
-    InnerLoopResult {messages: append(messages, {"role": "assistant", "content": source}), used_model: not failed, context_budget: settings.context_budget, prompt_tokens: 0, completion_tokens: step}
+function jev_run_tool_node(node: a mapping from text to text, node_id: text, state: GraphState): GraphState
+  intent: execute one graph tool node (or the built-in test_script check) and advance toward its declared next node
+  let tool: text = unwrap_or(get(node, "tool"), "")
+  let args: a mapping from text to text = unwrap_or(get(node, "args"), {})
+  let output: text = if tool == "test_script" then
+    jev_test_written_source(unwrap_or(get(args, "path"), "")).report
+  else if is_known_tool(tool) then
+    execute_tool(tool, json_encode(args))
   else
-    InnerLoopResult {messages: messages, used_model: false, context_budget: settings.context_budget, prompt_tokens: 0, completion_tokens: step}
+    "[jev] unknown tool in graph node " ++ node_id ++ ": " ++ tool
+  end
+  if jev_trace_enabled() then print("  [jev] node " ++ node_id ++ " tool " ++ tool ++ ": " ++ truncate_text(output, 200)) end
+  let advanced: GraphState = state with { steps: state.steps + 1, last_output: output, trace: jev_trace_append(state.trace, node_id ++ ":" ++ tool) }
+  let next_id: text = unwrap_or(get(node, "next"), "")
+  if next_id == "" then advanced with { done: true } else advanced with { node_id: next_id } end
+end
+
+function jev_choice_criteria(node: a mapping from text to text): a mapping from text to text
+  intent: build the label to description criteria Jev must choose from, always including the reserved replan escape hatch
+  let options: a mapping from text to text = unwrap_or(get(node, "options"), {})
+  let base: a mapping from text to text = reduce(keys(options), {}, fn(acc: a mapping from text to text, label: text): a mapping from text to text => put(acc, label, unwrap_or(get(get(options, label), "desc"), "")))
+  put(base, "<replan>", "None of the other branches fit what actually happened; regenerate the graph from this point.")
+end
+
+function jev_choice_goto(node: a mapping from text to text, label: text): text
+  intent: resolve the node id a chosen choice-node label advances to, treating the reserved label as a replan request
+  if label == "<replan>" then
+    "replan"
+  else
+    let options: a mapping from text to text = unwrap_or(get(node, "options"), {})
+    unwrap_or(get(unwrap_or(get(options, label), {}), "goto"), "replan")
   end
 end
 
-function run_jev_choice_turn(messages: a list of a mapping from text to text, user_input: text, settings: TurnSettings): InnerLoopResult
-  intent: generate Legible source by repeatedly asking Jev to choose a character or token until completion
-  let mode: text = lowercase(trim(unwrap_or(env_get("LEGIBLE_CODER_JEV_GRANULARITY"), "char")))
-  let selected_mode: text = if mode == "token" then "token" else "char" end
-  let max_steps: integer = resolve_jev_steps()
-  print("  [jev] sequential " ++ selected_mode ++ " generation (max " ++ to_text(max_steps) ++ " choices)")
-  mutable source: text = ""
-  mutable step: integer = 0
-  mutable finished: boolean = false
-  mutable failed: boolean = false
-  while step < max_steps and not finished and not failed do
-    let next: JevStepResult = jev_generation_step(source, user_input, settings, selected_mode)
-    set source = next.source
-    set finished = next.done
-    set failed = next.failed
-    if not finished and not failed then
-      set step = step + 1
-      if step % 20 == 0 then print("  [jev] generated " ++ to_text(step) ++ " items]") end
+function jev_ask_choice(api_key: text, node: a mapping from text to text, state: GraphState, user_input: text): an optional text
+  intent: send one Jev typed-choice request for the current node and return the validated label
+  let criteria: a mapping from text to text = jev_choice_criteria(node)
+  let question_text: text = unwrap_or(get(node, "question"), "Choose the branch that matches what actually happened.")
+  let request: a mapping from text to text = {
+    "model": unwrap_or(env_get("LEGIBLE_CODER_JEV_MODEL"), "jev-latest"),
+    "state": "User request:\n" ++ user_input ++ "\n\nRecent trace:\n" ++ truncate_text(state.trace, 1500) ++ "\n\nMost recent output:\n" ++ truncate_text(state.last_output, 1500),
+    "questions": {"choice": {"type": "choice", "instructions": question_text ++ " Return the choice label exactly; do not explain.", "criteria": criteria}}
+  }
+  let response: a mapping from text to text = http_client_post(jev_base_url(), {"Authorization": "Bearer " ++ api_key, "Content-Type": "application/json"}, json_encode(request))
+  let status: text = get(response, "status")
+  if status != "200" then
+    print("  [jev] API error (" ++ status ++ "): " ++ extract_error_message(get(response, "body")))
+    none
+  else
+    jev_response_choice_named(get(response, "body"), "choice", criteria)
+  end
+end
+
+function jev_run_choice_node(api_key: text, node: a mapping from text to text, node_id: text, state: GraphState, user_input: text): GraphState
+  intent: ask Jev to pick a branch at a choice node and advance, routing the reserved label or a goto of replan through the planner
+  let picked: an optional text = jev_ask_choice(api_key, node, state, user_input)
+  if is_none(picked) then
+    state with { failed: true, last_output: "Jev did not return a valid choice at node " ++ node_id ++ "." }
+  else
+    let label: text = unwrap(picked)
+    if jev_trace_enabled() then print("  [jev] node " ++ node_id ++ " choice: " ++ label) end
+    let goto: text = jev_choice_goto(node, label)
+    let advanced: GraphState = state with { steps: state.steps + 1, trace: jev_trace_append(state.trace, node_id ++ ":choice:" ++ label) }
+    if goto == "replan" then
+      jev_apply_replan(advanced, user_input, "node " ++ node_id ++ " chose \"" ++ label ++ "\" (this branch calls for replanning)")
+    else if goto == "" then
+      advanced with { done: true }
+    else
+      advanced with { node_id: goto }
     end
   end
-  finish_jev_choice_turn(messages, source, failed, finished, step, settings)
+end
+
+function jev_check_next(state: GraphState, user_input: text): GraphState
+  intent: replan when a tool node advanced to a node id that is missing from the graph
+  if state.done or state.failed then
+    state
+  else if has_key(unwrap_or(get(state.graph, "nodes"), {}), state.node_id) then
+    state
+  else
+    jev_apply_replan(state, user_input, "node \"" ++ state.node_id ++ "\" referenced by \"next\" does not exist in the graph")
+  end
+end
+
+function jev_advance_node(api_key: text, state: GraphState, user_input: text): GraphState
+  intent: execute the current node and route to whichever node, replan, or completion it advances to
+  let nodes: a mapping from text to text = unwrap_or(get(state.graph, "nodes"), {})
+  if not has_key(nodes, state.node_id) then
+    jev_apply_replan(state, user_input, "node \"" ++ state.node_id ++ "\" does not exist in the graph")
+  else
+    let node: a mapping from text to text = get(nodes, state.node_id)
+    let kind: text = unwrap_or(get(node, "kind"), "")
+    let node_id: text = state.node_id
+    if kind == "tool" then
+      jev_check_next(jev_run_tool_node(node, node_id, state), user_input)
+    else if kind == "choice" then
+      jev_run_choice_node(api_key, node, node_id, state, user_input)
+    else
+      state with { failed: true, last_output: "[jev] unknown node kind \"" ++ kind ++ "\" at " ++ node_id ++ "." }
+    end
+  end
+end
+
+function jev_graph_loop_complete(state: GraphState, max_nodes: integer): boolean
+  intent: report whether graph traversal reached a terminal state or its node budget
+  state.steps >= max_nodes or state.done or state.failed
+end
+
+function jev_graph_loop_step(state: GraphState, api_key: text, user_input: text): GraphState
+  intent: advance one graph node and periodically report progress
+  let advanced: GraphState = jev_advance_node(api_key, state, user_input)
+  if advanced.steps > state.steps and advanced.steps % 10 == 0 then print("  [jev] executed " ++ to_text(advanced.steps) ++ " graph nodes") end
+  advanced
+end
+
+function finish_jev_graph_turn(messages: a list of a mapping from text to text, state: GraphState, settings: TurnSettings): InnerLoopResult
+  intent: print the final graph-turn output and append it as the assistant reply, or leave the transcript unchanged on total failure
+  if state.failed and text_length(trim(state.last_output)) == 0 then
+    InnerLoopResult {messages: messages, used_model: false, context_budget: settings.context_budget, prompt_tokens: 0, completion_tokens: state.steps}
+  else
+    let summary: text = if text_length(trim(state.last_output)) > 0 then trim(state.last_output) else "Done." end
+    print("")
+    print_separator()
+    print(summary)
+    print_separator()
+    print("")
+    web_event_emit({"type": "final", "text": summary})
+    InnerLoopResult {messages: append(messages, {"role": "assistant", "content": summary}), used_model: not state.failed, context_budget: settings.context_budget, prompt_tokens: 0, completion_tokens: state.steps}
+  end
+end
+
+function run_jev_graph_turn(messages: a list of a mapping from text to text, user_input: text, settings: TurnSettings): InnerLoopResult
+  intent: draft a Jev decision graph once, then let Jev traverse and replan it until the turn completes
+  let max_nodes: integer = resolve_jev_max_nodes()
+  print("  [jev] drafting decision graph (max " ++ to_text(max_nodes) ++ " nodes, " ++ to_text(resolve_jev_max_replans()) ++ " replans)")
+  let graph: a mapping from text to text = jev_generate_graph(user_input, "")
+  if not has_key(graph, "start") then
+    finish_jev_graph_turn(messages, GraphState {graph: {}, node_id: "", last_output: "[jev] the planner failed to produce a usable decision graph.", trace: "", steps: 0, replans: 0, done: false, failed: true}, settings)
+  else
+    mutable state: GraphState = GraphState {graph: graph, node_id: get(graph, "start"), last_output: "", trace: "", steps: 0, replans: 0, done: false, failed: false}
+    while not jev_graph_loop_complete(state, max_nodes) do
+      set state = jev_graph_loop_step(state, settings.key, user_input)
+    end
+    finish_jev_graph_turn(messages, state, settings)
+  end
 end
 
 function shell_quote(value: text): text
@@ -2498,7 +2791,7 @@ end
 function attempt_provider(state: FallbackState, prov: a mapping from text to text, settings: TurnSettings, start: integer, user_input: text): FallbackState
   intent: run the turn on one provider when it is reachable and record the resulting messages and whether the model was used
   if provider_is_reachable(get(prov, "url")) then
-    let inner: InnerLoopResult = if provider_tier(get(prov, "url")) == "jev" then run_jev_choice_turn(state.messages, user_input, settings) else run_inner_loop(state.messages, start, settings) end
+    let inner: InnerLoopResult = if provider_tier(get(prov, "url")) == "jev" then run_jev_graph_turn(state.messages, user_input, settings) else run_inner_loop(state.messages, start, settings) end
     state with { messages: inner.messages, last_inner: inner, consecutive_failures: if inner.used_model then 0 else state.consecutive_failures end }
   else
     print("  [unavailable] cannot reach " ++ get(prov, "name"))

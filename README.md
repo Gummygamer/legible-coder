@@ -114,19 +114,18 @@ cd your-project-directory
 legible-coder
 ```
 
-### Experimental Jev choice backend
+### Experimental Jev decision-graph backend
 
-This branch includes an opt-in experiment for [TypeSafe Jev](https://docs.typesafe.ai/). Jev is a typed decision model, not a chat or code-completion model, so legible-coder asks it to choose one item at a time and appends that item to a Legible source buffer. It cannot use the normal file and shell tools in this mode.
+This branch includes an opt-in experiment for [TypeSafe Jev](https://docs.typesafe.ai/). Jev is a typed decision model, not a chat or code-completion model: it can only pick one labeled branch from criteria it is given, never generate free text. So legible-coder splits the turn in two: a real LLM (the "planner", the normal Qwen/Gemini/OrcaRouter/NIM/OpenRouter/Groq chain by default) drafts a small JSON decision graph once, and Jev then traverses that graph, making one typed choice at each branch point. Graph nodes are either `tool` steps (which reuse the normal `read_file`/`write_file`/`shell_exec`/etc. tool implementations, plus a built-in `test_script` step that runs `legible check` and `legible run` against a written file) or `choice` steps where Jev decides which branch to take. Every choice node also carries a reserved `<replan>` branch, so Jev itself can ask the planner to regenerate the graph mid-turn whenever none of the authored options fit what actually happened — this is how the write/test/fix loop recovers from a failed script without the planner having had to anticipate the exact failure.
 
 ```bash
 export TYPESAFE_API_KEY="your-typesafe-key-here"
+export OPENAI_API_KEY="your-qwen-key-here"   # or another provider key for the planner
 export LEGIBLE_CODER_JEV_MODE=1
-export LEGIBLE_CODER_JEV_GRANULARITY=char   # or token
-export LEGIBLE_CODER_JEV_MAX_STEPS=512
 legible-coder
 ```
 
-`char` offers printable characters plus newline and tab. `token` offers a small fixed set of common Legible syntax tokens. The generated source is returned as the assistant response when Jev selects `<done>` or the step limit is reached. This is deliberately a separate experimental backend; unset `LEGIBLE_CODER_JEV_MODE` to use the normal provider chain.
+Set `LEGIBLE_CODER_JEV_PLANNER_URL` and `LEGIBLE_CODER_JEV_PLANNER_MODEL` to point the planner at a specific backend instead of the default fallback chain. Set `LEGIBLE_CODER_JEV_TRACE=1` to print every graph node executed and every choice Jev makes. Write-like requests automatically save to `main.lbl`; set `LEGIBLE_CODER_JEV_OUTPUT=hello.lbl` to choose a path, or include a `.lbl` filename in the request. `LEGIBLE_CODER_JEV_MAX_NODES` bounds total graph nodes executed in one turn (default `40`), and `LEGIBLE_CODER_JEV_MAX_REPLANS` bounds how many times the whole graph may be regenerated (default `3`); `LEGIBLE_CODER_JEV_TEST_TIMEOUT=15` bounds each `test_script` run. The turn's final output is the last tool or test result once the graph reaches an empty `next`/`goto`. This is deliberately a separate experimental backend; unset `LEGIBLE_CODER_JEV_MODE` to use the normal provider chain.
 
 For a local OpenAI-compatible server such as LM Studio:
 
@@ -255,3 +254,8 @@ legible-coder/
 | `LEGIBLE_CODER_CONTEXT_TOKENS` | No | Rough transcript compaction budget. Defaults: `6000` local, `850000` Qwen, `700000` Gemini, and provider-specific limits for other remotes |
 | `LEGIBLE_CODER_CONTEXT_KEEP_MESSAGES` | No | Recent messages preserved verbatim during compaction. Defaults: `8` local, `12` remote |
 | `LEGIBLE_CODER_CONTEXT_COMPACT_AFTER` | No | Minimum estimated transcript tokens before any compression (tool-result masking, vision stripping, summary compaction) runs. Defaults: `100000` Qwen, `0` other providers. Clamped to the context budget |
+| `LEGIBLE_CODER_JEV_PLANNER_URL` | No | OpenAI-compatible base URL for the LLM that drafts/redrafts the Jev decision graph. Defaults to the normal provider fallback chain |
+| `LEGIBLE_CODER_JEV_PLANNER_MODEL` | No | Model name for the Jev planner backend. Defaults to that provider's normal model |
+| `LEGIBLE_CODER_JEV_MAX_NODES` | No | Maximum decision-graph nodes executed in one Jev turn. Default: `40` |
+| `LEGIBLE_CODER_JEV_MAX_REPLANS` | No | Maximum whole-graph regenerations Jev may trigger in one turn. Default: `3` |
+| `LEGIBLE_CODER_JEV_TEST_TIMEOUT` | No | Maximum seconds for one `legible run` test of a written Jev script. Default: `15` |

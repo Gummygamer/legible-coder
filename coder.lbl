@@ -1313,13 +1313,14 @@ function jev_step_summary_line(state: JevState): text
 end
 
 function finish_jev_turn(messages: a list of a mapping from text to text, state: JevState, settings: TurnSettings): InnerLoopResult
-  intent: report the final answer, or a failure/budget explanation with the trailing history, and append it as an assistant message when the turn produced a usable result
+  intent: report the final answer, or a failure/budget explanation with the trailing history, and always append it as an assistant message so the turn ends instead of falling through to provider fallback
   if state.failed then
     let summary: text = "[jev] stopping after repeated bad decisions" ++ (if text_length(state.last_reason) > 0 then ": " ++ state.last_reason else "" end) ++ ".\n\n" ++ truncate_text(state.history, 4000)
     print(jev_step_summary_line(state))
     print("")
     print(summary)
-    InnerLoopResult {messages: messages, used_model: false, context_budget: settings.context_budget, prompt_tokens: 0, completion_tokens: state.steps}
+    web_event_emit({"type": "final", "text": summary})
+    InnerLoopResult {messages: append(messages, {"role": "assistant", "content": summary}), used_model: true, context_budget: settings.context_budget, prompt_tokens: 0, completion_tokens: state.steps}
   else
     let summary: text = if state.done and text_length(trim(state.final_text)) > 0 then
       trim(state.final_text)

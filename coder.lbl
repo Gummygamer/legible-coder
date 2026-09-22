@@ -988,14 +988,20 @@ function jev_planner_reply_text(body: text): text
 end
 
 function jev_request_graph(prov: a mapping from text to text, user_input: text, context: text): text
-  intent: ask the planner backend to draft or replace the Jev decision graph as a single JSON reply
+  intent: ask the planner backend to draft or replace the Jev decision graph as a single JSON reply, retrying once on a transport-level failure
   let context_block: text = if text_length(context) > 0 then "\n\n" ++ context else "" end
   let messages: a list of a mapping from text to text = [
     {"role": "system", "content": jev_graph_system_prompt()},
     {"role": "user", "content": "User request:\n" ++ user_input ++ context_block}
   ]
-  let request: a mapping from text to text = build_request(get(prov, "full"), messages, true, false, false, 8000, false)
-  let response: a mapping from text to text = call_api(get(prov, "key"), get(prov, "url"), request)
+  let request: a mapping from text to text = build_request(get(prov, "full"), messages, true, false, false, 6000, false)
+  let first: a mapping from text to text = call_api(get(prov, "key"), get(prov, "url"), request)
+  let response: a mapping from text to text = if get(first, "status") == "000" then
+    print("  [jev] planner request failed (" ++ extract_error_message(get(first, "body")) ++ "); retrying once")
+    call_api(get(prov, "key"), get(prov, "url"), request)
+  else
+    first
+  end
   let status: text = get(response, "status")
   if status != "200" then
     print("  [jev] planner API error (" ++ status ++ "): " ++ extract_error_message(get(response, "body")))
@@ -1040,6 +1046,8 @@ record GraphState
   node_id: text
   last_output: text
   trace: text
+  gathered: text
+  recon_passes: integer
   steps: integer
   replans: integer
   node_budget: integer
@@ -1122,6 +1130,43 @@ function jev_trace_append(trace: text, entry: text): text
   if total > 2000 then "(earlier steps trimmed) ... " ++ substring(combined, total - 2000, 2000) else combined end
 end
 
+function jev_gathered_append(gathered: text, entry: text): text
+  intent: combine gathered with entry and keep only the most recent 6000 characters of combined gathered tool output, trimming earlier output when it grows too long
+  let combined: text = gathered ++ (if text_length(gathered) > 0 then "\n\n---\n\n" else "" end) ++ entry
+  let total: integer = text_length(combined)
+  if total > 6000 then "(earlier gathered output trimmed) ... " ++ substring(combined, total - 6000, 6000) else combined end
+end
+
+function jev_mutating_tool(tool: text): boolean
+  intent: check whether tool equals write_file or edit_file, the two tools that actually change a file
+  tool == "write_file" or tool == "edit_file"
+end
+
+function jev_graph_has_mutation(graph: a mapping from text to text): boolean
+  intent: reduce over the graph nodes, keyed by id, checking with jev_mutating_tool whether any node tool is write_file or edit_file
+  let nodes: a mapping from text to text = unwrap_or(get(graph, "nodes"), {})
+  reduce(keys(nodes), false, fn(acc: boolean, id: text): boolean => acc or jev_mutating_tool(unwrap_or(get(get(nodes, id), "tool"), "")))
+end
+
+function jev_graph_node_summary(nodes: a mapping from text to text, id: text): text
+  intent: describe one graph node compactly as id, kind, and detail for a replan prompt that should not repeat the same plan
+  let node: a mapping from text to text = get(nodes, id)
+  let kind: text = unwrap_or(get(node, "kind"), "?")
+  let detail: text = if kind == "tool" then unwrap_or(get(node, "tool"), "?") else unwrap_or(get(node, "question"), "?") end
+  id ++ ":" ++ kind ++ ":" ++ truncate_text(detail, 40)
+end
+
+function jev_graph_summary(graph: a mapping from text to text): text
+  intent: join the graph node keys, each summarized by jev_graph_node_summary, with a semicolon separator, or none when the nodes mapping is empty
+  let nodes: a mapping from text to text = unwrap_or(get(graph, "nodes"), {})
+  if length(keys(nodes)) == 0 then "(none)" else join(map(keys(nodes), fn(id: text): text => jev_graph_node_summary(nodes, id)), "; ") end
+end
+
+function jev_recon_pass_cap(): integer
+  intent: return 2, the cap on consecutive reconnaissance-only graphs the planner may draft in one turn before Jev forces concrete edits
+  2
+end
+
 function jev_budget_line(state: GraphState): text
   intent: state how much of the node and replan budget is left so the planner and Jev can both condition on it
   "Budget: " ++ to_text(state.steps) ++ " of " ++ to_text(state.node_budget) ++ " graph nodes executed, " ++
@@ -1134,27 +1179,48 @@ function jev_grow_budgets(state: GraphState, graph: a mapping from text to text)
   state with { node_budget: nodes, replan_budget: max(state.replan_budget, resolve_jev_max_replans(graph)) }
 end
 
-function jev_replan_context(user_input: text, state: GraphState, reason: text): text
-  intent: summarize the executed trace and last tool output so the planner can regenerate the graph in place
+function jev_replan_context(user_input: text, state: GraphState, reason: text, next_recon_passes: integer): text
+  intent: summarize the previous graph, executed trace, and any gathered tool output so the planner regenerates a graph that makes real progress instead of repeating a prior reconnaissance-only pass
+  let gather_block: text = if text_length(trim(state.gathered)) > 0 then
+    "Already gathered this turn (do not re-run these reads/greps; use this content directly):\n" ++ state.gathered ++ "\n\n"
+  else
+    ""
+  end
+  let force_edit_line: text = if next_recon_passes >= jev_recon_pass_cap() then
+    "Reconnaissance is over: this would be gather-only pass " ++ to_text(next_recon_passes) ++ " of the " ++ to_text(jev_recon_pass_cap()) ++ " allowed this turn. You already have the gathered content above. Draft concrete write_file/edit_file nodes now, with old_string copied verbatim from that gathered content — a graph whose only path is a choice node routing to replan will be rejected.\n\n"
+  else if text_length(trim(state.gathered)) > 0 then
+    "You already gathered real content above; prefer drafting concrete edit_file/write_file nodes from it now rather than another reconnaissance-only graph.\n\n"
+  else
+    ""
+  end
   "The previous decision graph needs to change. Reason: " ++ reason ++ "\n\n" ++
   jev_budget_line(state) ++ " Draft a graph that finishes within it.\n\n" ++
+  "Previous graph's nodes (do not redraft this same plan):\n" ++ jev_graph_summary(state.graph) ++ "\n\n" ++
   "Executed so far:\n" ++ state.trace ++ "\n\n" ++
+  gather_block ++
+  force_edit_line ++
   "Most recent tool or test output:\n" ++ truncate_text(state.last_output, 8000) ++ "\n\n" ++
   "Produce a full replacement graph (a fresh \"start\" and \"nodes\") that continues correctly from here for the original request."
 end
 
 function jev_apply_replan(state: GraphState, user_input: text, reason: text): GraphState
-  intent: regenerate the whole graph in place, bounded by the replan budget, whether Jev or a malformed goto asked for it
+  intent: regenerate the whole graph in place, bounded by the replan budget and by a separate cap on consecutive reconnaissance-only graphs, whether Jev or a malformed goto asked for it
   if state.replans >= state.replan_budget then
     state with { failed: true, last_output: "[jev] replan limit reached; stopping.\n" ++ state.last_output }
   else
-    print("  [jev] replanning (" ++ to_text(state.replans + 1) ++ "): " ++ reason)
-    let context: text = jev_replan_context(user_input, state, reason)
-    let graph: a mapping from text to text = jev_generate_graph(user_input, context)
-    if not has_key(graph, "start") then
-      state with { failed: true, last_output: "[jev] planner failed to produce a replacement graph." }
+    let was_recon_only: boolean = not jev_graph_has_mutation(state.graph)
+    let next_recon_passes: integer = if was_recon_only then state.recon_passes + 1 else 0 end
+    if was_recon_only and next_recon_passes > jev_recon_pass_cap() then
+      state with { failed: true, last_output: "[jev] planner kept drafting reconnaissance-only graphs without proposing edits; stopping after " ++ to_text(jev_recon_pass_cap()) ++ " gather passes.\n\nGathered:\n" ++ state.gathered }
     else
-      jev_grow_budgets(state, graph) with { graph: graph, node_id: get(graph, "start"), replans: state.replans + 1, trace: jev_trace_append(state.trace, "replan: " ++ reason) }
+      print("  [jev] replanning (" ++ to_text(state.replans + 1) ++ "): " ++ reason)
+      let context: text = jev_replan_context(user_input, state, reason, next_recon_passes)
+      let graph: a mapping from text to text = jev_generate_graph(user_input, context)
+      if not has_key(graph, "start") then
+        state with { failed: true, last_output: "[jev] planner failed to produce a replacement graph." }
+      else
+        jev_grow_budgets(state, graph) with { graph: graph, node_id: get(graph, "start"), replans: state.replans + 1, recon_passes: next_recon_passes, trace: jev_trace_append(state.trace, "replan: " ++ reason) }
+      end
     end
   end
 end
@@ -1171,7 +1237,7 @@ function jev_run_tool_node(node: a mapping from text to text, node_id: text, sta
     "[jev] unknown tool in graph node " ++ node_id ++ ": " ++ tool
   end
   if jev_trace_enabled() then print("  [jev] node " ++ node_id ++ " tool " ++ tool ++ ": " ++ truncate_text(output, 200)) end
-  let advanced: GraphState = state with { steps: state.steps + 1, last_output: output, trace: jev_trace_append(state.trace, node_id ++ ":" ++ tool) }
+  let advanced: GraphState = state with { steps: state.steps + 1, last_output: output, trace: jev_trace_append(state.trace, node_id ++ ":" ++ tool), gathered: jev_gathered_append(state.gathered, "[" ++ tool ++ " @ " ++ node_id ++ "]\n" ++ output) }
   let next_id: text = unwrap_or(get(node, "next"), "")
   if next_id == "" then advanced with { done: true } else advanced with { node_id: next_id } end
 end
@@ -1194,7 +1260,7 @@ function jev_choice_goto(node: a mapping from text to text, label: text): text
 end
 
 function jev_ask_choice(api_key: text, node: a mapping from text to text, state: GraphState, user_input: text): an optional text
-  intent: send one Jev typed-choice request for the current node and return the validated label
+  intent: send one Jev typed-choice request for the current node and return the validated label, retrying once on a transport-level failure
   let criteria: a mapping from text to text = jev_choice_criteria(node)
   let question_text: text = unwrap_or(get(node, "question"), "Choose the branch that matches what actually happened.")
   let request: a mapping from text to text = {
@@ -1202,7 +1268,14 @@ function jev_ask_choice(api_key: text, node: a mapping from text to text, state:
     "state": "User request:\n" ++ user_input ++ "\n\n" ++ jev_budget_line(state) ++ "\n\nRecent trace:\n" ++ truncate_text(state.trace, 1500) ++ "\n\nMost recent output:\n" ++ truncate_text(state.last_output, 1500),
     "questions": {"choice": {"type": "choice", "instructions": question_text ++ " Return the choice label exactly; do not explain.", "criteria": criteria}}
   }
-  let response: a mapping from text to text = http_client_post(jev_base_url(), {"Authorization": "Bearer " ++ api_key, "Content-Type": "application/json"}, json_encode(request))
+  let headers: a mapping from text to text = {"Authorization": "Bearer " ++ api_key, "Content-Type": "application/json"}
+  let first: a mapping from text to text = http_client_post(jev_base_url(), headers, json_encode(request))
+  let response: a mapping from text to text = if get(first, "status") == "000" then
+    print("  [jev] choice request failed (" ++ extract_error_message(get(first, "body")) ++ "); retrying once")
+    http_client_post(jev_base_url(), headers, json_encode(request))
+  else
+    first
+  end
   let status: text = get(response, "status")
   if status != "200" then
     print("  [jev] API error (" ++ status ++ "): " ++ extract_error_message(get(response, "body")))
@@ -1295,12 +1368,12 @@ function run_jev_graph_turn(messages: a list of a mapping from text to text, use
   print("  [jev] drafting decision graph")
   let graph: a mapping from text to text = jev_generate_graph(user_input, "")
   if not has_key(graph, "start") then
-    finish_jev_graph_turn(messages, GraphState {graph: {}, node_id: "", last_output: "[jev] the planner failed to produce a usable decision graph.", trace: "", steps: 0, replans: 0, node_budget: 0, replan_budget: 0, done: false, failed: true}, settings)
+    finish_jev_graph_turn(messages, GraphState {graph: {}, node_id: "", last_output: "[jev] the planner failed to produce a usable decision graph.", trace: "", gathered: "", recon_passes: 0, steps: 0, replans: 0, node_budget: 0, replan_budget: 0, done: false, failed: true}, settings)
   else
     let max_nodes: integer = resolve_jev_max_nodes(graph, 0)
     let max_replans: integer = resolve_jev_max_replans(graph)
     print("  [jev] " ++ to_text(jev_graph_node_count(graph)) ++ "-node graph, budget " ++ to_text(max_nodes) ++ " nodes and " ++ to_text(max_replans) ++ " replans")
-    mutable state: GraphState = GraphState {graph: graph, node_id: get(graph, "start"), last_output: "", trace: "", steps: 0, replans: 0, node_budget: max_nodes, replan_budget: max_replans, done: false, failed: false}
+    mutable state: GraphState = GraphState {graph: graph, node_id: get(graph, "start"), last_output: "", trace: "", gathered: "", recon_passes: 0, steps: 0, replans: 0, node_budget: max_nodes, replan_budget: max_replans, done: false, failed: false}
     while not jev_graph_loop_complete(state) do
       set state = jev_graph_loop_step(state, settings.key, user_input)
     end

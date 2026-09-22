@@ -38,16 +38,17 @@ function make_tool(name: text, description: text, param_names: a list of text, p
 end
 
 function file_tools(include_dir_tools: boolean): a list of a mapping from text to text
-  intent: build file read write schemas and optionally add directory listing tools
+  intent: build file read, write, and targeted-edit schemas and optionally add directory listing tools
   let read_tool: a mapping from text to text = make_tool("read_file", "Read the contents of a file at the given path.", ["path"], ["The file path to read"], ["path"])
   let lines_tool: a mapping from text to text = make_tool("read_file_lines", "Read only part of a file using 1-based start_line and line_count.", ["path", "start_line", "line_count"], ["The file path to read", "The first 1-based line number to include", "The number of lines to include"], ["path", "start_line", "line_count"])
   let write_tool: a mapping from text to text = make_tool("write_file", "Write content to a file at the given path. Creates or overwrites.", ["path", "content"], ["The file path to write", "The content to write"], ["path", "content"])
+  let edit_tool: a mapping from text to text = make_tool("edit_file", "Replace one exact, unique occurrence of old_string with new_string in an existing file. old_string must match the file's current content exactly (including whitespace) and appear exactly once; include enough surrounding context to make it unique. Prefer this over write_file when changing one or a few specific spots in a file, especially a large one, since it never requires reproducing the whole file.", ["path", "old_string", "new_string"], ["The file path to edit", "The exact, unique existing text to replace", "The text to replace it with"], ["path", "old_string", "new_string"])
   if include_dir_tools then
     let list_tool: a mapping from text to text = make_tool("list_dir", "List files and directories at a given path (one level only).", ["path"], ["The directory path to list"], ["path"])
     let recursive_tool: a mapping from text to text = make_tool("read_dir_recursive", "Recursively list all files under a directory. Use this instead of repeated list_dir calls to understand the project structure.", ["path"], ["The root directory to list recursively"], ["path"])
-    [read_tool, lines_tool, write_tool, list_tool, recursive_tool]
+    [read_tool, lines_tool, write_tool, edit_tool, list_tool, recursive_tool]
   else
-    [read_tool, lines_tool, write_tool]
+    [read_tool, lines_tool, write_tool, edit_tool]
   end
 end
 
@@ -93,14 +94,14 @@ end
 function is_known_tool(name: text): boolean
   intent: compare the cleaned name to the supported tool names
   let n: text = clean_tool_name(name)
-  n == "read_file" or n == "read_file_lines" or n == "write_file" or n == "shell_exec" or
+  n == "read_file" or n == "read_file_lines" or n == "write_file" or n == "edit_file" or n == "shell_exec" or
   n == "list_dir" or n == "read_dir_recursive" or n == "grep" or n == "take_screenshot" or n == "web_search"
 end
 
 function is_local_known_tool(name: text): boolean
   intent: compare the cleaned name to the local manual-tool names that exclude full-file reads
   let n: text = clean_tool_name(name)
-  n == "read_file_lines" or n == "write_file" or n == "shell_exec" or
+  n == "read_file_lines" or n == "write_file" or n == "edit_file" or n == "shell_exec" or
   n == "list_dir" or n == "read_dir_recursive" or n == "grep" or n == "take_screenshot" or n == "web_search"
 end
 
@@ -197,7 +198,7 @@ end
 function describe_tool_call(name: text, arguments: text): text
   intent: format name with its path, command, or pattern argument as a short label
   let args: a mapping from text to text = json_parse(arguments)
-  if name == "read_file" or name == "list_dir" or name == "read_dir_recursive" or name == "write_file" then
+  if name == "read_file" or name == "list_dir" or name == "read_dir_recursive" or name == "write_file" or name == "edit_file" then
     name ++ "  " ++ unwrap_or(get(args, "path"), "")
   else if name == "read_file_lines" then
     describe_line_slice(name, args)
@@ -270,6 +271,42 @@ function exec_write_file(args: a mapping from text to text): text
     "File written successfully: " ++ path
   else
     "File written: " ++ path ++ "\nWARNING: legible check found errors in the file you just wrote:\n" ++ check_report ++ "\nFix these errors and call write_file again with corrected code."
+  end
+end
+
+function exec_edit_file(args: a mapping from text to text): text
+  intent: replace exactly one occurrence of old_string with new_string in path, print a diff, and run legible_check_report on .lbl files
+  let path: text = get(args, "path")
+  let old_string: text = get(args, "old_string")
+  let new_string: text = get(args, "new_string")
+  if not file_exists(path) then
+    "Error: file not found: " ++ path
+  else if text_length(old_string) == 0 then
+    "Error: old_string must not be empty."
+  else
+    let old_content: text = read_file(path)
+    let parts: a list of text = split(old_content, old_string)
+    let occurrences: integer = length(parts) - 1
+    if occurrences == 0 then
+      "Error: old_string was not found in " ++ path ++ ". It must match the file's current content exactly, including whitespace."
+    else if occurrences > 1 then
+      "Error: old_string appears " ++ to_text(occurrences) ++ " times in " ++ path ++ "; it must match exactly one location. Include more surrounding context to make it unique."
+    else
+      let content: text = join(parts, new_string)
+      write_file("/tmp/legible_coder_old", old_content)
+      write_file(path, content)
+      let diff_output: text = get(shell_exec("diff -u /tmp/legible_coder_old " ++ path ++ " 2>&1 | head -120"), "stdout")
+      if text_length(diff_output) > 0 then
+        print("")
+        print(diff_output)
+      end
+      let check_report: text = legible_check_report(path)
+      if text_length(check_report) == 0 then
+        "File edited successfully: " ++ path
+      else
+        "File edited: " ++ path ++ "\nWARNING: legible check found errors in the file you just edited:\n" ++ check_report ++ "\nFix these errors, e.g. with another edit_file call."
+      end
+    end
   end
 end
 
@@ -464,21 +501,33 @@ function exec_read_dir_recursive(args: a mapping from text to text): text
   get(shell_exec("find " ++ get(args, "path") ++ " -type f | sort 2>&1 | head -200"), "stdout")
 end
 
-function execute_tool(name: text, arguments: text): text
-  intent: parse arguments and dispatch to the supported tool implementations
-  let args: a mapping from text to text = json_parse(arguments)
+function execute_file_tool(name: text, args: a mapping from text to text): an optional text
+  intent: for read_file, read_file_lines, write_file, edit_file, list_dir, or read_dir_recursive call the matching exec_ function on args and return its result, otherwise return none
   if name == "read_file" then
     exec_read_file(args)
   else if name == "read_file_lines" then
     exec_read_file_lines(args)
   else if name == "write_file" then
     exec_write_file(args)
-  else if name == "shell_exec" then
-    exec_shell(args)
+  else if name == "edit_file" then
+    exec_edit_file(args)
   else if name == "list_dir" then
     exec_list_dir(args)
   else if name == "read_dir_recursive" then
     exec_read_dir_recursive(args)
+  else
+    none
+  end
+end
+
+function execute_tool(name: text, arguments: text): text
+  intent: parse arguments and dispatch to the supported tool implementations
+  let args: a mapping from text to text = json_parse(arguments)
+  let file_result: an optional text = execute_file_tool(name, args)
+  if is_some(file_result) then
+    unwrap(file_result)
+  else if name == "shell_exec" then
+    exec_shell(args)
   else if name == "grep" then
     exec_grep(args)
   else if name == "take_screenshot" then
@@ -899,7 +948,7 @@ end
 
 function jev_planner_tool_names(): text
   intent: list the tool node names the planner may reference besides the built-in test_script check
-  "read_file, read_file_lines, write_file, shell_exec, list_dir, read_dir_recursive, grep, web_search, and test_script (checks and runs a written .lbl file at args.path)"
+  "read_file, read_file_lines, write_file, edit_file, shell_exec, list_dir, read_dir_recursive, grep, web_search, and test_script (checks and runs a written .lbl file at args.path)"
 end
 
 function jev_graph_system_prompt(): text
@@ -913,6 +962,7 @@ function jev_graph_system_prompt(): text
   "Jev is a typed decision model: at a choice node it can only pick one of the labeled options you provide, never free text. Label every option in <angle-bracket> form, e.g. <pass>, <fix>. Jev always also has a reserved <replan> option that regenerates the whole graph from that point, so never author an option literally named <replan> yourself.\n" ++
   "An empty \"next\" or \"goto\" (\"\") ends the turn successfully right there.\n" ++
   "For any task that writes a Legible (.lbl) file: follow the write_file node with a test_script node on the same path, then a choice node whose branches include one that goes back to a corrected write_file (or to \"goto\":\"replan\") when the test report shows an error, and one that ends the turn when it passes.\n" ++
+  "For a task that changes one or a few specific spots in an existing file (fixing a handful of named issues, renaming something, correcting specific lines), use edit_file, not write_file: write_file requires you to know and restate the file's entire contents at plan time, which you usually cannot do for a file you have not fully read, and is wasteful and error-prone for a large file. edit_file args are \{\"path\":..., \"old_string\":..., \"new_string\":...\}; old_string must be copied verbatim from a read_file, read_file_lines, or grep node you already planned earlier in the graph (never guessed or paraphrased), and must be unique in the file — include a line or two of surrounding context if the exact text could appear more than once. Give each distinct fix its own edit_file node with its own literal old_string and new_string drawn from that fix's specific location; never rely on a single shell_exec script that pattern-matches or keyword-matches several locations at once and applies the same replacement text to all of them, since two unrelated spots can share the same keywords and a shared replacement is almost always wrong for at least one of them.\n" ++
   "Every node id referenced by \"start\", \"next\", or \"goto\" must exist in \"nodes\", except \"\" (end) and the reserved \"replan\".\n\n"
 end
 
@@ -2331,7 +2381,7 @@ function finish_inner_loop(msgs: a list of a mapping from text to text, messages
 end
 
 function last_message_is_assistant_text(msgs: a list of a mapping from text to text): boolean
-  intent: get the last_msg from msgs and check its role is assistant and the text_length of its content is greater than 0
+  intent: return true if the last message role is assistant and its content is non-empty text
   if length(msgs) == 0 then
     false
   else

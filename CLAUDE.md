@@ -35,6 +35,7 @@ The model has access to these tools:
 - `read_file` — read a file's contents
 - `read_file_lines` — read a fixed 40-line slice with line numbers
 - `write_file` — write content to a file
+- `edit_file` — replace one exact, unique `old_string` occurrence in an existing file with `new_string`, without reproducing the whole file
 - `shell_exec` — run a shell command
 - `list_dir` — list directory contents
 - `read_dir_recursive` — recursively list files (via `find`)
@@ -44,7 +45,16 @@ The model has access to these tools:
 `write_file` strips a wrapping markdown code fence from the content (some
 models, notably on NIM, wrap file content in ``` fences) and runs
 `legible check` on written `.lbl` files, feeding any errors back to the model
-in the tool result so it can immediately rewrite the file.
+in the tool result so it can immediately rewrite the file. `edit_file` rejects
+the call (rather than editing) when `old_string` is missing or matches more
+than once, and also runs `legible check` on written `.lbl` files the same way.
+The Jev graph planner's tool list mirrors this set (see `jev_planner_tool_names`
+and `jev_graph_system_prompt` in `coder.lbl`); its system prompt tells the
+planner to use `edit_file` — one node per distinct fix, with `old_string`
+copied verbatim from a prior `read_file`/`read_file_lines`/`grep` node — for
+tasks that touch a handful of specific spots in an existing file, instead of
+`write_file` (which requires restating the whole file) or a `shell_exec`
+script that pattern-matches multiple locations with one replacement.
 
 Local endpoints default to the manual `TOOL name JSON_arguments` protocol unless
 the model name looks like Gemma 4 or `LEGIBLE_CODER_LOCAL_TOOLS=1` is set. Set

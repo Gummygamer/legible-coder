@@ -292,31 +292,37 @@ end
 
 function exec_write_file(args: a mapping from text to text): text
   intent: write content to path, print a best-effort diff if the file existed, and run legible_check_report on .lbl files
-  let path: text = get(args, "path")
-  let content: text = strip_code_fences(get(args, "content"))
-  -- ensure the parent directory exists so writes to new subdirs don't fail
-  let ignored: a mapping from text to text = shell_exec("mkdir -p \"$(dirname \"" ++ path ++ "\")\"")
-  if file_exists(path) then
-    let old_content: text = read_file(path)
-    write_file(path, content)
-    print_file_diff(old_content, path)
+  let path: text = unwrap_or(get(args, "path"), "")
+  let content: text = strip_code_fences(unwrap_or(get(args, "content"), ""))
+  if text_length(path) == 0 then
+    "Error: missing required argument \"path\"."
   else
-    write_file(path, content)
-  end
-  let check_report: text = legible_check_report(path)
-  if text_length(check_report) == 0 then
-    "File written successfully: " ++ path
-  else
-    "File written: " ++ path ++ "\nWARNING: legible check found errors in the file you just wrote:\n" ++ check_report ++ "\nFix these errors and call write_file again with corrected code."
+    -- ensure the parent directory exists so writes to new subdirs don't fail
+    let ignored: a mapping from text to text = shell_exec("mkdir -p \"$(dirname \"" ++ path ++ "\")\"")
+    if file_exists(path) then
+      let old_content: text = read_file(path)
+      write_file(path, content)
+      print_file_diff(old_content, path)
+    else
+      write_file(path, content)
+    end
+    let check_report: text = legible_check_report(path)
+    if text_length(check_report) == 0 then
+      "File written successfully: " ++ path
+    else
+      "File written: " ++ path ++ "\nWARNING: legible check found errors in the file you just wrote:\n" ++ check_report ++ "\nFix these errors and call write_file again with corrected code."
+    end
   end
 end
 
 function exec_edit_file(args: a mapping from text to text): text
   intent: replace exactly one occurrence of old_string with new_string in path, print a best-effort diff, and run legible_check_report on .lbl files
-  let path: text = get(args, "path")
-  let old_string: text = get(args, "old_string")
-  let new_string: text = get(args, "new_string")
-  if not file_exists(path) then
+  let path: text = unwrap_or(get(args, "path"), "")
+  let old_string: text = unwrap_or(get(args, "old_string"), "")
+  let new_string: text = unwrap_or(get(args, "new_string"), "")
+  if text_length(path) == 0 then
+    "Error: missing required argument \"path\"."
+  else if not file_exists(path) then
     "Error: file not found: " ++ path
   else if text_length(old_string) == 0 then
     "Error: old_string must not be empty."
@@ -344,24 +350,33 @@ end
 
 function exec_shell(args: a mapping from text to text): text
   intent: run the command and return exit_code, stdout, and stderr as text
-  let result: a mapping from text to text = shell_exec(strip_redundant_cd(get(args, "command")))
-  let base: text = "exit_code: " ++ to_text(get(result, "exit_code"))
-  let with_out: text = if text_length(get(result, "stdout")) > 0 then base ++ "\nstdout:\n" ++ get(result, "stdout") else base end
-  if text_length(get(result, "stderr")) > 0 then with_out ++ "\nstderr:\n" ++ get(result, "stderr") else with_out end
+  let command: text = unwrap_or(get(args, "command"), "")
+  if text_length(command) == 0 then
+    "Error: missing required argument \"command\"."
+  else
+    let result: a mapping from text to text = shell_exec(strip_redundant_cd(command))
+    let base: text = "exit_code: " ++ to_text(get(result, "exit_code"))
+    let with_out: text = if text_length(get(result, "stdout")) > 0 then base ++ "\nstdout:\n" ++ get(result, "stdout") else base end
+    if text_length(get(result, "stderr")) > 0 then with_out ++ "\nstderr:\n" ++ get(result, "stderr") else with_out end
+  end
 end
 
 function exec_grep(args: a mapping from text to text): text
   intent: run grep with pattern, path, and optional glob and return matching lines
-  let pattern: text = get(args, "pattern")
+  let pattern: text = unwrap_or(get(args, "pattern"), "")
   let path: text = unwrap_or(get(args, "path"), ".")
   let glob_pattern: text = unwrap_or(get(args, "glob"), "")
-  let cmd: text = if text_length(glob_pattern) > 0 then
-    "grep -rn --include='" ++ glob_pattern ++ "' '" ++ pattern ++ "' " ++ path ++ " 2>&1 | head -50"
+  if text_length(pattern) == 0 then
+    "Error: missing required argument \"pattern\"."
   else
-    "grep -rn '" ++ pattern ++ "' " ++ path ++ " 2>&1 | head -50"
+    let cmd: text = if text_length(glob_pattern) > 0 then
+      "grep -rn --include='" ++ glob_pattern ++ "' '" ++ pattern ++ "' " ++ path ++ " 2>&1 | head -50"
+    else
+      "grep -rn '" ++ pattern ++ "' " ++ path ++ " 2>&1 | head -50"
+    end
+    let stdout: text = get(shell_exec(cmd), "stdout")
+    if text_length(stdout) > 0 then stdout else "No matches found." end
   end
-  let stdout: text = get(shell_exec(cmd), "stdout")
-  if text_length(stdout) > 0 then stdout else "No matches found." end
 end
 
 function web_search_encode(query: text): text
@@ -443,8 +458,10 @@ end
 
 function exec_read_file_lines(args: a mapping from text to text): text
   intent: read one file slice using a 1-based start line and line count
-  let path: text = get(args, "path")
-  if not file_exists(path) then
+  let path: text = unwrap_or(get(args, "path"), "")
+  if text_length(path) == 0 then
+    "Error: missing required argument \"path\"."
+  else if not file_exists(path) then
     "Error: file not found: " ++ path
   else
     let start_line: integer = max(unwrap_or(to_integer(unwrap_or(get(args, "start_line"), "1")), 1), 1)
@@ -518,8 +535,8 @@ end
 
 function exec_read_file(args: a mapping from text to text): text
   intent: read the file at the path argument or report that it was not found
-  let path: text = get(args, "path")
-  if file_exists(path) then read_file(path) else "Error: file not found: " ++ path end
+  let path: text = unwrap_or(get(args, "path"), "")
+  if text_length(path) == 0 then "Error: missing required argument \"path\"." else if file_exists(path) then read_file(path) else "Error: file not found: " ++ path end
 end
 
 function exec_list_dir(args: a mapping from text to text): text
@@ -921,7 +938,7 @@ function jev_actor_model(): text
 end
 
 function jev_base_url(): text
-  intent: return the TypeSafe System One endpoint Jev mode uses for its typed good/bad judge choice, allowing a local test endpoint override
+  intent: unwrap_or env_get LEGIBLE_CODER_JEV_URL, defaulting to https://api.typesafe.ai/v1/systemone
   unwrap_or(env_get("LEGIBLE_CODER_JEV_URL"), "https://api.typesafe.ai/v1/systemone")
 end
 
@@ -1045,7 +1062,7 @@ function jev_tool_arg_spec(): text
 end
 
 function jev_chain_tool_names(): text
-  intent: return the fixed text listing the read-only and shell tools a non-contingent chain may use
+  intent: return the fixed text "read_file, read_file_lines, list_dir, read_dir_recursive, grep, web_search, and shell_exec"
   "read_file, read_file_lines, list_dir, read_dir_recursive, grep, web_search, and shell_exec"
 end
 
@@ -1060,7 +1077,7 @@ function jev_chain_system_prompt(): text
 end
 
 function jev_chain_safe_tool(tool: text): boolean
-  intent: confirm a chain step only uses a read-only or shell tool, never write_file or edit_file
+  intent: compare tool against read_file, read_file_lines, list_dir, read_dir_recursive, grep, web_search, and shell_exec, returning true only on a match
   tool == "read_file" or tool == "read_file_lines" or tool == "list_dir" or tool == "read_dir_recursive" or tool == "grep" or tool == "web_search" or tool == "shell_exec"
 end
 
@@ -1070,7 +1087,7 @@ function jev_chain_all_safe(steps: a list of a mapping from text to text): boole
 end
 
 function jev_plan_chain(prov: a mapping from text to text, user_input: text): a list of a mapping from text to text
-  intent: ask the actor model whether the whole task is a fixed, non-code-contingent chain of read-only/shell tool calls, returning it only when every step is safe and otherwise an empty list so the turn falls back to one-decision-at-a-time mode
+  intent: call jev_call_llm with prov, jev_chain_system_prompt, User request user_input to get raw, call jev_parse_json_reply to get parsed, unwrap_or get chain into steps, and return steps if jev_chain_all_safe else an empty list
   let raw: text = jev_call_llm(prov, jev_chain_system_prompt(), "User request:\n" ++ user_input, 4000)
   let parsed: a mapping from text to text = jev_parse_json_reply(raw)
   let steps: a list of a mapping from text to text = unwrap_or(get(parsed, "chain"), [])
@@ -1080,7 +1097,7 @@ end
 -- ─── Jev turn: one decision at a time ──────────────────────────────────────────
 
 function jev_decision_tool_names(): text
-  intent: return the fixed text listing every tool name a one-step Jev decision may call, including the synthetic test_script check
+  intent: return the fixed text "read_file, read_file_lines, write_file, edit_file, shell_exec, list_dir, read_dir_recursive, grep, web_search, and test_script"
   "read_file, read_file_lines, write_file, edit_file, shell_exec, list_dir, read_dir_recursive, grep, web_search, and test_script (checks and runs a written .lbl file at args.path)"
 end
 
@@ -1138,7 +1155,7 @@ function jev_response_verdict(body: text, criteria: a mapping from text to text)
 end
 
 function jev_next_decision(prov: a mapping from text to text, user_input: text, state: JevState): a mapping from text to text
-  intent: ask the actor model for exactly one next tool call or final answer, given everything executed so far
+  intent: call jev_call_llm with prov, jev_decision_system_prompt, and jev_turn_state_block, parse the reply with jev_parse_json_reply, print it when jev_trace_enabled, and return the decision
   let decision: a mapping from text to text = jev_parse_json_reply(jev_call_llm(prov, jev_decision_system_prompt(), jev_turn_state_block(user_input, state), 8000))
   if jev_trace_enabled() then print("  [jev] decision: " ++ json_encode(decision)) end
   decision
@@ -1184,7 +1201,7 @@ function jev_verdict_from_response(response: a mapping from text to text, criter
 end
 
 function jev_judge_tool_call(prov: a mapping from text to text, user_input: text, state: JevState, tool: text, args: a mapping from text to text, output: text): a mapping from text to text
-  intent: send one typed Jev choice request judging the action just executed as good or bad
+  intent: build criteria with jev_judge_criteria, the request with jev_judge_request_body, post it with jev_judge_post, and extract the verdict with jev_verdict_from_response
   let criteria: a mapping from text to text = jev_judge_criteria()
   let request: a mapping from text to text = jev_judge_request_body(prov, user_input, state, tool, args, output, criteria)
   jev_verdict_from_response(jev_judge_post(prov, request), criteria)
@@ -1223,7 +1240,7 @@ function jev_execute_step(actor_prov: a mapping from text to text, judge_prov: a
 end
 
 function jev_run_chain(actor_prov: a mapping from text to text, judge_prov: a mapping from text to text, user_input: text, chain: a list of a mapping from text to text, state: JevState): JevState
-  intent: execute a pre-approved chain of non-contingent tool calls in order, judging each and stopping the moment one is judged bad so the rest falls back to one-decision-at-a-time mode
+  intent: while i is under length(chain) and consecutive_bad is 0 and steps is under jev_max_steps, unwrap each step tool and args and call jev_execute_step, advancing i and current each time
   mutable current: JevState = state
   mutable i: integer = 0
   while i < length(chain) and current.consecutive_bad == 0 and current.steps < jev_max_steps() do
@@ -1237,7 +1254,7 @@ function jev_run_chain(actor_prov: a mapping from text to text, judge_prov: a ma
 end
 
 function jev_invalid_decision_state(state: JevState, note: text, reason: text): JevState
-  intent: record one malformed or unusable actor reply as a bad decision so the next decision prompt is told to correct it
+  intent: return state with history appended via jev_history_append, steps and consecutive_bad incremented, last_verdict set to "bad", and last_reason set to reason
   state with { history: jev_history_append(state.history, note), steps: state.steps + 1, consecutive_bad: state.consecutive_bad + 1, last_verdict: "bad", last_reason: reason }
 end
 
@@ -1265,7 +1282,7 @@ function jev_apply_decision(actor_prov: a mapping from text to text, judge_prov:
 end
 
 function jev_step_loop(actor_prov: a mapping from text to text, judge_prov: a mapping from text to text, user_input: text, state: JevState): JevState
-  intent: decide, execute, and judge one tool call at a time until the actor emits a final answer, the step budget runs out, or too many consecutive decisions are judged bad
+  intent: while not current.done and not current.failed and steps is under jev_max_steps, set failed when consecutive_bad exceeds jev_max_step_retries, otherwise call jev_apply_decision with jev_next_decision
   mutable current: JevState = state
   while not current.done and not current.failed and current.steps < jev_max_steps() do
     if current.consecutive_bad > jev_max_step_retries() then
@@ -2815,7 +2832,7 @@ function build_custom_provider(url: text, model_override: an optional text): a m
 end
 
 function build_jev_provider(): a mapping from text to text
-  intent: build the experimental Jev provider for the actor half of Jev mode on the normal Qwen endpoint using Qwen3.8-Flash, leaving the judge half to be built separately by jev_judge_provider on the typed TypeSafe Jev endpoint
+  intent: build a provider mapping with name "Jev", key from require_qwen_api_key, url from qwen_base_url, full from jev_actor_model, and empty fast and expert
   {"name": "Jev", "key": require_qwen_api_key(), "url": qwen_base_url(), "full": jev_actor_model(), "fast": "", "expert": ""}
 end
 

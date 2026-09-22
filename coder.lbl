@@ -986,18 +986,71 @@ record GraphState
   trace: text
   steps: integer
   replans: integer
+  node_budget: integer
+  replan_budget: integer
   done: boolean
   failed: boolean
 end
 
-function resolve_jev_max_nodes(): integer
-  intent: read the maximum number of Jev graph nodes to execute in one turn
-  max(to_integer(unwrap_or(env_get("LEGIBLE_CODER_JEV_MAX_NODES"), "40")), 1)
+-- Both Jev budgets are sized from the graph the planner actually drafted
+-- rather than fixed at a constant, because the agent-scaling literature says a
+-- flat budget is the wrong shape: it starves a large plan and is never reached
+-- by a small one, and simply raising it does nothing on its own. The
+-- multipliers below come from three findings: iterative self-repair saturates
+-- after about three attempts, long-horizon runs still pay off out to a couple
+-- of hundred steps, and agents given their remaining budget explicitly reach
+-- the same accuracy on a fraction of the calls, which is why every replan
+-- prompt and every Jev choice also carries the budget line.
+
+function jev_repair_passes(): integer
+  intent: return the attempt count after which iterative self-correction is known to stop improving
+  3
 end
 
-function resolve_jev_max_replans(): integer
-  intent: read the maximum number of whole-graph replans Jev may trigger in one turn
-  max(to_integer(unwrap_or(env_get("LEGIBLE_CODER_JEV_MAX_REPLANS"), "3")), 0)
+function jev_node_budget_floor(): integer
+  intent: return the smallest node budget worth granting, below which even a short tool plan is cut off mid-way
+  12
+end
+
+function jev_node_budget_ceiling(): integer
+  intent: return the absolute node budget one turn may never exceed however large the graph is
+  200
+end
+
+function jev_graph_node_count(graph: a mapping from text to text): integer
+  intent: count how many nodes the planner drafted in this graph
+  length(keys(unwrap_or(get(graph, "nodes"), {})))
+end
+
+function jev_graph_choice_count(graph: a mapping from text to text): integer
+  intent: count the choice nodes in this graph, each one an independent point where the plan can need repair
+  let nodes: a mapping from text to text = unwrap_or(get(graph, "nodes"), {})
+  reduce(keys(nodes), 0, fn(acc: integer, id: text): integer => acc + (if unwrap_or(get(get(nodes, id), "kind"), "") == "choice" then 1 else 0 end))
+end
+
+function jev_graph_node_allowance(graph: a mapping from text to text): integer
+  intent: allow one full traversal of this graph plus the repair passes self-correction still gains from, within the floor and ceiling
+  min(max(jev_graph_node_count(graph) * (1 + jev_repair_passes()), jev_node_budget_floor()), jev_node_budget_ceiling())
+end
+
+function resolve_jev_max_nodes(graph: a mapping from text to text, steps: integer): integer
+  intent: read LEGIBLE_CODER_JEV_MAX_NODES or grant this graph its allowance on top of the nodes already executed
+  let override: an optional text = env_get("LEGIBLE_CODER_JEV_MAX_NODES")
+  if is_some(override) then
+    max(to_integer(unwrap(override)), 1)
+  else
+    min(steps + jev_graph_node_allowance(graph), jev_node_budget_ceiling())
+  end
+end
+
+function resolve_jev_max_replans(graph: a mapping from text to text): integer
+  intent: read LEGIBLE_CODER_JEV_MAX_REPLANS or allow the saturation point of self-repair plus one whole-graph redraft per decision point
+  let override: an optional text = env_get("LEGIBLE_CODER_JEV_MAX_REPLANS")
+  if is_some(override) then
+    max(to_integer(unwrap(override)), 0)
+  else
+    min(jev_repair_passes() + jev_graph_choice_count(graph), 2 * jev_repair_passes() + 2)
+  end
 end
 
 function jev_trace_append(trace: text, entry: text): text
@@ -1005,9 +1058,22 @@ function jev_trace_append(trace: text, entry: text): text
   truncate_text(trace ++ (if text_length(trace) > 0 then " -> " else "" end) ++ entry, 2000)
 end
 
+function jev_budget_line(state: GraphState): text
+  intent: state how much of the node and replan budget is left so the planner and Jev can both condition on it
+  "Budget: " ++ to_text(state.steps) ++ " of " ++ to_text(state.node_budget) ++ " graph nodes executed, " ++
+  to_text(state.replans) ++ " of " ++ to_text(state.replan_budget) ++ " replans used."
+end
+
+function jev_grow_budgets(state: GraphState, graph: a mapping from text to text): GraphState
+  intent: resize both budgets for a freshly drafted graph without ever shrinking what an earlier graph was already granted
+  let nodes: integer = max(state.node_budget, resolve_jev_max_nodes(graph, state.steps))
+  state with { node_budget: nodes, replan_budget: max(state.replan_budget, resolve_jev_max_replans(graph)) }
+end
+
 function jev_replan_context(user_input: text, state: GraphState, reason: text): text
   intent: summarize the executed trace and last tool output so the planner can regenerate the graph in place
   "The previous decision graph needs to change. Reason: " ++ reason ++ "\n\n" ++
+  jev_budget_line(state) ++ " Draft a graph that finishes within it.\n\n" ++
   "Executed so far:\n" ++ state.trace ++ "\n\n" ++
   "Most recent tool or test output:\n" ++ truncate_text(state.last_output, 2000) ++ "\n\n" ++
   "Produce a full replacement graph (a fresh \"start\" and \"nodes\") that continues correctly from here for the original request."
@@ -1015,7 +1081,7 @@ end
 
 function jev_apply_replan(state: GraphState, user_input: text, reason: text): GraphState
   intent: regenerate the whole graph in place, bounded by the replan budget, whether Jev or a malformed goto asked for it
-  if state.replans >= resolve_jev_max_replans() then
+  if state.replans >= state.replan_budget then
     state with { failed: true, last_output: "[jev] replan limit reached; stopping.\n" ++ state.last_output }
   else
     print("  [jev] replanning (" ++ to_text(state.replans + 1) ++ "): " ++ reason)
@@ -1024,7 +1090,7 @@ function jev_apply_replan(state: GraphState, user_input: text, reason: text): Gr
     if not has_key(graph, "start") then
       state with { failed: true, last_output: "[jev] planner failed to produce a replacement graph." }
     else
-      state with { graph: graph, node_id: get(graph, "start"), replans: state.replans + 1, trace: jev_trace_append(state.trace, "replan: " ++ reason) }
+      jev_grow_budgets(state, graph) with { graph: graph, node_id: get(graph, "start"), replans: state.replans + 1, trace: jev_trace_append(state.trace, "replan: " ++ reason) }
     end
   end
 end
@@ -1069,7 +1135,7 @@ function jev_ask_choice(api_key: text, node: a mapping from text to text, state:
   let question_text: text = unwrap_or(get(node, "question"), "Choose the branch that matches what actually happened.")
   let request: a mapping from text to text = {
     "model": unwrap_or(env_get("LEGIBLE_CODER_JEV_MODEL"), "jev-latest"),
-    "state": "User request:\n" ++ user_input ++ "\n\nRecent trace:\n" ++ truncate_text(state.trace, 1500) ++ "\n\nMost recent output:\n" ++ truncate_text(state.last_output, 1500),
+    "state": "User request:\n" ++ user_input ++ "\n\n" ++ jev_budget_line(state) ++ "\n\nRecent trace:\n" ++ truncate_text(state.trace, 1500) ++ "\n\nMost recent output:\n" ++ truncate_text(state.last_output, 1500),
     "questions": {"choice": {"type": "choice", "instructions": question_text ++ " Return the choice label exactly; do not explain.", "criteria": criteria}}
   }
   let response: a mapping from text to text = http_client_post(jev_base_url(), {"Authorization": "Bearer " ++ api_key, "Content-Type": "application/json"}, json_encode(request))
@@ -1132,9 +1198,9 @@ function jev_advance_node(api_key: text, state: GraphState, user_input: text): G
   end
 end
 
-function jev_graph_loop_complete(state: GraphState, max_nodes: integer): boolean
-  intent: report whether graph traversal reached a terminal state or its node budget
-  state.steps >= max_nodes or state.done or state.failed
+function jev_graph_loop_complete(state: GraphState): boolean
+  intent: report whether graph traversal reached a terminal state or the node budget its graphs have earned
+  state.steps >= state.node_budget or state.done or state.failed
 end
 
 function jev_graph_loop_step(state: GraphState, api_key: text, user_input: text): GraphState
@@ -1161,15 +1227,17 @@ function finish_jev_graph_turn(messages: a list of a mapping from text to text, 
 end
 
 function run_jev_graph_turn(messages: a list of a mapping from text to text, user_input: text, settings: TurnSettings): InnerLoopResult
-  intent: draft a Jev decision graph once, then let Jev traverse and replan it until the turn completes
-  let max_nodes: integer = resolve_jev_max_nodes()
-  print("  [jev] drafting decision graph (max " ++ to_text(max_nodes) ++ " nodes, " ++ to_text(resolve_jev_max_replans()) ++ " replans)")
+  intent: draft a Jev decision graph once, size its budgets from it, then let Jev traverse and replan it until the turn completes
+  print("  [jev] drafting decision graph")
   let graph: a mapping from text to text = jev_generate_graph(user_input, "")
   if not has_key(graph, "start") then
-    finish_jev_graph_turn(messages, GraphState {graph: {}, node_id: "", last_output: "[jev] the planner failed to produce a usable decision graph.", trace: "", steps: 0, replans: 0, done: false, failed: true}, settings)
+    finish_jev_graph_turn(messages, GraphState {graph: {}, node_id: "", last_output: "[jev] the planner failed to produce a usable decision graph.", trace: "", steps: 0, replans: 0, node_budget: 0, replan_budget: 0, done: false, failed: true}, settings)
   else
-    mutable state: GraphState = GraphState {graph: graph, node_id: get(graph, "start"), last_output: "", trace: "", steps: 0, replans: 0, done: false, failed: false}
-    while not jev_graph_loop_complete(state, max_nodes) do
+    let max_nodes: integer = resolve_jev_max_nodes(graph, 0)
+    let max_replans: integer = resolve_jev_max_replans(graph)
+    print("  [jev] " ++ to_text(jev_graph_node_count(graph)) ++ "-node graph, budget " ++ to_text(max_nodes) ++ " nodes and " ++ to_text(max_replans) ++ " replans")
+    mutable state: GraphState = GraphState {graph: graph, node_id: get(graph, "start"), last_output: "", trace: "", steps: 0, replans: 0, node_budget: max_nodes, replan_budget: max_replans, done: false, failed: false}
+    while not jev_graph_loop_complete(state) do
       set state = jev_graph_loop_step(state, settings.key, user_input)
     end
     finish_jev_graph_turn(messages, state, settings)

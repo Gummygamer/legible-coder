@@ -228,7 +228,7 @@ legible-coder/
 | `GROQ_API_KEY` | For Groq | Groq API key for the fifth fallback |
 | `LEGIBLE_CODER_API_KEY` | No | Explicit API key override. Local endpoints default to `lm-studio` |
 | `LEGIBLE_CODER_BASE_URL` | No | OpenAI-compatible base URL. Auto-detects Qwen, Gemini, OrcaRouter, NIM, OpenRouter, Groq, then local LM Studio when unset |
-| `LEGIBLE_CODER_MODEL` | No | Primary model. Defaults include `deepseek-v4-pro` for Qwen, `gemini-3.7-flash` for Gemini, and provider-specific models for other backends |
+| `LEGIBLE_CODER_MODEL` | No | Primary model. Defaults include `deepseek-v4-pro` for Qwen, `gemini-3.8-flash` for Gemini, and provider-specific models for other backends |
 | `LEGIBLE_CODER_FAST_MODEL` | No | Remote fast model for simple turns. Defaults to the provider's fast or primary model |
 | `LEGIBLE_CODER_EXPERT_MODEL` | No | Optional remote expert model for architecture/refactor/design turns |
 | `LEGIBLE_CODER_LOCAL_TOOLS` | No | `1` forces native tools for local models, `0` forces manual local protocol. Gemma 4 names auto-enable native tools |

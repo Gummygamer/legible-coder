@@ -2138,7 +2138,7 @@ end
 
 function resolve_context_budget(tier: text): integer
   intent: read LEGIBLE_CODER_CONTEXT_TOKENS or use a provider-appropriate token budget before compaction
-  -- gemini-3.7-flash and qwen3.8-max have 1M-token contexts, OrcaRouter Qwen3.8 has 65K, NIM has 131K, local is very limited
+  -- gemini-3.8-flash and qwen3.8-max have 1M-token contexts, OrcaRouter Qwen3.8 has 65K, NIM has 131K, local is very limited
   let default_text: text = if tier == "local" then "6000" else if tier == "gemini" then "700000" else if tier == "qwen" then "850000" else if tier == "orcarouter" then "60000" else if tier == "nims" then "120000" else "90000" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_CONTEXT_TOKENS"), default_text)
   max(to_integer(raw), 1000)
@@ -2161,7 +2161,7 @@ end
 
 function resolve_max_output_tokens(tier: text, include_tools: boolean): integer
   intent: read LEGIBLE_CODER_MAX_OUTPUT_TOKENS or pick a default suited to the backend
-  -- qwen3.8-max supports up to 131K output, gemini-3.7-flash up to 65K, NIM up to 131K, local is small
+  -- qwen3.8-max supports up to 131K output, gemini-3.8-flash up to 65K, NIM up to 131K, local is small
   let default_text: text = if tier == "local" and include_tools then "4096" else if tier == "local" then "750" else if tier == "qwen" then "131072" else if tier == "gemini" then "32768" else if tier == "nims" then "32768" else "16384" end
   let raw: text = unwrap_or(env_get("LEGIBLE_CODER_MAX_OUTPUT_TOKENS"), default_text)
   max(to_integer(raw), 128)
@@ -2235,7 +2235,7 @@ end
 function build_custom_provider(url: text, model_override: an optional text): a mapping from text to text
   intent: call resolve_api_key and env_get to build a provider mapping for an explicitly configured url with model and fast_model
   let key: text = resolve_api_key(url)
-  let default_model: text = if is_qwen_url(url) then "qwen3.8-max" else if is_gemini_url(url) then "gemini-3.7-flash" else if is_orcarouter_url(url) then "qwen/qwen3.8-27b-free" else if is_nims_url(url) then "deepseek-ai/deepseek-v4-flash-0731" else if is_openrouter_url(url) then "openrouter/free" else if is_groq_url(url) then "openai/gpt-oss-120b" else "google/gemma-4-26b-a4b" end
+  let default_model: text = if is_qwen_url(url) then "qwen3.8-max" else if is_gemini_url(url) then "gemini-3.8-flash" else if is_orcarouter_url(url) then "qwen/qwen3.8-27b-free" else if is_nims_url(url) then "nvidia/nemotron-3-super-120b-a12b" else if is_openrouter_url(url) then "openrouter/free" else if is_groq_url(url) then "openai/gpt-oss-120b" else "google/gemma-4-26b-a4b" end
   let model: text = unwrap_or(model_override, default_model)
   let url_is_local: boolean = contains_text(url, "localhost") or contains_text(url, "127.0.0.1")
   let fast_model: text = if url_is_local then "" else unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), model) end
@@ -2253,7 +2253,7 @@ end
 
 function build_gemini_provider(key: text, model_override: an optional text): a mapping from text to text
   intent: build a provider mapping for the Gemini API using the free-tier default
-  let model: text = unwrap_or(model_override, "gemini-3.7-flash")
+  let model: text = unwrap_or(model_override, "gemini-3.8-flash")
   let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), model)
   let expert_model: text = unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "")
   {"name": "Gemini", "key": key, "url": gemini_base_url(), "full": model, "fast": fast_model, "expert": expert_model}
@@ -2284,9 +2284,9 @@ function build_groq_provider(key: text, model_override: an optional text): a map
 end
 
 function build_nims_provider(key: text, model_override: an optional text): a mapping from text to text
-  intent: build a provider mapping for the NVIDIA NIM API using the deepseek-v4-flash-0731 model
-  let model: text = unwrap_or(model_override, "deepseek-ai/deepseek-v4-flash-0731")
-  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "deepseek-ai/deepseek-v4-flash-0731")
+  intent: build a provider mapping for the NVIDIA NIM API using the nemotron-3-super-120b-a12b model
+  let model: text = unwrap_or(model_override, "nvidia/nemotron-3-super-120b-a12b")
+  let fast_model: text = unwrap_or(env_get("LEGIBLE_CODER_FAST_MODEL"), "nvidia/nemotron-3-super-120b-a12b")
   let expert_model: text = unwrap_or(env_get("LEGIBLE_CODER_EXPERT_MODEL"), "")
   {"name": "NIM", "key": key, "url": nims_base_url(), "full": model, "fast": fast_model, "expert": expert_model}
 end
